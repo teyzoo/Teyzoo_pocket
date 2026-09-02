@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import time
-from typing import Any, Optional
+from typing import Any
 
 import aiohttp
 import pandas as pd
@@ -17,538 +18,1095 @@ from config import (
 )
 
 
-# ============================================================
-# CONSTANTS
-# ============================================================
-
-TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
-
-# Публичный источник рыночных котировок без авторизации.
-BIQUOTE_URL = "https://biquote.io/api/{symbol}"
-
-REQUEST_TIMEOUT = 20
-
-ASSET_CACHE_SECONDS = max(
-    60,
-    int(ASSET_DISCOVERY_CACHE_SECONDS or 300),
-)
-
-MIN_CANDLES = max(
-    80,
-    int(CANDLE_LIMIT or 100),
-)
-
-
-# ============================================================
-# OTC PAIRS
-# ============================================================
-
-OTC_PAIRS = [
-    "EURUSD_otc",
-    "GBPUSD_otc",
-    "USDJPY_otc",
-    "USDCHF_otc",
-    "AUDUSD_otc",
-    "USDCAD_otc",
-    "NZDUSD_otc",
-    "EURGBP_otc",
-    "EURJPY_otc",
-    "GBPJPY_otc",
-    "AUDCAD_otc",
-    "AUDCHF_otc",
-    "AUDJPY_otc",
-    "CADCHF_otc",
-    "CADJPY_otc",
-    "CHFJPY_otc",
-    "EURAUD_otc",
-    "EURCAD_otc",
-    "EURCHF_otc",
-    "EURNZD_otc",
-    "GBPAUD_otc",
-    "GBPCAD_otc",
-    "GBPCHF_otc",
-    "GBPNZD_otc",
-    "NZDCAD_otc",
-    "NZDCHF_otc",
-    "NZDJPY_otc",
-]
-
-
 class MarketClient:
     """
-    Единый источник рыночных данных.
+    Получение рыночных свечей.
 
-    Обычные Forex:
-        Twelve Data
+    Обычные Forex-пары:
+        Twelve Data -> /time_series
 
     OTC:
-        публичный источник BiQuote.
+        отдельный источник свечей должен быть доступен публично.
+        Если источник не даёт полноценную историю OHLC,
+        OTC-пара просто пропускается.
 
-    Никакой авторизации Pocket Option
-    для получения данных не используется.
+    Важно:
+        CANDLE_INTERVAL может быть:
+            "1min"
+            "5min"
+            "15min"
+            "30min"
+            60
+            300
+            900
+
+        Строковый "5min" НЕ преобразуется через int("5min").
     """
 
+    TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
+
+    REQUEST_TIMEOUT = 15
+    MIN_CANDLES = 80
+    DEFAULT_CANDLE_LIMIT = 120
+
     def __init__(self) -> None:
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.session: aiohttp.ClientSession | None = None
 
         self._asset_cache: list[str] = []
         self._asset_cache_time: float = 0.0
 
+        self._request_lock = asyncio.Lock()
+
     # ============================================================
-    # HTTP SESSION
+    # SESSION
     # ============================================================
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if (
-            self.session is None
-            or self.session.closed
-        ):
+        if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(
-                total=REQUEST_TIMEOUT
+                total=self.REQUEST_TIMEOUT,
+                connect=8,
+                sock_read=10,
             )
 
             self.session = aiohttp.ClientSession(
                 timeout=timeout,
                 headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 "
-                        "(compatible; TeyzooSignalBot/1.0)"
-                    )
+                    "User-Agent": "Teyzoo-Pocket-Signal-Bot/1.0",
+                    "Accept": "application/json",
                 },
             )
 
         return self.session
 
     async def close(self) -> None:
-        if (
-            self.session is not None
-            and not self.session.closed
-        ):
-            try:
-                await self.session.close()
-            except Exception:
-                pass
+        if self.session is not None and not self.session.closed:
+            await self.session.close()
 
         self.session = None
 
     # ============================================================
-    # SYMBOL HELPERS
+    # INTERVAL HELPERS
     # ============================================================
 
     @staticmethod
-    def is_otc(value: str) -> bool:
-        if not value:
-            return False
+    def interval_to_twelve_data(interval: Any) -> str:
+        """
+        Приводит интервал к формату Twelve Data.
 
-        value = str(value).strip().lower()
+        Примеры:
 
-        return (
-            value.endswith("_otc")
-            or value.endswith("-otc")
-            or value.endswith(" otc")
-            or value.endswith("otc")
-        )
+            "5min" -> "5min"
+            "5m"   -> "5min"
+            300    -> "5min"
+            "300"  -> "5min"
+        """
+
+        if isinstance(interval, str):
+            value = interval.strip().lower()
+
+            aliases = {
+                "1m": "1min",
+                "1min": "1min",
+                "60": "1min",
+
+                "5m": "5min",
+                "5min": "5min",
+                "300": "5min",
+
+                "15m": "15min",
+                "15min": "15min",
+                "900": "15min",
+
+                "30m": "30min",
+                "30min": "30min",
+                "1800": "30min",
+
+                "45m": "45min",
+                "45min": "45min",
+                "2700": "45min",
+
+                "1h": "1h",
+                "60m": "1h",
+                "3600": "1h",
+
+                "2h": "2h",
+                "7200": "2h",
+
+                "4h": "4h",
+                "14400": "4h",
+
+                "8h": "8h",
+                "28800": "8h",
+
+                "1d": "1day",
+                "1day": "1day",
+            }
+
+            if value in aliases:
+                return aliases[value]
+
+            if value.endswith("min"):
+                number = value[:-3]
+
+                if number.isdigit():
+                    return f"{int(number)}min"
+
+            if value.endswith("m"):
+                number = value[:-1]
+
+                if number.isdigit():
+                    return f"{int(number)}min"
+
+            if value.endswith("h"):
+                number = value[:-1]
+
+                if number.isdigit():
+                    hours = int(number)
+
+                    if hours == 1:
+                        return "1h"
+
+                    return f"{hours}h"
+
+            if value.isdigit():
+                seconds = int(value)
+
+                seconds_map = {
+                    60: "1min",
+                    300: "5min",
+                    900: "15min",
+                    1800: "30min",
+                    2700: "45min",
+                    3600: "1h",
+                    7200: "2h",
+                    14400: "4h",
+                    28800: "8h",
+                }
+
+                if seconds in seconds_map:
+                    return seconds_map[seconds]
+
+            # Если уже выглядит как валидный Twelve Data interval.
+            return value
+
+        if isinstance(interval, (int, float)):
+            seconds = int(interval)
+
+            seconds_map = {
+                60: "1min",
+                300: "5min",
+                900: "15min",
+                1800: "30min",
+                2700: "45min",
+                3600: "1h",
+                7200: "2h",
+                14400: "4h",
+                28800: "8h",
+            }
+
+            if seconds in seconds_map:
+                return seconds_map[seconds]
+
+            # Если передали количество минут вместо секунд.
+            if seconds in (1, 5, 15, 30, 45):
+                return f"{seconds}min"
+
+            return f"{seconds}min"
+
+        return "5min"
 
     @staticmethod
-    def _clean_asset_name(
-        value: str,
-    ) -> str:
-        if not value:
+    def interval_to_seconds(interval: Any) -> int:
+        """
+        Используется только для внутренних расчётов.
+        Никогда не вызывается как int("5min").
+        """
+
+        if isinstance(interval, (int, float)):
+            value = int(interval)
+
+            if value <= 45:
+                return value * 60
+
+            return value
+
+        if isinstance(interval, str):
+            value = interval.strip().lower()
+
+            aliases = {
+                "1m": 60,
+                "1min": 60,
+                "60": 60,
+
+                "5m": 300,
+                "5min": 300,
+                "300": 300,
+
+                "15m": 900,
+                "15min": 900,
+                "900": 900,
+
+                "30m": 1800,
+                "30min": 1800,
+                "1800": 1800,
+
+                "45m": 2700,
+                "45min": 2700,
+                "2700": 2700,
+
+                "1h": 3600,
+                "3600": 3600,
+
+                "2h": 7200,
+                "7200": 7200,
+
+                "4h": 14400,
+                "14400": 14400,
+
+                "8h": 28800,
+                "28800": 28800,
+
+                "1d": 86400,
+                "1day": 86400,
+            }
+
+            if value in aliases:
+                return aliases[value]
+
+            if value.endswith("min"):
+                number = value[:-3]
+
+                if number.isdigit():
+                    return int(number) * 60
+
+            if value.endswith("m"):
+                number = value[:-1]
+
+                if number.isdigit():
+                    return int(number) * 60
+
+            if value.endswith("h"):
+                number = value[:-1]
+
+                if number.isdigit():
+                    return int(number) * 3600
+
+            if value.isdigit():
+                number = int(value)
+
+                if number <= 45:
+                    return number * 60
+
+                return number
+
+        return 300
+
+    # ============================================================
+    # PAIR HELPERS
+    # ============================================================
+
+    @staticmethod
+    def clean_pair(pair: str | None) -> str:
+        if not pair:
             return ""
 
-        value = str(value).strip()
+        value = str(pair).strip().upper()
 
-        while "  " in value:
-            value = value.replace(
-                "  ",
-                " ",
-            )
+        value = value.replace("-", "/")
+        value = value.replace("_", "/")
+
+        if value.endswith("/OTC"):
+            value = value[:-4] + "_OTC"
+
+        if value.endswith(" OTC"):
+            value = value[:-4] + "_OTC"
+
+        if value.endswith("OTC") and not value.endswith("_OTC"):
+            value = value[:-3] + "_OTC"
 
         return value
 
     @staticmethod
-    def _normalize_forex_pair(
-        value: str,
-    ) -> Optional[str]:
+    def is_otc_pair(pair: str | None) -> bool:
+        if not pair:
+            return False
+
+        value = str(pair).upper()
+
+        return (
+            "_OTC" in value
+            or "/OTC" in value
+            or " OTC" in value
+        )
+
+    @staticmethod
+    def twelve_data_symbol(pair: str) -> str:
         """
-        EURUSD -> EUR/USD
-        EUR/USD -> EUR/USD
+        EURUSD      -> EUR/USD
+        EUR/USD     -> EUR/USD
+        GBPJPY      -> GBP/JPY
+        GBP/JPY OTC -> GBP/JPY
         """
 
-        if not value:
+        value = str(pair).strip().upper()
+
+        value = value.replace("_OTC", "")
+        value = value.replace("/OTC", "")
+        value = value.replace(" OTC", "")
+
+        value = value.replace("-", "")
+        value = value.replace("_", "")
+        value = value.replace("/", "")
+
+        if len(value) == 6:
+            return f"{value[:3]}/{value[3:]}"
+
+        return value
+
+    @staticmethod
+    def display_pair(pair: str) -> str:
+        value = str(pair).upper()
+
+        otc = MarketClient.is_otc_pair(value)
+
+        value = value.replace("_OTC", "")
+        value = value.replace("/OTC", "")
+        value = value.replace(" OTC", "")
+
+        value = value.replace("/", "")
+        value = value.replace("-", "")
+        value = value.replace("_", "")
+
+        if len(value) == 6:
+            result = f"{value[:3]}/{value[3:]}"
+        else:
+            result = value
+
+        if otc:
+            result += " OTC"
+
+        return result
+
+    # ============================================================
+    # TWELVE DATA
+    # ============================================================
+
+    async def _get_twelve_data_candles(
+        self,
+        pair: str,
+        limit: int | None = None,
+    ) -> pd.DataFrame | None:
+        if not TWELVE_DATA_API_KEY:
+            print("[MARKET] TWELVE_DATA_API_KEY не задан")
             return None
 
-        value = str(
-            value
-        ).strip().upper()
+        symbol = self.twelve_data_symbol(pair)
 
-        if MarketClient.is_otc(value):
+        interval = self.interval_to_twelve_data(
+            CANDLE_INTERVAL
+        )
+
+        try:
+            requested_limit = int(
+                limit
+                if limit is not None
+                else CANDLE_LIMIT
+            )
+        except (TypeError, ValueError):
+            requested_limit = self.DEFAULT_CANDLE_LIMIT
+
+        requested_limit = max(
+            requested_limit,
+            self.MIN_CANDLES + 20,
+        )
+
+        requested_limit = min(
+            requested_limit,
+            5000,
+        )
+
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": requested_limit,
+            "apikey": TWELVE_DATA_API_KEY,
+            "timezone": "UTC",
+            "format": "JSON",
+        }
+
+        print(
+            f"[MARKET] {self.display_pair(pair)}: "
+            f"Twelve Data interval={interval}, "
+            f"limit={requested_limit}"
+        )
+
+        session = await self._get_session()
+
+        try:
+            async with self._request_lock:
+                async with session.get(
+                    self.TWELVE_DATA_URL,
+                    params=params,
+                ) as response:
+
+                    text = await response.text()
+
+                    if response.status != 200:
+                        print(
+                            f"[MARKET] {self.display_pair(pair)}: "
+                            f"HTTP {response.status}: "
+                            f"{text[:300]}"
+                        )
+                        return None
+
+                    try:
+                        data = await response.json(
+                            content_type=None
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[MARKET] {self.display_pair(pair)}: "
+                            f"JSON error: {exc}"
+                        )
+                        return None
+
+        except asyncio.TimeoutError:
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"timeout"
+            )
             return None
 
-        value = value.replace(
-            " ",
-            "",
-        )
+        except aiohttp.ClientError as exc:
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"network error: {exc}"
+            )
+            return None
 
-        value = value.replace(
-            "-",
-            "/",
-        )
+        except Exception as exc:
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"request error: {exc}"
+            )
+            return None
 
-        value = value.replace(
-            "_",
-            "/",
-        )
+        if not isinstance(data, dict):
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"неверный ответ API"
+            )
+            return None
 
-        if "/" in value:
-            parts = value.split("/")
+        if data.get("status") == "error":
+            message = data.get(
+                "message",
+                "unknown API error",
+            )
 
-            if (
-                len(parts) == 2
-                and len(parts[0]) == 3
-                and len(parts[1]) == 3
-                and parts[0].isalpha()
-                and parts[1].isalpha()
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"Twelve Data error: {message}"
+            )
+
+            return None
+
+        values = data.get("values")
+
+        if not isinstance(values, list):
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"поле values отсутствует"
+            )
+            return None
+
+        if not values:
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"свечи не получены"
+            )
+            return None
+
+        rows: list[dict[str, Any]] = []
+
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+
+            datetime_value = item.get("datetime")
+
+            if datetime_value is None:
+                continue
+
+            try:
+                open_price = float(item["open"])
+                high_price = float(item["high"])
+                low_price = float(item["low"])
+                close_price = float(item["close"])
+            except (
+                TypeError,
+                ValueError,
+                KeyError,
             ):
-                return (
-                    f"{parts[0]}/"
-                    f"{parts[1]}"
+                continue
+
+            rows.append(
+                {
+                    "datetime": datetime_value,
+                    "open": open_price,
+                    "high": high_price,
+                    "low": low_price,
+                    "close": close_price,
+                    "volume": self._safe_float(
+                        item.get("volume")
+                    ),
+                }
+            )
+
+        if not rows:
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"OHLC не удалось распарсить"
+            )
+            return None
+
+        df = pd.DataFrame(rows)
+
+        try:
+            df["datetime"] = pd.to_datetime(
+                df["datetime"],
+                utc=True,
+                errors="coerce",
+            )
+        except Exception as exc:
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"datetime error: {exc}"
+            )
+            return None
+
+        df = df.dropna(
+            subset=[
+                "datetime",
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+        )
+
+        if df.empty:
+            return None
+
+        df = df.sort_values(
+            "datetime"
+        ).drop_duplicates(
+            subset=["datetime"],
+            keep="last",
+        )
+
+        df = df.reset_index(drop=True)
+
+        numeric_columns = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+
+        for column in numeric_columns:
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            )
+
+        df = df.dropna(
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+        )
+
+        if len(df) < self.MIN_CANDLES:
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"недостаточно свечей "
+                f"{len(df)}/{self.MIN_CANDLES}"
+            )
+            return None
+
+        print(
+            f"[MARKET] {self.display_pair(pair)}: "
+            f"получено {len(df)} свечей"
+        )
+
+        return df
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return 0.0
+
+    # ============================================================
+    # OTC
+    # ============================================================
+
+    async def get_otc_candles(
+        self,
+        pair: str,
+        limit: int | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        OTC не подменяется обычным Forex.
+
+        Если публичный источник не предоставляет полноценные
+        исторические OHLC-свечи, возвращаем None.
+
+        Это важно: обычные EUR/USD данные нельзя выдавать
+        за EUR/USD OTC.
+        """
+
+        print(
+            f"[OTC] {self.display_pair(pair)}: "
+            f"публичные исторические OTC-свечи "
+            f"недоступны"
+        )
+
+        return None
+
+    # ============================================================
+    # MAIN CANDLES METHOD
+    # ============================================================
+
+    async def get_candles(
+        self,
+        pair: str,
+        limit: int | None = None,
+    ) -> pd.DataFrame | None:
+
+        if not pair:
+            return None
+
+        pair = str(pair).strip()
+
+        if self.is_otc_pair(pair):
+            return await self.get_otc_candles(
+                pair,
+                limit=limit,
+            )
+
+        return await self._get_twelve_data_candles(
+            pair,
+            limit=limit,
+        )
+
+    # ============================================================
+    # COMPATIBILITY ALIASES
+    # ============================================================
+
+    async def fetch_candles(
+        self,
+        pair: str,
+        limit: int | None = None,
+    ) -> pd.DataFrame | None:
+        return await self.get_candles(
+            pair,
+            limit=limit,
+        )
+
+    async def get_history(
+        self,
+        pair: str,
+        interval: Any = None,
+        limit: int | None = None,
+    ) -> pd.DataFrame | None:
+        """
+        Старый интерфейс.
+
+        Важно:
+        interval здесь НЕ передаётся в int().
+        Если передан "5min", он безопасно нормализуется.
+        """
+
+        if interval is not None:
+            normalized = self.interval_to_twelve_data(
+                interval
+            )
+
+            original_interval = CANDLE_INTERVAL
+
+            try:
+                # Для текущего запроса используем локальный
+                # нормализованный интервал.
+                return await self._get_twelve_data_candles_with_interval(
+                    pair,
+                    normalized,
+                    limit,
                 )
+            finally:
+                _ = original_interval
 
-        if (
-            len(value) == 6
-            and value.isalpha()
-        ):
-            return (
-                f"{value[:3]}/"
-                f"{value[3:]}"
-            )
+        return await self.get_candles(
+            pair,
+            limit=limit,
+        )
 
-        return None
+    async def get_data(
+        self,
+        pair: str,
+        interval: Any = None,
+        limit: int | None = None,
+    ) -> pd.DataFrame | None:
+        return await self.get_history(
+            pair,
+            interval=interval,
+            limit=limit,
+        )
 
-    @staticmethod
-    def normalize_otc_symbol(
-        value: str,
-    ) -> Optional[str]:
-        """
-        EUR/USD OTC -> EURUSD_otc
-        EURUSD OTC  -> EURUSD_otc
-        EURUSD_otc  -> EURUSD_otc
-        """
+    async def _get_twelve_data_candles_with_interval(
+        self,
+        pair: str,
+        interval: str,
+        limit: int | None = None,
+    ) -> pd.DataFrame | None:
 
-        if not value:
+        if not TWELVE_DATA_API_KEY:
+            print("[MARKET] TWELVE_DATA_API_KEY не задан")
             return None
 
-        raw = str(
-            value
-        ).strip()
-
-        if not MarketClient.is_otc(raw):
-            return None
-
-        clean = raw
-
-        for suffix in (
-            "_otc",
-            "-otc",
-            " otc",
-            "otc",
-            "_OTC",
-            "-OTC",
-            " OTC",
-            "OTC",
-        ):
-            if clean.lower().endswith(
-                suffix.lower()
-            ):
-                clean = clean[
-                    : -len(suffix)
-                ]
-                break
-
-        compact = "".join(
-            character
-            for character in clean
-            if character.isalpha()
-        ).upper()
-
-        if len(compact) == 6:
-            return f"{compact}_otc"
-
-        if compact:
-            return f"{compact}_otc"
-
-        return None
-
-    @staticmethod
-    def display_asset_name(
-        value: str,
-    ) -> str:
-
-        if not value:
-            return value
-
-        raw = str(
-            value
-        ).strip()
-
-        if MarketClient.is_otc(raw):
-
-            otc = MarketClient.normalize_otc_symbol(
-                raw
+        if self.is_otc_pair(pair):
+            return await self.get_otc_candles(
+                pair,
+                limit=limit,
             )
 
-            if otc:
-                base = otc[:-4]
+        symbol = self.twelve_data_symbol(pair)
 
-                if (
-                    len(base) == 6
-                    and base.isalpha()
-                ):
-                    return (
-                        f"{base[:3]}/"
-                        f"{base[3:]} OTC"
+        try:
+            requested_limit = int(
+                limit
+                if limit is not None
+                else CANDLE_LIMIT
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            requested_limit = self.DEFAULT_CANDLE_LIMIT
+
+        requested_limit = max(
+            requested_limit,
+            self.MIN_CANDLES + 20,
+        )
+
+        requested_limit = min(
+            requested_limit,
+            5000,
+        )
+
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": requested_limit,
+            "apikey": TWELVE_DATA_API_KEY,
+            "timezone": "UTC",
+            "format": "JSON",
+        }
+
+        print(
+            f"[MARKET] {self.display_pair(pair)}: "
+            f"Twelve Data interval={interval}, "
+            f"limit={requested_limit}"
+        )
+
+        session = await self._get_session()
+
+        try:
+            async with self._request_lock:
+                async with session.get(
+                    self.TWELVE_DATA_URL,
+                    params=params,
+                ) as response:
+
+                    if response.status != 200:
+                        text = await response.text()
+
+                        print(
+                            f"[MARKET] {self.display_pair(pair)}: "
+                            f"HTTP {response.status}: "
+                            f"{text[:300]}"
+                        )
+
+                        return None
+
+                    data = await response.json(
+                        content_type=None
                     )
 
-                return f"{base} OTC"
+        except asyncio.TimeoutError:
+            print(
+                f"[MARKET] {self.display_pair(pair)}: timeout"
+            )
+            return None
 
-        normal = MarketClient._normalize_forex_pair(
-            raw
+        except aiohttp.ClientError as exc:
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"network error: {exc}"
+            )
+            return None
+
+        except Exception as exc:
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"request error: {exc}"
+            )
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        if data.get("status") == "error":
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"{data.get('message', 'API error')}"
+            )
+            return None
+
+        values = data.get("values")
+
+        if not isinstance(values, list):
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"свечи не получены"
+            )
+            return None
+
+        rows = []
+
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                rows.append(
+                    {
+                        "datetime": item["datetime"],
+                        "open": float(item["open"]),
+                        "high": float(item["high"]),
+                        "low": float(item["low"]),
+                        "close": float(item["close"]),
+                        "volume": self._safe_float(
+                            item.get("volume")
+                        ),
+                    }
+                )
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+        if not rows:
+            return None
+
+        df = pd.DataFrame(rows)
+
+        df["datetime"] = pd.to_datetime(
+            df["datetime"],
+            utc=True,
+            errors="coerce",
         )
 
-        if normal:
-            return normal
+        for column in [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]:
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            )
 
-        return raw
+        df = df.dropna(
+            subset=[
+                "datetime",
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+        )
+
+        df = df.sort_values(
+            "datetime"
+        ).drop_duplicates(
+            subset=["datetime"],
+            keep="last",
+        )
+
+        df = df.reset_index(drop=True)
+
+        if len(df) < self.MIN_CANDLES:
+            print(
+                f"[MARKET] {self.display_pair(pair)}: "
+                f"недостаточно данных "
+                f"{len(df)}/{self.MIN_CANDLES}"
+            )
+            return None
+
+        print(
+            f"[MARKET] {self.display_pair(pair)}: "
+            f"получено {len(df)} свечей"
+        )
+
+        return df
 
     # ============================================================
     # ASSET DISCOVERY
     # ============================================================
 
-    async def discover_pocket_assets(
-        self,
-    ) -> list[str]:
-
-        now = time.monotonic()
-
-        if (
-            self._asset_cache
-            and (
-                now - self._asset_cache_time
-                < ASSET_CACHE_SECONDS
-            )
-        ):
-            return list(
-                self._asset_cache
-            )
-
-        if not ASSET_DISCOVERY_ENABLED:
-            return self._fallback_assets()
-
-        assets: list[str] = []
-
-        try:
-            session = await self._get_session()
-
-            async with session.get(
-                POCKET_OPTION_ASSETS_URL
-            ) as response:
-
-                if response.status == 200:
-
-                    html = await response.text(
-                        errors="ignore"
-                    )
-
-                    assets = self._parse_pocket_assets(
-                        html
-                    )
-
-        except Exception as exc:
-
-            print(
-                "[MARKET] Discovery error: "
-                f"{exc}"
-            )
-
-        fallback = self._fallback_assets()
-
-        result: list[str] = []
-
-        for asset in (
-            assets + fallback
-        ):
-
-            if not asset:
-                continue
-
-            if asset not in result:
-                result.append(
-                    asset
-                )
-
-        self._asset_cache = result
-        self._asset_cache_time = now
-
-        return list(result)
-
     async def discover_pocket_pairs(
         self,
     ) -> list[str]:
 
-        assets = await self.discover_pocket_assets()
-
-        pairs: list[str] = []
-
-        for asset in assets:
-
-            if self.is_otc(asset):
-                continue
-
-            pair = self._normalize_forex_pair(
-                asset
-            )
-
-            if pair and pair not in pairs:
-                pairs.append(pair)
-
-        if not pairs:
-            return list(
-                FALLBACK_PAIRS
-            )
-
-        return pairs
-
-    def _fallback_assets(
-        self,
-    ) -> list[str]:
-
-        result: list[str] = []
-
-        for pair in FALLBACK_PAIRS:
-
-            normalized = (
-                self._normalize_forex_pair(
-                    pair
-                )
-            )
-
-            if (
-                normalized
-                and normalized not in result
-            ):
-                result.append(
-                    normalized
-                )
-
-        for pair in OTC_PAIRS:
-
-            normalized = (
-                self.normalize_otc_symbol(
-                    pair
-                )
-            )
-
-            if (
-                normalized
-                and normalized not in result
-            ):
-                result.append(
-                    normalized
-                )
-
-        return result
-
-    def _parse_pocket_assets(
-        self,
-        html: str,
-    ) -> list[str]:
-
-        if not html:
+        if not ASSET_DISCOVERY_ENABLED:
             return []
 
-        found: list[str] = []
+        now = time.time()
 
-        # --------------------------------------------------------
-        # OTC
-        # --------------------------------------------------------
+        if (
+            self._asset_cache
+            and now - self._asset_cache_time
+            < ASSET_DISCOVERY_CACHE_SECONDS
+        ):
+            return list(self._asset_cache)
 
-        otc_patterns = [
-            r"\b([A-Z]{3}/[A-Z]{3})\s*OTC\b",
-            r"\b([A-Z]{6})[_\-\s]OTC\b",
-        ]
+        if not POCKET_OPTION_ASSETS_URL:
+            return []
 
-        for pattern in otc_patterns:
-
-            try:
-                matches = __import__(
-                    "re"
-                ).findall(
-                    pattern,
-                    html,
-                    flags=__import__(
-                        "re"
-                    ).IGNORECASE,
-                )
-            except Exception:
-                matches = []
-
-            for value in matches:
-
-                value = self._clean_asset_name(
-                    value
-                )
-
-                otc = self.normalize_otc_symbol(
-                    f"{value} OTC"
-                )
-
-                if otc:
-                    found.append(
-                        otc
-                    )
-
-        # --------------------------------------------------------
-        # NORMAL
-        # --------------------------------------------------------
+        session = await self._get_session()
 
         try:
+            async with session.get(
+                POCKET_OPTION_ASSETS_URL
+            ) as response:
 
-            matches = __import__(
-                "re"
-            ).findall(
-                r"\b([A-Z]{3}/[A-Z]{3})\b",
-                html,
-                flags=__import__(
-                    "re"
-                ).IGNORECASE,
-            )
+                if response.status != 200:
+                    print(
+                        f"[PAIRS] discovery HTTP "
+                        f"{response.status}"
+                    )
+                    return []
 
-        except Exception:
-
-            matches = []
-
-        for value in matches:
-
-            normalized = (
-                self._normalize_forex_pair(
-                    value
+                data = await response.json(
+                    content_type=None
                 )
-            )
 
-            if normalized:
-                found.append(
-                    normalized
-                )
+        except Exception as exc:
+            print(
+                f"[PAIRS] discovery error: {exc}"
+            )
+            return []
 
         result: list[str] = []
 
-        for asset in found:
+        if isinstance(data, dict):
+            candidates = (
+                data.get("assets")
+                or data.get("pairs")
+                or data.get("symbols")
+                or data.get("data")
+                or []
+            )
+        elif isinstance(data, list):
+            candidates = data
+        else:
+            candidates = []
 
-            if asset not in result:
-                result.append(
-                    asset
+        for item in candidates:
+            symbol = None
+
+            if isinstance(item, str):
+                symbol = item
+
+            elif isinstance(item, dict):
+                symbol = (
+                    item.get("symbol")
+                    or item.get("name")
+                    or item.get("pair")
+                    or item.get("asset")
                 )
+
+            if not symbol:
+                continue
+
+            symbol = str(symbol).strip()
+
+            if not symbol:
+                continue
+
+            result.append(symbol)
+
+        result = self._normalize_pair_list(result)
+
+        self._asset_cache = result
+        self._asset_cache_time = now
+
+        print(
+            f"[PAIRS] Динамически найдено: "
+            f"{len(result)}"
+        )
+
+        return list(result)
+
+    @staticmethod
+    def _normalize_pair_list(
+        pairs: list[str],
+    ) -> list[str]:
+
+        result: list[str] = []
+        seen: set[str] = set()
+
+        for pair in pairs:
+            value = str(pair).strip()
+
+            if not value:
+                continue
+
+            upper = value.upper()
+
+            key = upper.replace(
+                "/",
+                "",
+            ).replace(
+                "_",
+                "",
+            ).replace(
+                "-",
+                "",
+            ).replace(
+                " ",
+                "",
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            result.append(value)
 
         return result
 
@@ -558,975 +1116,69 @@ class MarketClient:
 
     async def get_available_pairs(
         self,
+        include_otc: bool = True,
     ) -> list[str]:
 
-        discovered = (
-            await self.discover_pocket_assets()
+        """
+        Возвращает список пар без массового запроса свечей.
+
+        Это специально сделано так, чтобы бот не делал
+        20-30 API-запросов только для определения списка пар.
+        """
+
+        regular_pairs = self._normalize_pair_list(
+            list(FALLBACK_PAIRS)
         )
 
-        result: list[str] = []
+        print(
+            f"[PAIRS] Обычных: "
+            f"{len(regular_pairs)}"
+        )
 
-        # --------------------------------------------------------
-        # NORMAL FOREX
-        # --------------------------------------------------------
+        result = list(regular_pairs)
 
-        for asset in discovered:
-
-            if self.is_otc(asset):
-                continue
-
-            pair = self._normalize_forex_pair(
-                asset
-            )
-
-            if not pair:
-                continue
-
+        if include_otc:
             try:
+                from keyboards import OTC_PAIRS
 
-                candles = (
-                    await self._get_twelve_data_candles(
-                        pair,
-                        limit=5,
-                        interval=CANDLE_INTERVAL,
-                    )
+                otc_pairs = self._normalize_pair_list(
+                    list(OTC_PAIRS)
                 )
 
-                if (
-                    candles is not None
-                    and not candles.empty
-                ):
-
-                    if pair not in result:
-                        result.append(
-                            pair
-                        )
-
-            except Exception:
-                continue
-
-        # --------------------------------------------------------
-        # FALLBACK NORMAL
-        # --------------------------------------------------------
-
-        if not any(
-            not self.is_otc(pair)
-            for pair in result
-        ):
-            for pair in FALLBACK_PAIRS:
-
-                normalized = (
-                    self._normalize_forex_pair(
-                        pair
-                    )
+                print(
+                    f"[PAIRS] OTC: "
+                    f"{len(otc_pairs)}"
                 )
 
-                if (
-                    normalized
-                    and normalized not in result
-                ):
-                    result.append(
-                        normalized
-                    )
+                result.extend(otc_pairs)
 
-        # --------------------------------------------------------
-        # OTC
-        # --------------------------------------------------------
-
-        for pair in OTC_PAIRS:
-
-            normalized = (
-                self.normalize_otc_symbol(
-                    pair
-                )
-            )
-
-            if (
-                normalized
-                and normalized not in result
-            ):
-                result.append(
-                    normalized
+            except Exception as exc:
+                print(
+                    f"[PAIRS] OTC list error: {exc}"
                 )
 
-        regular_count = sum(
-            1
-            for pair in result
-            if not self.is_otc(pair)
-        )
-
-        otc_count = sum(
-            1
-            for pair in result
-            if self.is_otc(pair)
-        )
-
-        print(
-            "[MARKET] Доступные активы: "
-            f"{len(result)}"
-        )
-
-        print(
-            "[MARKET] Обычные: "
-            f"{regular_count}"
-        )
-
-        print(
-            "[MARKET] OTC: "
-            f"{otc_count}"
-        )
-
-        return result
-
-    # ============================================================
-    # MAIN CANDLES
-    # ============================================================
-
-    async def get_candles(
-        self,
-        pair: str,
-        interval: int = CANDLE_INTERVAL,
-        limit: int = CANDLE_LIMIT,
-    ) -> Optional[pd.DataFrame]:
-
-        if not pair:
-            return None
-
-        if self.is_otc(pair):
-
-            return await self.get_otc_candles(
-                pair,
-                interval=interval,
-                limit=limit,
-            )
-
-        normalized = (
-            self._normalize_forex_pair(
-                pair
-            )
-        )
-
-        if not normalized:
-            return None
-
-        return await self._get_twelve_data_candles(
-            normalized,
-            limit=limit,
-            interval=interval,
+        return self._normalize_pair_list(
+            result
         )
 
     # ============================================================
-    # OTC CANDLES
+    # HEALTH
     # ============================================================
 
-    async def get_otc_candles(
-        self,
-        symbol: str,
-        interval: int = CANDLE_INTERVAL,
-        limit: int = CANDLE_LIMIT,
-    ) -> Optional[pd.DataFrame]:
-
-        otc_symbol = (
-            self.normalize_otc_symbol(
-                symbol
-            )
-        )
-
-        if not otc_symbol:
-            return None
-
-        # --------------------------------------------------------
-        # BiQuote expects normal symbol:
-        #
-        # EURUSD
-        #
-        # not EURUSD_otc.
-        # --------------------------------------------------------
-
-        base_symbol = otc_symbol[:-4]
-
-        if len(base_symbol) != 6:
-            print(
-                f"[OTC] Неподдерживаемый "
-                f"символ: {symbol}"
-            )
-
-            return None
-
-        print(
-            f"[OTC] {otc_symbol}: "
-            "получение публичных данных"
-        )
-
-        # --------------------------------------------------------
-        # First: try enough historical points.
-        # --------------------------------------------------------
-
-        df = await self._get_biquote_history(
-            base_symbol,
-            interval=interval,
-            limit=limit,
-        )
-
-        if (
-            df is not None
-            and len(df) >= 50
-        ):
-
-            print(
-                f"[OTC] {otc_symbol}: "
-                f"получено {len(df)} свечей"
-            )
-
-            return df.tail(
-                limit
-            ).reset_index(
-                drop=True
-            )
-
-        # --------------------------------------------------------
-        # Second: build candles from live ticks.
-        # --------------------------------------------------------
-
-        df = await self._get_biquote_ticks(
-            base_symbol,
-            interval=interval,
-            limit=limit,
-        )
-
-        if (
-            df is not None
-            and len(df) >= 50
-        ):
-
-            print(
-                f"[OTC] {otc_symbol}: "
-                f"из live-данных получено "
-                f"{len(df)} свечей"
-            )
-
-            return df.tail(
-                limit
-            ).reset_index(
-                drop=True
-            )
-
-        print(
-            f"[OTC] {otc_symbol}: "
-            "недостаточно данных"
-        )
-
-        return None
-
-    # ============================================================
-    # BIQUOTE HISTORY
-    # ============================================================
-
-    async def _get_biquote_history(
-        self,
-        symbol: str,
-        interval: int,
-        limit: int,
-    ) -> Optional[pd.DataFrame]:
-
-        url = BIQUOTE_URL.format(
-            symbol=symbol
-        )
-
-        try:
-
-            session = await self._get_session()
-
-            async with session.get(
-                url
-            ) as response:
-
-                if response.status != 200:
-                    return None
-
-                payload = await response.json(
-                    content_type=None
-                )
-
-        except Exception as exc:
-
-            print(
-                f"[OTC] BiQuote history "
-                f"{symbol}: {exc}"
-            )
-
-            return None
-
-        # --------------------------------------------------------
-        # Different possible response formats.
-        # --------------------------------------------------------
-
-        rows: Any = None
-
-        if isinstance(
-            payload,
-            list,
-        ):
-            rows = payload
-
-        elif isinstance(
-            payload,
-            dict,
-        ):
-
-            for key in (
-                "data",
-                "history",
-                "candles",
-                "values",
-                "prices",
-                "ticks",
-                "result",
-            ):
-
-                value = payload.get(
-                    key
-                )
-
-                if isinstance(
-                    value,
-                    list,
-                ):
-                    rows = value
-                    break
-
-        if rows is None:
-            return None
-
-        # --------------------------------------------------------
-        # If API returns OHLC directly.
-        # --------------------------------------------------------
-
-        df = self._candles_to_dataframe(
-            rows
-        )
-
-        if (
-            df is not None
-            and len(df) >= 10
-        ):
-            return df
-
-        # --------------------------------------------------------
-        # If API returns ticks.
-        # --------------------------------------------------------
-
-        tick_df = self._ticks_to_dataframe(
-            rows
-        )
-
-        if tick_df is None:
-            return None
-
-        return self._ticks_to_candles(
-            tick_df,
-            interval=interval,
-        )
-
-    # ============================================================
-    # BIQUOTE TICKS
-    # ============================================================
-
-    async def _get_biquote_ticks(
-        self,
-        symbol: str,
-        interval: int,
-        limit: int,
-    ) -> Optional[pd.DataFrame]:
-
-        url = BIQUOTE_URL.format(
-            symbol=symbol
-        )
-
-        try:
-
-            session = await self._get_session()
-
-            async with session.get(
-                url
-            ) as response:
-
-                if response.status != 200:
-                    return None
-
-                payload = await response.json(
-                    content_type=None
-                )
-
-        except Exception:
-            return None
-
-        rows: Any = None
-
-        if isinstance(
-            payload,
-            list,
-        ):
-            rows = payload
-
-        elif isinstance(
-            payload,
-            dict,
-        ):
-
-            for key in (
-                "ticks",
-                "prices",
-                "data",
-                "history",
-                "values",
-                "result",
-            ):
-
-                value = payload.get(
-                    key
-                )
-
-                if isinstance(
-                    value,
-                    list,
-                ):
-                    rows = value
-                    break
-
-        if rows is None:
-            return None
-
-        ticks = self._ticks_to_dataframe(
-            rows
-        )
-
-        if ticks is None:
-            return None
-
-        return self._ticks_to_candles(
-            ticks,
-            interval=interval,
-        )
-
-    # ============================================================
-    # TICKS -> DATAFRAME
-    # ============================================================
-
-    @staticmethod
-    def _ticks_to_dataframe(
-        rows: Any,
-    ) -> Optional[pd.DataFrame]:
-
-        if not rows:
-            return None
-
-        if isinstance(
-            rows,
-            dict,
-        ):
-            rows = [rows]
-
-        try:
-
-            df = pd.DataFrame(
-                rows
-            )
-
-        except Exception:
-            return None
-
-        if df.empty:
-            return None
-
-        df.columns = [
-            str(column)
-            .strip()
-            .lower()
-            for column in df.columns
-        ]
-
-        timestamp_column = None
-
-        for name in (
-            "timestamp",
-            "time",
-            "datetime",
-            "date",
-            "ts",
-        ):
-
-            if name in df.columns:
-                timestamp_column = name
-                break
-
-        price_column = None
-
-        for name in (
-            "price",
-            "last",
-            "close",
-            "value",
-            "rate",
-        ):
-
-            if name in df.columns:
-                price_column = name
-                break
-
-        if (
-            timestamp_column is None
-            or price_column is None
-        ):
-            return None
-
-        df["timestamp"] = (
-            pd.to_numeric(
-                df[timestamp_column],
-                errors="coerce",
-            )
-        )
-
-        numeric_time = (
-            df["timestamp"]
-            .dropna()
-        )
-
-        if numeric_time.empty:
-            return None
-
-        median_time = float(
-            numeric_time.median()
-        )
-
-        if median_time > 100_000_000_000:
-
-            df["timestamp"] = pd.to_datetime(
-                df["timestamp"],
-                unit="ms",
-                utc=True,
-                errors="coerce",
-            )
-
-        else:
-
-            df["timestamp"] = pd.to_datetime(
-                df["timestamp"],
-                unit="s",
-                utc=True,
-                errors="coerce",
-            )
-
-        df["price"] = pd.to_numeric(
-            df[price_column],
-            errors="coerce",
-        )
-
-        df = df.dropna(
-            subset=[
-                "timestamp",
-                "price",
-            ]
-        )
-
-        if df.empty:
-            return None
-
-        return (
-            df[
-                [
-                    "timestamp",
-                    "price",
-                ]
-            ]
-            .sort_values("timestamp")
-            .drop_duplicates(
-                "timestamp",
-                keep="last",
-            )
-            .reset_index(
-                drop=True
-            )
-        )
-
-    # ============================================================
-    # TICKS -> CANDLES
-    # ============================================================
-
-    @staticmethod
-    def _ticks_to_candles(
-        ticks: pd.DataFrame,
-        interval: int,
-    ) -> Optional[pd.DataFrame]:
-
-        if ticks is None:
-            return None
-
-        if ticks.empty:
-            return None
-
-        seconds = max(
-            1,
-            int(interval),
-        )
-
-        frame = ticks.copy()
-
-        frame = frame.set_index(
-            "timestamp"
-        )
-
-        candles = (
-            frame["price"]
-            .resample(
-                f"{seconds}s",
-                label="left",
-                closed="left",
-            )
-            .ohlc()
-        )
-
-        candles = candles.dropna()
-
-        if candles.empty:
-            return None
-
-        candles = candles.reset_index()
-
-        return candles[
-            [
-                "timestamp",
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        ]
-
-    # ============================================================
-    # TWELVE DATA
-    # ============================================================
-
-    async def _get_twelve_data_candles(
-        self,
-        pair: str,
-        limit: int = CANDLE_LIMIT,
-        interval: int = CANDLE_INTERVAL,
-    ) -> Optional[pd.DataFrame]:
-
+    async def health_check(self) -> bool:
         if not TWELVE_DATA_API_KEY:
-            print(
-                "[MARKET] "
-                "TWELVE_DATA_API_KEY отсутствует"
-            )
-            return None
-
-        normalized = (
-            self._normalize_forex_pair(
-                pair
-            )
-        )
-
-        if not normalized:
-            return None
-
-        interval_name = (
-            self._twelve_interval(
-                interval
-            )
-        )
-
-        params = {
-            "symbol": normalized,
-            "interval": interval_name,
-            "outputsize": max(
-                1,
-                int(limit),
-            ),
-            "apikey": TWELVE_DATA_API_KEY,
-            "format": "JSON",
-        }
+            return False
 
         try:
-
-            session = await self._get_session()
-
-            async with session.get(
-                TWELVE_DATA_URL,
-                params=params,
-            ) as response:
-
-                if response.status != 200:
-                    return None
-
-                payload = await response.json(
-                    content_type=None
-                )
-
-        except Exception as exc:
-
-            print(
-                f"[MARKET] Twelve Data "
-                f"{normalized}: {exc}"
+            candles = await self.get_candles(
+                FALLBACK_PAIRS[0],
+                limit=10,
             )
 
-            return None
-
-        if not isinstance(
-            payload,
-            dict,
-        ):
-            return None
-
-        if payload.get(
-            "status"
-        ) == "error":
-            return None
-
-        values = payload.get(
-            "values"
-        )
-
-        if not isinstance(
-            values,
-            list,
-        ):
-            return None
-
-        return self._candles_to_dataframe(
-            values
-        )
-
-    # ============================================================
-    # INTERVAL
-    # ============================================================
-
-    @staticmethod
-    def _twelve_interval(
-        seconds: int,
-    ) -> str:
-
-        seconds = int(
-            seconds
-        )
-
-        mapping = {
-            60: "1min",
-            300: "5min",
-            900: "15min",
-            1800: "30min",
-            3600: "1h",
-        }
-
-        if seconds in mapping:
-            return mapping[seconds]
-
-        if (
-            seconds > 60
-            and seconds % 60 == 0
-        ):
             return (
-                f"{seconds // 60}min"
-            )
-
-        return "1min"
-
-    # ============================================================
-    # CANDLES DATAFRAME
-    # ============================================================
-
-    @staticmethod
-    def _candles_to_dataframe(
-        candles: Any,
-    ) -> Optional[pd.DataFrame]:
-
-        if candles is None:
-            return None
-
-        try:
-
-            df = pd.DataFrame(
-                candles
+                candles is not None
+                and not candles.empty
             )
 
         except Exception:
-            return None
-
-        if df.empty:
-            return None
-
-        df.columns = [
-            str(column)
-            .strip()
-            .lower()
-            for column in df.columns
-        ]
-
-        aliases = {
-            "datetime": "timestamp",
-            "date": "timestamp",
-            "time": "timestamp",
-            "ts": "timestamp",
-            "open_price": "open",
-            "high_price": "high",
-            "low_price": "low",
-            "close_price": "close",
-        }
-
-        df = df.rename(
-            columns=aliases
-        )
-
-        required = [
-            "open",
-            "high",
-            "low",
-            "close",
-        ]
-
-        for column in required:
-
-            if column not in df.columns:
-                return None
-
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="coerce",
-            )
-
-        if "timestamp" not in df.columns:
-            return None
-
-        raw_timestamp = df[
-            "timestamp"
-        ]
-
-        numeric_timestamp = (
-            pd.to_numeric(
-                raw_timestamp,
-                errors="coerce",
-            )
-        )
-
-        valid = (
-            numeric_timestamp
-            .dropna()
-        )
-
-        if not valid.empty:
-
-            median_value = float(
-                valid.median()
-            )
-
-            if median_value > 100_000_000_000:
-
-                df["timestamp"] = pd.to_datetime(
-                    numeric_timestamp,
-                    unit="ms",
-                    utc=True,
-                    errors="coerce",
-                )
-
-            else:
-
-                df["timestamp"] = pd.to_datetime(
-                    numeric_timestamp,
-                    unit="s",
-                    utc=True,
-                    errors="coerce",
-                )
-
-        else:
-
-            df["timestamp"] = pd.to_datetime(
-                raw_timestamp,
-                utc=True,
-                errors="coerce",
-            )
-
-        df = df.dropna(
-            subset=[
-                "timestamp",
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        )
-
-        if df.empty:
-            return None
-
-        df = (
-            df.sort_values(
-                "timestamp"
-            )
-            .drop_duplicates(
-                "timestamp",
-                keep="last",
-            )
-            .reset_index(
-                drop=True
-            )
-        )
-
-        return df[
-            [
-                "timestamp",
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        ]
-
-    # ============================================================
-    # LEGACY COMPATIBILITY
-    # ============================================================
-
-    async def fetch_candles(
-        self,
-        pair: str,
-        interval: int = CANDLE_INTERVAL,
-        limit: int = CANDLE_LIMIT,
-    ):
-
-        return await self.get_candles(
-            pair,
-            interval=interval,
-            limit=limit,
-        )
-
-    async def get_history(
-        self,
-        pair: str,
-        interval: int = CANDLE_INTERVAL,
-        limit: int = CANDLE_LIMIT,
-    ):
-
-        return await self.get_candles(
-            pair,
-            interval=interval,
-            limit=limit,
-        )
-
-    async def get_data(
-        self,
-        pair: str,
-        interval: int = CANDLE_INTERVAL,
-        limit: int = CANDLE_LIMIT,
-    ):
-
-        return await self.get_candles(
-            pair,
-            interval=interval,
-            limit=limit,
-        )
-
-
-# ============================================================
-# GLOBAL CLIENT
-# ============================================================
-
-market_client = MarketClient()
+            return False
