@@ -1,10 +1,9 @@
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
     Message,
@@ -14,20 +13,17 @@ from fastapi import FastAPI
 from config import (
     ADMIN_ID,
     BOT_TOKEN,
+    validate_config,
 )
-from database import Database
+from database import db
 from keyboards import (
-    admin_request,
-    main_menu,
+    admin_request_keyboard,
+    main_keyboard,
+    pending_keyboard,
 )
-from market import MarketClient
+from market import market_client
 from scheduler import SignalScheduler
-from signal_engine import SignalEngine
 
-
-# ============================================================
-# LOGGING
-# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,595 +35,528 @@ logging.basicConfig(
     ),
 )
 
-logger = logging.getLogger(
-    "pocket_signal_bot"
-)
+logger = logging.getLogger(__name__)
+
+errors = validate_config()
+
+if errors:
+    for error in errors:
+        logger.error(error)
 
 
-# ============================================================
-# BOT
-# ============================================================
-
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML
-    ),
-)
-
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-app = FastAPI(
-    title="Pocket Signal Bot"
-)
+signal_scheduler = SignalScheduler(bot)
 
 
-# ============================================================
-# SERVICES
-# ============================================================
-
-database = Database()
-
-market = MarketClient()
-
-engine = SignalEngine()
-
-scheduler = SignalScheduler(
-    bot=bot,
-    database=database,
-    market=market,
-    engine=engine,
-)
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 
-scheduler_task = None
+def get_user_status(user_id: int) -> str | None:
+    user = db.get_user(user_id)
+
+    if not user:
+        return None
+
+    return user["status"]
 
 
-# ============================================================
-# ACCESS HELPERS
-# ============================================================
-
-async def require_approved(
-    callback: CallbackQuery,
-) -> bool:
-
-    user_id = callback.from_user.id
-
-    status = database.get_status(
-        user_id
-    )
-
-    if status != "approved":
-
-        await callback.answer(
-            "🔒 Сначала дождитесь одобрения.",
-            show_alert=True,
-        )
-
-        return False
-
-    return True
-
-
-# ============================================================
-# START
-# ============================================================
-
-@dp.message(CommandStart())
-async def start_handler(
-    message: Message,
-) -> None:
-
-    user = message.from_user
-
-    if user is None:
+async def notify_admin_new_user(
+    user_id: int,
+    username: str | None,
+    first_name: str | None,
+):
+    if not ADMIN_ID:
         return
 
-    user_id = user.id
-
-    existing = database.get_user(
-        user_id
+    username_text = (
+        f"@{username}"
+        if username
+        else "нет username"
     )
 
-    # --------------------------------------------------------
-    # APPROVED
-    # --------------------------------------------------------
-
-    if existing is not None:
-
-        status = existing["status"]
-
-        if status == "approved":
-
-            await message.answer(
-                "🤖 <b>Pocket Signal Bot</b>\n\n"
-                "Доступ подтверждён.\n\n"
-                "Выберите действие:",
-                reply_markup=main_menu(),
-            )
-
-            return
-
-        if status == "pending":
-
-            await message.answer(
-                "⏳ <b>Заявка уже отправлена.</b>\n\n"
-                "Ожидайте решения администратора."
-            )
-
-            return
-
-        if status == "rejected":
-
-            await message.answer(
-                "❌ <b>Ваша заявка отклонена.</b>"
-            )
-
-            return
-
-        if status == "blocked":
-
-            await message.answer(
-                "🚫 <b>Ваш доступ заблокирован.</b>"
-            )
-
-            return
-
-
-    # --------------------------------------------------------
-    # NEW USER
-    # --------------------------------------------------------
-
-    username = (
-        f"@{user.username}"
-        if user.username
-        else "отсутствует"
-    )
-
-    full_name = (
-        user.full_name
-        or "Не указано"
-    )
-
-    database.create_user(
-        user_id=user_id,
-        username=username,
-        full_name=full_name,
-    )
-
-    await message.answer(
-        "🔒 <b>Доступ закрыт</b>\n\n"
-        "Для использования бота необходимо "
-        "отправить заявку.\n\n"
-        "После проверки администратор "
-        "решит, предоставить ли доступ."
-    )
-
-    admin_message = (
-        "🔔 <b>НОВАЯ ЗАЯВКА</b>\n\n"
-        f"👤 Имя: {full_name}\n"
-        f"🔗 Username: {username}\n"
-        f"🆔 ID: <code>{user_id}</code>"
+    text = (
+        "🔔 <b>Новая заявка на доступ</b>\n\n"
+        f"👤 Имя: <b>{first_name or '—'}</b>\n"
+        f"🔗 Username: <b>{username_text}</b>\n"
+        f"🆔 ID: <code>{user_id}</code>\n\n"
+        "Выберите действие:"
     )
 
     try:
-
         await bot.send_message(
             ADMIN_ID,
-            admin_message,
-            reply_markup=admin_request(
+            text,
+            parse_mode="HTML",
+            reply_markup=admin_request_keyboard(
                 user_id
             ),
         )
-
     except Exception:
-
         logger.exception(
-            "Не удалось отправить заявку админу."
+            "Не удалось уведомить администратора"
         )
 
 
-# ============================================================
-# APPROVE
-# ============================================================
+@dp.message(CommandStart())
+async def start_handler(message: Message):
+    if not message.from_user:
+        return
+
+    user_id = message.from_user.id
+
+    if is_admin(user_id):
+        await message.answer(
+            "👑 <b>Админ-панель</b>\n\n"
+            "Ты имеешь полный доступ к сигналам.",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    existing = db.get_user(user_id)
+
+    if existing:
+        status = existing["status"]
+
+        if status == "APPROVED":
+            await message.answer(
+                "✅ <b>Доступ подтверждён.</b>\n\n"
+                "Можно получать сигналы.",
+                parse_mode="HTML",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        if status == "REJECTED":
+            await message.answer(
+                "❌ <b>Доступ отклонён.</b>\n\n"
+                "Обратитесь к администратору.",
+                parse_mode="HTML",
+            )
+            return
+
+        await message.answer(
+            "⏳ <b>Заявка уже отправлена.</b>\n\n"
+            "Ожидайте решения администратора.",
+            parse_mode="HTML",
+            reply_markup=pending_keyboard(),
+        )
+        return
+
+    user = db.create_or_update_user(
+        user_id=user_id,
+        username=message.from_user.username,
+        first_name=message.from_user.first_name,
+    )
+
+    await message.answer(
+        "⏳ <b>Заявка отправлена.</b>\n\n"
+        "Доступ к сигналам пока закрыт.\n"
+        "Администратор должен одобрить твою заявку.",
+        parse_mode="HTML",
+        reply_markup=pending_keyboard(),
+    )
+
+    await notify_admin_new_user(
+        user_id=user_id,
+        username=message.from_user.username,
+        first_name=message.from_user.first_name,
+    )
+
+
+@dp.callback_query(
+    F.data == "check_access"
+)
+async def check_access_handler(
+    callback: CallbackQuery,
+):
+    user_id = callback.from_user.id
+
+    if is_admin(user_id):
+        await callback.message.edit_text(
+            "👑 Администратор имеет доступ."
+        )
+        await callback.answer()
+        return
+
+    status = get_user_status(user_id)
+
+    if status == "APPROVED":
+        await callback.message.edit_text(
+            "✅ <b>Доступ подтверждён.</b>\n\n"
+            "Теперь можно получать сигналы.",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+    elif status == "REJECTED":
+        await callback.message.edit_text(
+            "❌ <b>Доступ отклонён.</b>",
+            parse_mode="HTML",
+        )
+    else:
+        await callback.answer(
+            "Заявка ещё не рассмотрена.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+
 
 @dp.callback_query(
     F.data.startswith("approve:")
 )
 async def approve_handler(
     callback: CallbackQuery,
-) -> None:
-
-    if callback.from_user.id != ADMIN_ID:
-
+):
+    if not is_admin(callback.from_user.id):
         await callback.answer(
-            "⛔ Нет доступа.",
+            "Нет доступа.",
             show_alert=True,
         )
-
         return
 
     try:
-
         user_id = int(
-            callback.data.split(
-                ":",
-                1
-            )[1]
+            callback.data.split(":", 1)[1]
         )
-
     except (
         ValueError,
         AttributeError,
     ):
-
         await callback.answer(
-            "Некорректная заявка.",
+            "Некорректный ID.",
             show_alert=True,
         )
-
         return
 
-    database.update_user_status(
+    db.set_status(
         user_id,
-        "approved",
+        "APPROVED",
+    )
+
+    await callback.message.edit_text(
+        callback.message.text +
+        "\n\n✅ <b>ОДОБРЕНО</b>",
+        parse_mode="HTML",
     )
 
     try:
-
         await bot.send_message(
             user_id,
-            "✅ <b>Заявка одобрена!</b>\n\n"
-            "Теперь тебе доступен бот.",
-            reply_markup=main_menu(),
+            "🎉 <b>Доступ одобрен!</b>\n\n"
+            "Теперь ты можешь получать сигналы.",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
         )
-
     except Exception:
-
         logger.exception(
-            "Не удалось уведомить пользователя."
+            "Не удалось уведомить пользователя"
         )
-
-    try:
-
-        await callback.message.edit_reply_markup(
-            reply_markup=None
-        )
-
-    except Exception:
-
-        pass
-
-    await callback.message.answer(
-        f"✅ Пользователь "
-        f"<code>{user_id}</code> одобрен."
-    )
 
     await callback.answer(
         "Пользователь одобрен."
     )
 
 
-# ============================================================
-# REJECT
-# ============================================================
-
 @dp.callback_query(
     F.data.startswith("reject:")
 )
 async def reject_handler(
     callback: CallbackQuery,
-) -> None:
-
-    if callback.from_user.id != ADMIN_ID:
-
+):
+    if not is_admin(callback.from_user.id):
         await callback.answer(
-            "⛔ Нет доступа.",
+            "Нет доступа.",
             show_alert=True,
         )
-
         return
 
     try:
-
         user_id = int(
-            callback.data.split(
-                ":",
-                1
-            )[1]
+            callback.data.split(":", 1)[1]
         )
-
     except (
         ValueError,
         AttributeError,
     ):
-
         await callback.answer(
-            "Некорректная заявка.",
+            "Некорректный ID.",
             show_alert=True,
         )
-
         return
 
-    database.update_user_status(
+    db.set_status(
         user_id,
-        "rejected",
+        "REJECTED",
+    )
+
+    await callback.message.edit_text(
+        callback.message.text +
+        "\n\n❌ <b>ОТКЛОНЕНО</b>",
+        parse_mode="HTML",
     )
 
     try:
-
         await bot.send_message(
             user_id,
-            "❌ <b>Заявка отклонена.</b>"
+            "❌ <b>Доступ отклонён.</b>\n\n"
+            "Обратитесь к администратору.",
+            parse_mode="HTML",
         )
-
     except Exception:
-
         logger.exception(
-            "Не удалось уведомить пользователя."
+            "Не удалось уведомить пользователя"
         )
-
-    try:
-
-        await callback.message.edit_reply_markup(
-            reply_markup=None
-        )
-
-    except Exception:
-
-        pass
-
-    await callback.message.answer(
-        f"❌ Пользователь "
-        f"<code>{user_id}</code> отклонён."
-    )
 
     await callback.answer(
-        "Заявка отклонена."
+        "Пользователь отклонён."
     )
 
-
-# ============================================================
-# MANUAL SIGNAL
-# ============================================================
 
 @dp.callback_query(
     F.data == "request_signal"
 )
 async def request_signal_handler(
     callback: CallbackQuery,
-) -> None:
-
-    if not await require_approved(
-        callback
-    ):
-        return
-
+):
     user_id = callback.from_user.id
 
-    database.save_signal_request(
-        user_id
-    )
+    if (
+        not is_admin(user_id)
+        and get_user_status(user_id) != "APPROVED"
+    ):
+        await callback.answer(
+            "Сначала получите доступ.",
+            show_alert=True,
+        )
+        return
 
     await callback.answer(
         "🔎 Анализирую рынок..."
     )
 
-    status_message = await callback.message.answer(
-        "🔎 <b>Анализирую рынок...</b>\n\n"
-        "Проверяю валютные пары и "
-        "ищу ближайшую качественную точку входа."
-    )
-
     try:
-
-        signal = (
-            await scheduler.find_best_signal()
-        )
+        signal = await signal_scheduler.find_best_signal()
 
         if signal is None:
-
-            await status_message.edit_text(
-                "⛔ <b>СИЛЬНОГО СИГНАЛА НЕТ</b>\n\n"
-                "Сейчас рынок не прошёл "
-                "минимальный фильтр качества.\n\n"
-                "Попробуйте запросить сигнал позже."
+            await callback.message.answer(
+                "⚪ <b>Сильного сигнала сейчас нет.</b>\n\n"
+                "Я не буду выдавать слабый сигнал "
+                "только ради того, чтобы что-то показать.",
+                parse_mode="HTML",
             )
-
             return
 
-        direction = (
-            "🟢 CALL ↑"
-            if signal.direction == "CALL"
-            else "🔴 PUT ↓"
+        await signal_scheduler.save_signal(
+            signal
         )
 
-        confirmations = []
-
-        for name, value in (
-            signal.confirmations.items()
-        ):
-
-            mark = (
-                "🟢"
-                if value == "CALL"
-                else "🔴"
-            )
-
-            confirmations.append(
-                f"{mark} {name}"
-            )
-
-        confirmation_text = "\n".join(
-            confirmations
-        )
-
-        text = (
-            f"<b>{direction}</b>\n\n"
-            f"💱 <b>{signal.pair}</b>\n\n"
-            f"⏰ <b>ВХОД:</b> "
-            f"{signal.entry_time.strftime('%H:%M')} МСК\n"
-            f"🎯 <b>ЭКСПИРАЦИЯ:</b> "
-            f"{signal.expiry_time.strftime('%H:%M')} МСК\n\n"
-            f"📊 <b>QUALITY:</b> "
-            f"{signal.quality}/100\n\n"
-            f"<b>Подтверждения:</b>\n"
-            f"{confirmation_text}\n\n"
-            f"⚠️ Это аналитический сигнал, "
-            f"а не гарантия результата."
-        )
-
-        database.save_signal(
-            pair=signal.pair,
-            direction=signal.direction,
-            entry_time=signal.entry_time.isoformat(),
-            expiry_time=signal.expiry_time.isoformat(),
-            quality=signal.quality,
-            score_details=text,
-        )
-
-        await status_message.edit_text(
-            text
+        await callback.message.answer(
+            signal_scheduler.format_signal(
+                signal
+            ),
+            parse_mode="HTML",
         )
 
     except Exception:
-
         logger.exception(
-            "Ошибка ручного анализа."
+            "Ошибка ручного запроса сигнала"
         )
 
-        await status_message.edit_text(
-            "⚠️ <b>Не удалось выполнить анализ.</b>\n\n"
-            "Попробуйте ещё раз через некоторое время."
+        await callback.message.answer(
+            "⚠️ Не удалось получить рыночные данные.\n"
+            "Попробуйте ещё раз позже."
         )
 
 
-# ============================================================
-# AUTO SIGNALS BUTTON
-# ============================================================
-
 @dp.callback_query(
-    F.data == "auto_signals"
+    F.data == "history"
 )
-async def auto_signals_handler(
+async def history_handler(
     callback: CallbackQuery,
-) -> None:
+):
+    user_id = callback.from_user.id
 
-    if not await require_approved(
-        callback
+    if (
+        not is_admin(user_id)
+        and get_user_status(user_id) != "APPROVED"
     ):
-        return
-
-    await callback.answer()
-
-    await callback.message.answer(
-        "🤖 <b>Автоматические сигналы</b>\n\n"
-        "Бот самостоятельно анализирует рынок "
-        "и отправляет сильные сигналы "
-        "одобренным пользователям.\n\n"
-        "⏰ Время указывается по МСК (UTC+3)."
-    )
-
-
-# ============================================================
-# STATISTICS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "statistics"
-)
-async def statistics_handler(
-    callback: CallbackQuery,
-) -> None:
-
-    if not await require_approved(
-        callback
-    ):
-        return
-
-    stats = (
-        database.get_signal_stats()
-    )
-
-    await callback.answer()
-
-    await callback.message.answer(
-        "📊 <b>СТАТИСТИКА</b>\n\n"
-        f"📨 Всего сигналов: "
-        f"<b>{stats['total']}</b>\n"
-        f"✅ WIN: "
-        f"<b>{stats['wins']}</b>\n"
-        f"❌ LOSS: "
-        f"<b>{stats['losses']}</b>\n"
-        f"📈 Завершено: "
-        f"<b>{stats['finished']}</b>\n"
-        f"🎯 WINRATE: "
-        f"<b>{stats['winrate']:.2f}%</b>\n\n"
-        "WINRATE считается только по "
-        "фактически отмеченным результатам."
-    )
-
-
-# ============================================================
-# BACK MENU
-# ============================================================
-
-@dp.callback_query(
-    F.data == "back_menu"
-)
-async def back_menu_handler(
-    callback: CallbackQuery,
-) -> None:
-
-    if not await require_approved(
-        callback
-    ):
-        return
-
-    await callback.message.answer(
-        "Главное меню:",
-        reply_markup=main_menu(),
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# UNKNOWN CALLBACK
-# ============================================================
-
-@dp.callback_query()
-async def unknown_callback(
-    callback: CallbackQuery,
-) -> None:
-
-    status = database.get_status(
-        callback.from_user.id
-    )
-
-    if status != "approved":
-
         await callback.answer(
-            "🔒 Доступ не одобрен.",
+            "Нет доступа.",
             show_alert=True,
         )
-
         return
 
-    await callback.answer(
-        "Функция пока недоступна."
+    signals = db.get_recent_signals(10)
+
+    if not signals:
+        await callback.message.answer(
+            "📊 История пока пустая."
+        )
+        await callback.answer()
+        return
+
+    lines = [
+        "📊 <b>Последние сигналы</b>\n"
+    ]
+
+    for signal in signals:
+        direction = signal["direction"]
+
+        emoji = (
+            "🟢"
+            if direction == "CALL"
+            else "🔴"
+        )
+
+        lines.append(
+            f"{emoji} {signal['pair']} "
+            f"<b>{direction}</b> "
+            f"Quality {signal['quality']:.0f}"
+        )
+
+    await callback.message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+    await callback.answer()
+
+
+@dp.message(Command("users"))
+async def users_handler(message: Message):
+    if not message.from_user:
+        return
+
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    pending = db.get_pending_users()
+
+    if not pending:
+        await message.answer(
+            "📭 Новых заявок нет."
+        )
+        return
+
+    for user in pending:
+        username = (
+            f"@{user['username']}"
+            if user["username"]
+            else "нет username"
+        )
+
+        text = (
+            "👤 <b>Заявка</b>\n\n"
+            f"Имя: {user['first_name'] or '—'}\n"
+            f"Username: {username}\n"
+            f"ID: <code>{user['user_id']}</code>"
+        )
+
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=admin_request_keyboard(
+                user["user_id"]
+            ),
+        )
+
+
+@dp.message(Command("id"))
+async def id_handler(message: Message):
+    if not message.from_user:
+        return
+
+    await message.answer(
+        f"🆔 Ваш Telegram ID:\n"
+        f"<code>{message.from_user.id}</code>",
+        parse_mode="HTML",
     )
 
 
-# ============================================================
-# FASTAPI
-# ============================================================
+@dp.message()
+async def fallback_handler(message: Message):
+    if not message.from_user:
+        return
+
+    user_id = message.from_user.id
+
+    if (
+        is_admin(user_id)
+        or get_user_status(user_id) == "APPROVED"
+    ):
+        await message.answer(
+            "Выберите действие:",
+            reply_markup=main_keyboard(),
+        )
+    else:
+        await message.answer(
+            "⏳ Доступ ещё не одобрен.",
+            reply_markup=pending_keyboard(),
+        )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info(
+        "Запуск Pocket Signal Bot..."
+    )
+
+    if errors:
+        logger.error(
+            "Конфигурация содержит ошибки: %s",
+            errors,
+        )
+
+    bot_task = asyncio.create_task(
+        dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+    )
+
+    scheduler_task = asyncio.create_task(
+        signal_scheduler.run()
+    )
+
+    try:
+        yield
+
+    finally:
+        logger.info(
+            "Остановка приложения..."
+        )
+
+        scheduler_task.cancel()
+        bot_task.cancel()
+
+        await asyncio.gather(
+            scheduler_task,
+            bot_task,
+            return_exceptions=True,
+        )
+
+        await market_client.close()
+        await bot.session.close()
+
+
+app = FastAPI(
+    title="Pocket Signal Bot",
+    lifespan=lifespan,
+)
+
 
 @app.get("/")
 async def root():
     return {
         "status": "ok",
-        "service": "pocket-signal-bot",
+        "service": "Pocket Signal Bot",
     }
 
 
@@ -635,74 +564,5 @@ async def root():
 async def health():
     return {
         "status": "healthy",
+        "bot": "running",
     }
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-async def start_scheduler() -> None:
-
-    global scheduler_task
-
-    scheduler_task = asyncio.create_task(
-        scheduler.run()
-    )
-
-    logger.info(
-        "Signal scheduler task created."
-    )
-
-
-# ============================================================
-# BOT
-# ============================================================
-
-async def run_bot() -> None:
-
-    logger.info(
-        "Starting Telegram bot..."
-    )
-
-    await start_scheduler()
-
-    await dp.start_polling(
-        bot,
-        allowed_updates=(
-            dp.resolve_used_update_types()
-        ),
-        handle_signals=True,
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-async def main() -> None:
-
-    try:
-
-        await run_bot()
-
-    finally:
-
-        global scheduler_task
-
-        if scheduler_task is not None:
-
-            scheduler_task.cancel()
-
-            try:
-                await scheduler_task
-            except asyncio.CancelledError:
-                pass
-
-        database.close()
-
-        await bot.session.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
