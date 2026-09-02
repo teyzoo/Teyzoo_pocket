@@ -1,224 +1,231 @@
+from __future__ import annotations
+
 import asyncio
-import logging
 from datetime import datetime
 
 from config import (
     ADMIN_ID,
     AUTO_SCAN_SECONDS,
+    MIN_PROBABILITY,
     PAIRS,
     TIMEZONE,
 )
-from database import db
-from market import market_client
-from signal_engine import Signal, SignalEngine
 
-logger = logging.getLogger(__name__)
+from market import market_client
+from signal_engine import SignalEngine, Signal
+
+from database import db
 
 
 class SignalScheduler:
+
     def __init__(self, bot):
         self.bot = bot
         self.engine = SignalEngine()
+
         self.analysis_lock = asyncio.Lock()
 
-    async def find_best_signal(self) -> Signal | None:
-        async with self.analysis_lock:
+    async def _analyze_pair(self, pair: str) -> Signal | None:
+        try:
+            candles = await market_client.get_candles(pair)
 
-            async def analyze_pair(pair: str):
-                candles = await market_client.get_candles(
-                    pair
-                )
-
-                if candles is None:
-                    return None
-
-                try:
-                    return self.engine.analyze(
-                        pair,
-                        candles,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Ошибка анализа %s",
-                        pair,
-                    )
-                    return None
-
-            results = await asyncio.gather(
-                *[
-                    analyze_pair(pair)
-                    for pair in PAIRS
-                ],
-                return_exceptions=True,
-            )
-
-            signals = []
-
-            for result in results:
-                if isinstance(result, Signal):
-                    signals.append(result)
-
-            if not signals:
+            if candles is None:
                 return None
 
-            signals.sort(
-                key=lambda signal: signal.quality,
+            return self.engine.analyze(
+                pair=pair,
+                candles=candles,
+            )
+
+        except Exception as exc:
+            print(
+                f"[SIGNAL] Ошибка анализа {pair}: {exc}"
+            )
+            return None
+
+    async def find_best_signal(
+        self,
+        pair: str | None = None,
+    ) -> Signal | None:
+
+        async with self.analysis_lock:
+
+            if pair:
+                return await self._analyze_pair(pair)
+
+            tasks = [
+                self._analyze_pair(current_pair)
+                for current_pair in PAIRS
+            ]
+
+            results = await asyncio.gather(
+                *tasks,
+                return_exceptions=False,
+            )
+
+            valid_signals = [
+                signal
+                for signal in results
+                if signal is not None
+            ]
+
+            if not valid_signals:
+                return None
+
+            # Сначала качество, затем вероятность.
+            valid_signals.sort(
+                key=lambda signal: (
+                    signal.quality,
+                    signal.probability,
+                ),
                 reverse=True,
             )
 
-            return signals[0]
+            return valid_signals[0]
 
     @staticmethod
     def format_signal(signal: Signal) -> str:
-        entry_msk = signal.entry_time.astimezone(
+        direction_emoji = (
+            "🟢"
+            if signal.direction == "CALL"
+            else "🔴"
+        )
+
+        direction_arrow = (
+            "↑"
+            if signal.direction == "CALL"
+            else "↓"
+        )
+
+        entry_moscow = signal.entry_time.astimezone(
             TIMEZONE
         )
 
-        expiry_msk = signal.expiry_time.astimezone(
+        expiry_moscow = signal.expiry_time.astimezone(
             TIMEZONE
         )
 
-        if signal.direction == "CALL":
-            direction = "🟢 CALL ↑"
-        else:
-            direction = "🔴 PUT ↓"
-
-        confirmations = "\n".join(
-            f"• {item}"
-            for item in signal.confirmations[:6]
+        confirmations_text = "\n".join(
+            f"✅ {item}"
+            for item in signal.confirmations[:8]
         )
 
         return (
-            "🚨 <b>НОВЫЙ СИГНАЛ</b>\n\n"
-            f"<b>{direction}</b>\n\n"
-            f"💱 Пара: <b>{signal.pair}</b>\n"
-            f"⏰ ВХОД: <b>{entry_msk:%H:%M} МСК</b>\n"
-            f"🎯 ЭКСПИРАЦИЯ: "
-            f"<b>{expiry_msk:%H:%M} МСК</b>\n"
-            f"📊 QUALITY: "
-            f"<b>{signal.quality:.0f}/100</b>\n\n"
-            "🔎 <b>Подтверждения:</b>\n"
-            f"{confirmations}\n\n"
-            "⚠️ Сигнал является аналитическим "
-            "прогнозом, а не гарантией результата."
+            f"{direction_emoji} {signal.direction} {direction_arrow}\n\n"
+            f"💱 {signal.pair}\n\n"
+            f"⏰ ВХОД: {entry_moscow:%H:%M} МСК\n"
+            f"🎯 ЭКСПИРАЦИЯ: {expiry_moscow:%H:%M} МСК\n\n"
+            f"📊 QUALITY: {signal.quality}/100\n"
+            f"📈 ШАНС: {signal.probability:.0f}%\n\n"
+            f"{confirmations_text}"
         )
 
     async def save_signal(
         self,
         signal: Signal,
-    ) -> int | None:
-
-        entry_iso = signal.entry_time.isoformat()
+    ) -> bool:
 
         if db.signal_exists(
-            signal.pair,
-            signal.direction,
-            entry_iso,
+            pair=signal.pair,
+            direction=signal.direction,
+            entry_time=signal.entry_time.isoformat(),
         ):
-            return None
+            return False
 
-        signal_id = db.save_signal(
+        db.save_signal(
             pair=signal.pair,
             direction=signal.direction,
             quality=signal.quality,
-            entry_time=entry_iso,
+            entry_time=signal.entry_time.isoformat(),
             expiry_time=signal.expiry_time.isoformat(),
             analysis_time=signal.analysis_time.isoformat(),
-            confirmations=signal.confirmations,
-            reasons=signal.reasons,
+            confirmations="\n".join(signal.confirmations),
+            reasons="\n".join(signal.reasons),
         )
 
-        return signal_id
+        return True
 
-    async def send_to_user(
-        self,
-        user_id: int,
-        signal: Signal,
-    ):
-        try:
-            await self.bot.send_message(
-                user_id,
-                self.format_signal(signal),
-                parse_mode="HTML",
-            )
-        except Exception as exc:
-            logger.warning(
-                "Не удалось отправить сигнал %s: %s",
-                user_id,
-                exc,
-            )
-
-    async def send_automatic_signal(
+    async def send_signal_to_users(
         self,
         signal: Signal,
     ):
-        signal_id = await self.save_signal(
-            signal
-        )
-
-        if signal_id is None:
-            logger.info(
-                "Сигнал уже существует: %s %s %s",
-                signal.pair,
-                signal.direction,
-                signal.entry_time,
-            )
-            return
+        text = self.format_signal(signal)
 
         users = db.get_approved_users()
 
-        if ADMIN_ID and ADMIN_ID not in users:
-            users.append(ADMIN_ID)
+        sent_to = set()
 
-        if not users:
-            logger.info(
-                "Нет пользователей для отправки сигнала"
-            )
-            return
+        for user in users:
+            user_id = int(user["user_id"])
 
-        await asyncio.gather(
-            *[
-                self.send_to_user(
-                    user_id,
-                    signal,
+            if user_id in sent_to:
+                continue
+
+            try:
+                await self.bot.send_message(
+                    chat_id=user_id,
+                    text=text,
                 )
-                for user_id in users
-            ],
-            return_exceptions=True,
-        )
 
-        logger.info(
-            "Сигнал #%s отправлен: %s %s %.0f",
-            signal_id,
-            signal.pair,
-            signal.direction,
-            signal.quality,
-        )
+                sent_to.add(user_id)
+
+            except Exception as exc:
+                print(
+                    f"[SIGNAL] Не удалось отправить "
+                    f"{user_id}: {exc}"
+                )
+
+        # Админ тоже получает сигнал.
+        if ADMIN_ID and ADMIN_ID not in sent_to:
+            try:
+                await self.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=text,
+                )
+            except Exception as exc:
+                print(
+                    f"[SIGNAL] Ошибка отправки админу: {exc}"
+                )
+
+    async def scan_once(self):
+        signal = await self.find_best_signal()
+
+        if signal is None:
+            print(
+                "[SIGNAL] Сильного сигнала нет."
+            )
+            return None
+
+        saved = await self.save_signal(signal)
+
+        if saved:
+            await self.send_signal_to_users(signal)
+
+        return signal
+
+    async def get_manual_signal(
+        self,
+        pair: str | None = None,
+    ) -> Signal | None:
+
+        return await self.find_best_signal(pair=pair)
 
     async def run(self):
-        logger.info(
-            "Автоматический сканер запущен"
-        )
+        print("[SCHEDULER] Автоматический анализ запущен.")
 
         while True:
             try:
-                signal = await self.find_best_signal()
-
-                if signal:
-                    await self.send_automatic_signal(
-                        signal
-                    )
-                else:
-                    logger.info(
-                        "Сильного сигнала сейчас нет"
-                    )
+                await self.scan_once()
 
             except asyncio.CancelledError:
+                print(
+                    "[SCHEDULER] Остановка."
+                )
                 raise
 
-            except Exception:
-                logger.exception(
-                    "Ошибка scheduler"
+            except Exception as exc:
+                print(
+                    f"[SCHEDULER] Ошибка: {exc}"
                 )
 
             await asyncio.sleep(
