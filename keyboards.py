@@ -4,32 +4,39 @@ from aiogram.types import (
 )
 
 
-def main_menu() -> InlineKeyboardMarkup:
+def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔎 Запросить сигнал",
+                    text="🎯 Получить сигнал",
                     callback_data="request_signal",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🤖 Авто-сигналы",
-                    callback_data="auto_signals",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📊 Статистика",
-                    callback_data="statistics",
+                    text="📊 История",
+                    callback_data="history",
                 )
             ],
         ]
     )
 
 
-def admin_request(
+def pending_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Проверить доступ",
+                    callback_data="check_access",
+                )
+            ]
+        ]
+    )
+
+
+def admin_request_keyboard(
     user_id: int,
 ) -> InlineKeyboardMarkup:
 
@@ -44,19 +51,6 @@ def admin_request(
                     text="❌ Отклонить",
                     callback_data=f"reject:{user_id}",
                 ),
-            ]
-        ]
-    )
-
-
-def back_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Главное меню",
-                    callback_data="back_menu",
-                )
             ]
         ]
     )
