@@ -31,18 +31,33 @@ from scheduler import SignalScheduler
 from market import market_client
 
 
+# ============================================================
+# CONFIG VALIDATION
+# ============================================================
+
 errors = validate_config()
 
 if errors:
     print("[CONFIG] Ошибки конфигурации:")
+
     for error in errors:
         print(f" - {error}")
 
 
+# ============================================================
+# BOT
+# ============================================================
+
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+
+# ============================================================
+# SCHEDULER
+# ============================================================
+
 scheduler = SignalScheduler(bot)
+
 scheduler_task: asyncio.Task | None = None
 polling_task: asyncio.Task | None = None
 
@@ -58,8 +73,12 @@ async def start_handler(message: Message):
     username = message.from_user.username or ""
     first_name = message.from_user.first_name or ""
 
-    # Админ
+    # --------------------------------------------------------
+    # ADMIN
+    # --------------------------------------------------------
+
     if user_id == ADMIN_ID:
+
         db.create_or_update_user(
             user_id=user_id,
             username=username,
@@ -72,38 +91,63 @@ async def start_handler(message: Message):
             "Бот готов к работе.",
             reply_markup=main_keyboard(),
         )
+
         return
+
+    # --------------------------------------------------------
+    # EXISTING USER
+    # --------------------------------------------------------
 
     user = db.get_user(user_id)
 
-    # Пользователь уже существует
     if user:
 
         status = user["status"]
 
+        # APPROVED
         if status == "APPROVED":
+
             await message.answer(
                 "✅ Доступ разрешён.\n\n"
                 "Выберите действие:",
                 reply_markup=main_keyboard(),
             )
+
             return
 
+        # PENDING
         if status == "PENDING":
+
             await message.answer(
                 "⏳ Ваша заявка ещё рассматривается.\n\n"
                 "Ожидайте одобрения администратора.",
                 reply_markup=pending_keyboard(),
             )
+
             return
 
+        # REJECTED
         if status == "REJECTED":
+
             await message.answer(
                 "❌ В доступе отказано."
             )
+
             return
 
-    # Новый пользователь
+        # BLOCKED
+        if status == "BLOCKED":
+
+            await message.answer(
+                "🚫 Ваш доступ заблокирован."
+            )
+
+            return
+
+    # --------------------------------------------------------
+    # NEW USER
+    # --------------------------------------------------------
+
     db.create_or_update_user(
         user_id=user_id,
         username=username,
@@ -120,6 +164,7 @@ async def start_handler(message: Message):
     )
 
     try:
+
         await bot.send_message(
             chat_id=ADMIN_ID,
             text=(
@@ -130,14 +175,16 @@ async def start_handler(message: Message):
             ),
             reply_markup=admin_request_keyboard(user_id),
         )
+
     except Exception as exc:
+
         print(
             f"[ADMIN] Ошибка уведомления: {exc}"
         )
 
 
 # ============================================================
-# ПРОВЕРКА ДОСТУПА
+# CHECK ACCESS
 # ============================================================
 
 @dp.callback_query(F.data == "check_access")
@@ -150,15 +197,20 @@ async def check_access_callback(
     user = db.get_user(user_id)
 
     if not user:
+
         await callback.answer(
             "Заявка не найдена.",
             show_alert=True,
         )
+
         return
 
     status = user["status"]
 
+    # APPROVED
     if status == "APPROVED":
+
+        await callback.answer()
 
         await callback.message.edit_text(
             "✅ Доступ уже одобрен.\n\n"
@@ -166,17 +218,29 @@ async def check_access_callback(
             reply_markup=main_keyboard(),
         )
 
-        await callback.answer()
         return
 
+    # PENDING
     if status == "PENDING":
 
         await callback.answer(
             "⏳ Заявка ещё рассматривается.",
             show_alert=True,
         )
+
         return
 
+    # BLOCKED
+    if status == "BLOCKED":
+
+        await callback.answer(
+            "🚫 Доступ заблокирован.",
+            show_alert=True,
+        )
+
+        return
+
+    # REJECTED
     await callback.answer(
         "❌ Доступ не предоставлен.",
         show_alert=True,
@@ -193,26 +257,44 @@ async def approve_callback(
 ):
 
     if callback.from_user.id != ADMIN_ID:
+
         await callback.answer(
             "Нет доступа.",
             show_alert=True,
         )
+
         return
 
-    user_id = int(
-        callback.data.split(":", 1)[1]
-    )
+    try:
+
+        user_id = int(
+            callback.data.split(
+                ":",
+                1,
+            )[1]
+        )
+
+    except (ValueError, IndexError):
+
+        await callback.answer(
+            "Некорректный ID пользователя.",
+            show_alert=True,
+        )
+
+        return
 
     db.set_status(
         user_id=user_id,
         status="APPROVED",
     )
 
+    # СНАЧАЛА отвечаем Telegram callback.
     await callback.answer(
         "Пользователь одобрен."
     )
 
     try:
+
         await bot.send_message(
             chat_id=user_id,
             text=(
@@ -221,12 +303,15 @@ async def approve_callback(
             ),
             reply_markup=main_keyboard(),
         )
+
     except Exception as exc:
+
         print(
             f"[ADMIN] Ошибка уведомления пользователя: {exc}"
         )
 
     with contextlib.suppress(Exception):
+
         await callback.message.edit_reply_markup(
             reply_markup=None
         )
@@ -242,43 +327,64 @@ async def reject_callback(
 ):
 
     if callback.from_user.id != ADMIN_ID:
+
         await callback.answer(
             "Нет доступа.",
             show_alert=True,
         )
+
         return
 
-    user_id = int(
-        callback.data.split(":", 1)[1]
-    )
+    try:
+
+        user_id = int(
+            callback.data.split(
+                ":",
+                1,
+            )[1]
+        )
+
+    except (ValueError, IndexError):
+
+        await callback.answer(
+            "Некорректный ID пользователя.",
+            show_alert=True,
+        )
+
+        return
 
     db.set_status(
         user_id=user_id,
         status="REJECTED",
     )
 
+    # СНАЧАЛА отвечаем Telegram callback.
     await callback.answer(
         "Пользователь отклонён."
     )
 
     try:
+
         await bot.send_message(
             chat_id=user_id,
-            text="❌ Ваша заявка на доступ отклонена."
+            text="❌ Ваша заявка на доступ отклонена.",
         )
+
     except Exception as exc:
+
         print(
-            f"[ADMIN] Ошибка уведомления: {exc}"
+            f"[ADMIN] Ошибка уведомления пользователя: {exc}"
         )
 
     with contextlib.suppress(Exception):
+
         await callback.message.edit_reply_markup(
             reply_markup=None
         )
 
 
 # ============================================================
-# ПОЛУЧИТЬ СИГНАЛ
+# GET SIGNAL
 # ============================================================
 
 @dp.callback_query(F.data == "request_signal")
@@ -291,23 +397,27 @@ async def request_signal_callback(
     )
 
     if not user or user["status"] != "APPROVED":
+
         await callback.answer(
             "❌ У тебя нет доступа.",
             show_alert=True,
         )
+
         return
+
+    # Сразу закрываем callback.
+    await callback.answer()
 
     await callback.message.answer(
         "💱 Выбери валютную пару:\n\n"
-        f"📈 Минимальный шанс: {MIN_PROBABILITY:.0f}%",
+        f"📈 Минимальный шанс: "
+        f"{MIN_PROBABILITY:.0f}%",
         reply_markup=pair_selection_keyboard(),
     )
 
-    await callback.answer()
-
 
 # ============================================================
-# ВЫБОР ПАРЫ
+# PAIR SELECTION
 # ============================================================
 
 @dp.callback_query(F.data.startswith("pair:"))
@@ -320,10 +430,12 @@ async def pair_callback(
     )
 
     if not user or user["status"] != "APPROVED":
+
         await callback.answer(
             "❌ Нет доступа.",
             show_alert=True,
         )
+
         return
 
     pair_value = callback.data.split(
@@ -331,56 +443,138 @@ async def pair_callback(
         1,
     )[1]
 
+    # --------------------------------------------------------
+    # CANCEL
+    # --------------------------------------------------------
+
     if pair_value == "cancel":
+
+        # Callback короткий — можно ответить
+        # до редактирования сообщения.
+
+        await callback.answer()
 
         await callback.message.edit_text(
             "❌ Получение сигнала отменено."
         )
 
-        await callback.answer()
         return
 
+    # --------------------------------------------------------
+    # ANY PAIR
+    # --------------------------------------------------------
+
     if pair_value == "any":
+
         selected_pair = None
         selected_name = "Любая пара"
+
+    # --------------------------------------------------------
+    # SPECIFIC PAIR
+    # --------------------------------------------------------
+
     else:
+
         selected_pair = pair_value
 
         if selected_pair not in PAIRS:
+
             await callback.answer(
                 "❌ Неизвестная пара.",
                 show_alert=True,
             )
+
             return
 
         selected_name = selected_pair
 
+    # ========================================================
+    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ
+    # ========================================================
+    #
+    # Telegram callback query имеет ограниченное время жизни.
+    #
+    # Раньше callback.answer() выполнялся ПОСЛЕ:
+    #
+    #     await scheduler.get_manual_signal(...)
+    #
+    # Анализ рынка мог занять достаточно долго,
+    # из-за чего Telegram отвечал:
+    #
+    #     query is too old
+    #
+    # Теперь подтверждаем callback СРАЗУ.
+    # ========================================================
+
+    await callback.answer(
+        "🔎 Начинаю анализ..."
+    )
+
+    # --------------------------------------------------------
+    # SHOW ANALYSIS STATUS
+    # --------------------------------------------------------
+
     await callback.message.edit_text(
         "🔎 Анализирую...\n\n"
         f"💱 {selected_name}\n"
-        f"📈 Минимальный шанс: {MIN_PROBABILITY:.0f}%\n\n"
+        f"📈 Минимальный шанс: "
+        f"{MIN_PROBABILITY:.0f}%\n\n"
         "⏳ Проверяю рынок..."
     )
 
-    signal = await scheduler.get_manual_signal(
-        pair=selected_pair
-    )
+    # --------------------------------------------------------
+    # MARKET ANALYSIS
+    # --------------------------------------------------------
+
+    try:
+
+        signal = await scheduler.get_manual_signal(
+            pair=selected_pair
+        )
+
+    except Exception as exc:
+
+        print(
+            "[MANUAL] Ошибка получения сигнала:"
+        )
+
+        print(
+            f"   {type(exc).__name__}: {exc}"
+        )
+
+        await callback.message.edit_text(
+            "⚠️ Не удалось получить сигнал.\n\n"
+            f"💱 {selected_name}\n\n"
+            "Произошла ошибка при анализе рынка.",
+            reply_markup=main_keyboard(),
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # NO SIGNAL
+    # --------------------------------------------------------
 
     if signal is None:
 
         if selected_pair is None:
+
             text = (
                 "⚪ Сильного сигнала сейчас нет.\n\n"
                 "🔀 Проверены все доступные пары.\n"
-                f"📈 Минимальный шанс: {MIN_PROBABILITY:.0f}%\n\n"
+                f"📈 Минимальный шанс: "
+                f"{MIN_PROBABILITY:.0f}%\n\n"
                 "Я не буду выдавать слабый сигнал "
                 "только ради того, чтобы что-то показать."
             )
+
         else:
+
             text = (
                 "⚪ Сильного сигнала сейчас нет.\n\n"
                 f"💱 {selected_name}\n"
-                f"📈 Минимальный шанс: {MIN_PROBABILITY:.0f}%\n\n"
+                f"📈 Минимальный шанс: "
+                f"{MIN_PROBABILITY:.0f}%\n\n"
                 "Я не буду выдавать слабый сигнал "
                 "только ради того, чтобы что-то показать."
             )
@@ -390,23 +584,24 @@ async def pair_callback(
             reply_markup=main_keyboard(),
         )
 
-        await callback.answer()
         return
 
-    text = scheduler.format_signal(signal)
+    # --------------------------------------------------------
+    # SIGNAL FOUND
+    # --------------------------------------------------------
+
+    text = scheduler.format_signal(
+        signal
+    )
 
     await callback.message.edit_text(
         text,
         reply_markup=main_keyboard(),
     )
 
-    await callback.answer(
-        "Сигнал найден."
-    )
-
 
 # ============================================================
-# ИСТОРИЯ
+# HISTORY
 # ============================================================
 
 @dp.callback_query(F.data == "history")
@@ -419,22 +614,28 @@ async def history_callback(
     )
 
     if not user or user["status"] != "APPROVED":
+
         await callback.answer(
             "❌ Нет доступа.",
             show_alert=True,
         )
+
         return
+
+    # Отвечаем сразу.
+    await callback.answer()
 
     signals = db.get_recent_signals(
         limit=10
     )
 
     if not signals:
+
         await callback.message.edit_text(
             "📊 История пока пустая.",
             reply_markup=main_keyboard(),
         )
-        await callback.answer()
+
         return
 
     lines = [
@@ -451,7 +652,10 @@ async def history_callback(
             else "🔴"
         )
 
-        result = signal["result"] or "—"
+        result = (
+            signal["result"]
+            or "—"
+        )
 
         lines.append(
             f"{emoji} {direction} | "
@@ -464,8 +668,6 @@ async def history_callback(
         "\n".join(lines),
         reply_markup=main_keyboard(),
     )
-
-    await callback.answer()
 
 
 # ============================================================
@@ -483,17 +685,28 @@ async def users_handler(
     users = db.get_pending_users()
 
     if not users:
+
         await message.answer(
             "📭 Новых заявок нет."
         )
+
         return
 
     for user in users:
 
-        user_id = int(user["user_id"])
+        user_id = int(
+            user["user_id"]
+        )
 
-        username = user["username"] or "нет"
-        first_name = user["first_name"] or "нет"
+        username = (
+            user["username"]
+            or "нет"
+        )
+
+        first_name = (
+            user["first_name"]
+            or "нет"
+        )
 
         await message.answer(
             "👤 Заявка\n\n"
@@ -516,7 +729,7 @@ async def id_handler(
 ):
 
     await message.answer(
-        f"🆔 Твой Telegram ID:\n\n"
+        "🆔 Твой Telegram ID:\n\n"
         f"{message.from_user.id}"
     )
 
@@ -548,6 +761,12 @@ async def fallback_handler(
             reply_markup=pending_keyboard(),
         )
 
+    elif user and user["status"] == "BLOCKED":
+
+        await message.answer(
+            "🚫 Ваш доступ заблокирован."
+        )
+
     else:
 
         await message.answer(
@@ -556,7 +775,7 @@ async def fallback_handler(
 
 
 # ============================================================
-# FASTAPI
+# FASTAPI LIFESPAN
 # ============================================================
 
 @asynccontextmanager
@@ -570,6 +789,16 @@ async def lifespan(
     print(
         "[APP] Запуск Pocket Signal Bot..."
     )
+
+    # Передаём bot в scheduler ещё раз
+    # для совместимости с разными версиями.
+    try:
+
+        scheduler.set_bot(bot)
+
+    except Exception:
+
+        pass
 
     scheduler_task = asyncio.create_task(
         scheduler.run()
@@ -588,41 +817,84 @@ async def lifespan(
         "[APP] Остановка..."
     )
 
+    # --------------------------------------------------------
+    # STOP SCHEDULER
+    # --------------------------------------------------------
+
     if scheduler_task:
+
         scheduler_task.cancel()
 
         with contextlib.suppress(
             asyncio.CancelledError
         ):
+
             await scheduler_task
 
+    # --------------------------------------------------------
+    # STOP POLLING
+    # --------------------------------------------------------
+
     if polling_task:
+
         polling_task.cancel()
 
         with contextlib.suppress(
             asyncio.CancelledError
         ):
+
             await polling_task
 
-    await market_client.close()
-    await bot.session.close()
+    # --------------------------------------------------------
+    # CLOSE MARKET
+    # --------------------------------------------------------
 
+    with contextlib.suppress(
+        Exception
+    ):
+
+        await market_client.close()
+
+    # --------------------------------------------------------
+    # CLOSE BOT
+    # --------------------------------------------------------
+
+    with contextlib.suppress(
+        Exception
+    ):
+
+        await bot.session.close()
+
+
+# ============================================================
+# FASTAPI APP
+# ============================================================
 
 app = FastAPI(
     lifespan=lifespan
 )
 
 
+# ============================================================
+# ROOT
+# ============================================================
+
 @app.get("/")
 async def root():
+
     return {
         "status": "ok",
         "service": "Pocket Signal Bot",
     }
 
 
+# ============================================================
+# HEALTH
+# ============================================================
+
 @app.get("/health")
 async def health():
+
     return {
         "status": "healthy",
     }
