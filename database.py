@@ -1,6 +1,7 @@
+import json
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from config import DATABASE_PATH
@@ -10,300 +11,382 @@ class Database:
     def __init__(self, path: str = DATABASE_PATH):
         self.path = path
         self.lock = threading.Lock()
+        self._init_db()
 
-        self.connection = sqlite3.connect(
+    def _connect(self):
+        connection = sqlite3.connect(
             self.path,
             check_same_thread=False,
         )
+        connection.row_factory = sqlite3.Row
+        return connection
 
-        self.connection.row_factory = sqlite3.Row
-
-        self._create_tables()
-
-
-    # ========================================================
-    # TABLES
-    # ========================================================
-
-    def _create_tables(self) -> None:
+    def _init_db(self):
         with self.lock:
-            cursor = self.connection.cursor()
+            conn = self._connect()
 
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    full_name TEXT,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id INTEGER PRIMARY KEY,
+                        username TEXT,
+                        first_name TEXT,
+                        status TEXT NOT NULL DEFAULT 'PENDING',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS signal_requests (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS signals (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        pair TEXT NOT NULL,
+                        direction TEXT NOT NULL,
+                        quality REAL NOT NULL,
+                        entry_time TEXT NOT NULL,
+                        expiry_time TEXT NOT NULL,
+                        analysis_time TEXT NOT NULL,
+                        confirmations TEXT,
+                        reasons TEXT,
+                        result TEXT
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_signals_entry
+                    ON signals(entry_time);
+
+                    CREATE INDEX IF NOT EXISTS idx_users_status
+                    ON users(status);
+                    """
                 )
-                """
-            )
 
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS signals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    pair TEXT NOT NULL,
-                    direction TEXT NOT NULL,
-                    entry_time TEXT NOT NULL,
-                    expiry_time TEXT NOT NULL,
-                    quality INTEGER NOT NULL,
-                    score_details TEXT,
-                    created_at TEXT NOT NULL,
-                    result TEXT DEFAULT NULL
-                )
-                """
-            )
+                conn.commit()
 
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS signal_requests (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
+            finally:
+                conn.close()
 
-            self.connection.commit()
+    @staticmethod
+    def now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
 
+    def get_user(self, user_id: int) -> Optional[dict]:
+        with self.lock:
+            conn = self._connect()
 
-    # ========================================================
-    # USERS
-    # ========================================================
+            try:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM users
+                    WHERE user_id = ?
+                    """,
+                    (user_id,),
+                ).fetchone()
 
-    def get_user(
+                return dict(row) if row else None
+
+            finally:
+                conn.close()
+
+    def create_or_update_user(
         self,
         user_id: int,
-    ) -> Optional[sqlite3.Row]:
+        username: Optional[str],
+        first_name: Optional[str],
+    ) -> dict:
+
+        now = self.now_iso()
 
         with self.lock:
-            cursor = self.connection.cursor()
+            conn = self._connect()
 
-            cursor.execute(
-                """
-                SELECT *
-                FROM users
-                WHERE user_id = ?
-                """,
-                (user_id,),
-            )
+            try:
+                existing = conn.execute(
+                    """
+                    SELECT *
+                    FROM users
+                    WHERE user_id = ?
+                    """,
+                    (user_id,),
+                ).fetchone()
 
-            return cursor.fetchone()
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE users
+                        SET username = ?,
+                            first_name = ?,
+                            updated_at = ?
+                        WHERE user_id = ?
+                        """,
+                        (
+                            username,
+                            first_name,
+                            now,
+                            user_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO users (
+                            user_id,
+                            username,
+                            first_name,
+                            status,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (?, ?, ?, 'PENDING', ?, ?)
+                        """,
+                        (
+                            user_id,
+                            username,
+                            first_name,
+                            now,
+                            now,
+                        ),
+                    )
 
+                conn.commit()
 
-    def create_user(
-        self,
-        user_id: int,
-        username: str,
-        full_name: str,
-    ) -> None:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM users
+                    WHERE user_id = ?
+                    """,
+                    (user_id,),
+                ).fetchone()
 
-        now = datetime.utcnow().isoformat()
+                return dict(row)
+
+            finally:
+                conn.close()
+
+    def set_status(self, user_id: int, status: str):
+        now = self.now_iso()
 
         with self.lock:
-            cursor = self.connection.cursor()
+            conn = self._connect()
 
-            cursor.execute(
-                """
-                INSERT INTO users (
-                    user_id,
-                    username,
-                    full_name,
-                    status,
-                    created_at,
-                    updated_at
+            try:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET status = ?,
+                        updated_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (
+                        status,
+                        now,
+                        user_id,
+                    ),
                 )
-                VALUES (?, ?, ?, 'pending', ?, ?)
-                """,
-                (
-                    user_id,
-                    username,
-                    full_name,
-                    now,
-                    now,
-                ),
-            )
 
-            self.connection.commit()
+                conn.commit()
 
+            finally:
+                conn.close()
 
-    def update_user_status(
+    def get_pending_users(self) -> list[dict]:
+        with self.lock:
+            conn = self._connect()
+
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM users
+                    WHERE status = 'PENDING'
+                    ORDER BY created_at ASC
+                    """
+                ).fetchall()
+
+                return [dict(row) for row in rows]
+
+            finally:
+                conn.close()
+
+    def get_approved_users(self) -> list[int]:
+        with self.lock:
+            conn = self._connect()
+
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT user_id
+                    FROM users
+                    WHERE status = 'APPROVED'
+                    """
+                ).fetchall()
+
+                return [int(row["user_id"]) for row in rows]
+
+            finally:
+                conn.close()
+
+    def add_signal_request(self, user_id: int):
+        with self.lock:
+            conn = self._connect()
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO signal_requests (
+                        user_id,
+                        created_at
+                    )
+                    VALUES (?, ?)
+                    """,
+                    (
+                        user_id,
+                        self.now_iso(),
+                    ),
+                )
+
+                conn.commit()
+
+            finally:
+                conn.close()
+
+    def signal_exists(
         self,
-        user_id: int,
-        status: str,
-    ) -> None:
-
-        now = datetime.utcnow().isoformat()
+        pair: str,
+        direction: str,
+        entry_time: str,
+    ) -> bool:
 
         with self.lock:
-            cursor = self.connection.cursor()
+            conn = self._connect()
 
-            cursor.execute(
-                """
-                UPDATE users
-                SET status = ?,
-                    updated_at = ?
-                WHERE user_id = ?
-                """,
-                (
-                    status,
-                    now,
-                    user_id,
-                ),
-            )
+            try:
+                row = conn.execute(
+                    """
+                    SELECT id
+                    FROM signals
+                    WHERE pair = ?
+                      AND direction = ?
+                      AND entry_time = ?
+                    LIMIT 1
+                    """,
+                    (
+                        pair,
+                        direction,
+                        entry_time,
+                    ),
+                ).fetchone()
 
-            self.connection.commit()
+                return row is not None
 
-
-    def get_status(
-        self,
-        user_id: int,
-    ) -> Optional[str]:
-
-        user = self.get_user(user_id)
-
-        if user is None:
-            return None
-
-        return user["status"]
-
-
-    # ========================================================
-    # SIGNALS
-    # ========================================================
+            finally:
+                conn.close()
 
     def save_signal(
         self,
         pair: str,
         direction: str,
+        quality: float,
         entry_time: str,
         expiry_time: str,
-        quality: int,
-        score_details: str,
+        analysis_time: str,
+        confirmations: list[str],
+        reasons: list[str],
     ) -> int:
 
-        now = datetime.utcnow().isoformat()
-
         with self.lock:
-            cursor = self.connection.cursor()
+            conn = self._connect()
 
-            cursor.execute(
-                """
-                INSERT INTO signals (
-                    pair,
-                    direction,
-                    entry_time,
-                    expiry_time,
-                    quality,
-                    score_details,
-                    created_at
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO signals (
+                        pair,
+                        direction,
+                        quality,
+                        entry_time,
+                        expiry_time,
+                        analysis_time,
+                        confirmations,
+                        reasons
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        pair,
+                        direction,
+                        quality,
+                        entry_time,
+                        expiry_time,
+                        analysis_time,
+                        json.dumps(
+                            confirmations,
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            reasons,
+                            ensure_ascii=False,
+                        ),
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    pair,
-                    direction,
-                    entry_time,
-                    expiry_time,
-                    quality,
-                    score_details,
-                    now,
-                ),
-            )
 
-            self.connection.commit()
+                conn.commit()
 
-            return int(cursor.lastrowid)
+                return int(cursor.lastrowid)
 
+            finally:
+                conn.close()
 
-    def get_signal_stats(self) -> dict:
-
+    def get_recent_signals(self, limit: int = 20) -> list[dict]:
         with self.lock:
-            cursor = self.connection.cursor()
+            conn = self._connect()
 
-            cursor.execute(
-                """
-                SELECT
-                    COUNT(*) AS total,
-                    SUM(
-                        CASE
-                            WHEN result = 'WIN'
-                            THEN 1
-                            ELSE 0
-                        END
-                    ) AS wins,
-                    SUM(
-                        CASE
-                            WHEN result = 'LOSS'
-                            THEN 1
-                            ELSE 0
-                        END
-                    ) AS losses
-                FROM signals
-                """
-            )
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM signals
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
 
-            row = cursor.fetchone()
+                return [dict(row) for row in rows]
 
-        total = int(row["total"] or 0)
-        wins = int(row["wins"] or 0)
-        losses = int(row["losses"] or 0)
+            finally:
+                conn.close()
 
-        finished = wins + losses
-
-        if finished:
-            winrate = wins / finished * 100
-        else:
-            winrate = 0.0
-
-        return {
-            "total": total,
-            "wins": wins,
-            "losses": losses,
-            "finished": finished,
-            "winrate": winrate,
-        }
-
-
-    # ========================================================
-    # REQUESTS
-    # ========================================================
-
-    def save_signal_request(
+    def set_signal_result(
         self,
-        user_id: int,
-    ) -> None:
-
-        now = datetime.utcnow().isoformat()
-
+        signal_id: int,
+        result: str,
+    ):
         with self.lock:
-            cursor = self.connection.cursor()
+            conn = self._connect()
 
-            cursor.execute(
-                """
-                INSERT INTO signal_requests (
-                    user_id,
-                    created_at
+            try:
+                conn.execute(
+                    """
+                    UPDATE signals
+                    SET result = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        result,
+                        signal_id,
+                    ),
                 )
-                VALUES (?, ?)
-                """,
-                (
-                    user_id,
-                    now,
-                ),
-            )
 
-            self.connection.commit()
+                conn.commit()
+
+            finally:
+                conn.close()
 
 
-    # ========================================================
-    # CLOSE
-    # ========================================================
-
-    def close(self) -> None:
-        with self.lock:
-            self.connection.close()
+db = Database()
