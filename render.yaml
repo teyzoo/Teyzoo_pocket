@@ -2,10 +2,35 @@ services:
   - type: web
     name: pocket-signal-bot
     runtime: python
+
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+    startCommand: python main.py
+
     envVars:
       - key: BOT_TOKEN
         sync: false
+
       - key: ADMIN_ID
         sync: false
+
+      - key: TWELVE_DATA_API_KEY
+        sync: false
+
+      - key: MIN_QUALITY
+        value: "85"
+
+      - key: MIN_CANDLES
+        value: "100"
+
+      - key: TIMEFRAME
+        value: "5min"
+
+      - key: ENTRY_STEP_MINUTES
+        value: "5"
+
+      - key: EXPIRY_MINUTES
+        value: "5"
+
+      - key: AUTO_SIGNALS_ENABLED
+        value: "true"
