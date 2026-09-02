@@ -1,422 +1,387 @@
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Dict, Optional
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from config import (
-    ENTRY_STEP_MINUTES,
-    EXPIRY_MINUTES,
-    MIN_CANDLES,
-    MIN_QUALITY,
-    TIMEZONE,
-)
-from indicators import calculate_indicators
+from config import MIN_QUALITY
+from indicators import add_indicators
 
 
 @dataclass
 class Signal:
     pair: str
     direction: str
+    quality: float
     entry_time: datetime
     expiry_time: datetime
-    quality: int
-    confirmations: Dict[str, str]
+    analysis_time: datetime
+    confirmations: list[str]
     reasons: list[str]
 
 
 class SignalEngine:
-
     def analyze(
         self,
         pair: str,
-        dataframe: pd.DataFrame,
-    ) -> Optional[Signal]:
+        candles: pd.DataFrame,
+    ) -> Signal | None:
 
-        if dataframe is None:
+        if candles is None or len(candles) < 80:
             return None
 
-        if len(dataframe) < MIN_CANDLES:
-            return None
+        df = add_indicators(candles)
 
-        try:
-            df = calculate_indicators(
-                dataframe
-            )
-        except Exception:
-            return None
+        # Последняя свеча может быть ещё формирующейся.
+        # Анализируем только полностью закрытые свечи.
+        if len(df) > 1:
+            df = df.iloc[:-1].copy()
 
-        if len(df) < 60:
+        df = df.dropna(
+            subset=[
+                "ema_9",
+                "ema_21",
+                "ema_50",
+                "rsi",
+                "macd",
+                "macd_signal",
+                "macd_hist",
+                "bb_middle",
+                "bb_upper",
+                "bb_lower",
+                "stoch_k",
+                "stoch_d",
+                "atr",
+                "body_ratio",
+                "support",
+                "resistance",
+            ]
+        )
+
+        if len(df) < 50:
             return None
 
         current = df.iloc[-1]
         previous = df.iloc[-2]
 
-        required_columns = [
-            "ema_fast",
-            "ema_slow",
-            "ema_trend",
-            "rsi",
-            "macd",
-            "macd_signal",
-            "macd_hist",
-            "bb_upper",
-            "bb_lower",
-            "stoch_k",
-            "stoch_d",
-            "atr",
-            "body_ratio",
-            "support",
-            "resistance",
-        ]
+        close = float(current["close"])
 
-        for column in required_columns:
-            value = current[column]
+        call_score = 0.0
+        put_score = 0.0
 
-            if pd.isna(value):
-                return None
+        call_confirmations = []
+        put_confirmations = []
 
+        # -------------------------------------------------
+        # 1. Основной тренд — 20 баллов
+        # -------------------------------------------------
 
-        # ====================================================
-        # SCORES
-        # ====================================================
+        bullish_trend = (
+            current["ema_9"] >
+            current["ema_21"] >
+            current["ema_50"]
+        )
 
-        call_score = 0
-        put_score = 0
+        bearish_trend = (
+            current["ema_9"] <
+            current["ema_21"] <
+            current["ema_50"]
+        )
 
-        confirmations = {}
-
-        reasons = []
-
-
-        # ====================================================
-        # TREND / EMA
-        # ====================================================
-
-        if (
-            current["ema_fast"]
-            > current["ema_slow"]
-            > current["ema_trend"]
-        ):
+        if bullish_trend:
             call_score += 20
-            confirmations["Тренд"] = "CALL"
-            reasons.append(
-                "EMA показывают восходящий тренд."
+            call_confirmations.append(
+                "EMA 9/21/50: бычье выравнивание"
             )
 
-        elif (
-            current["ema_fast"]
-            < current["ema_slow"]
-            < current["ema_trend"]
-        ):
+        if bearish_trend:
             put_score += 20
-            confirmations["Тренд"] = "PUT"
-            reasons.append(
-                "EMA показывают нисходящий тренд."
+            put_confirmations.append(
+                "EMA 9/21/50: медвежье выравнивание"
             )
 
+        # -------------------------------------------------
+        # 2. Momentum EMA — 10 баллов
+        # -------------------------------------------------
 
-        # ====================================================
-        # RSI
-        # ====================================================
-
-        rsi = float(
-            current["rsi"]
+        ema_rising = (
+            current["ema_9_slope"] > 0
         )
 
-        if 50 <= rsi <= 68:
-            call_score += 10
-            confirmations["RSI"] = "CALL"
-
-        elif 32 <= rsi < 50:
-            put_score += 10
-            confirmations["RSI"] = "PUT"
-
-
-        # ====================================================
-        # MACD
-        # ====================================================
-
-        macd = float(
-            current["macd"]
-        )
-
-        macd_signal = float(
-            current["macd_signal"]
-        )
-
-        previous_macd = float(
-            previous["macd"]
-        )
-
-        previous_macd_signal = float(
-            previous["macd_signal"]
+        ema_falling = (
+            current["ema_9_slope"] < 0
         )
 
         if (
-            macd > macd_signal
-            and previous_macd
-            <= previous_macd_signal
+            close > current["ema_9"]
+            and ema_rising
         ):
-            call_score += 15
-            confirmations["MACD"] = "CALL"
-            reasons.append(
-                "MACD дал бычье пересечение."
-            )
-
-        elif (
-            macd < macd_signal
-            and previous_macd
-            >= previous_macd_signal
-        ):
-            put_score += 15
-            confirmations["MACD"] = "PUT"
-            reasons.append(
-                "MACD дал медвежье пересечение."
-            )
-
-        elif macd > macd_signal:
-            call_score += 8
-            confirmations["MACD"] = "CALL"
-
-        elif macd < macd_signal:
-            put_score += 8
-            confirmations["MACD"] = "PUT"
-
-
-        # ====================================================
-        # BOLLINGER
-        # ====================================================
-
-        close = float(
-            current["close"]
-        )
-
-        bb_upper = float(
-            current["bb_upper"]
-        )
-
-        bb_lower = float(
-            current["bb_lower"]
-        )
-
-        if close < bb_lower:
             call_score += 10
-            confirmations["Bollinger"] = "CALL"
+            call_confirmations.append(
+                "Цена выше EMA9 + восходящий momentum"
+            )
 
-        elif close > bb_upper:
+        if (
+            close < current["ema_9"]
+            and ema_falling
+        ):
             put_score += 10
-            confirmations["Bollinger"] = "PUT"
+            put_confirmations.append(
+                "Цена ниже EMA9 + нисходящий momentum"
+            )
 
+        # -------------------------------------------------
+        # 3. MACD — 15 баллов
+        # -------------------------------------------------
 
-        # ====================================================
-        # STOCHASTIC
-        # ====================================================
-
-        stoch_k = float(
-            current["stoch_k"]
+        macd_bullish = (
+            current["macd"] >
+            current["macd_signal"]
+            and current["macd_hist"] > 0
         )
 
-        stoch_d = float(
-            current["stoch_d"]
+        macd_bearish = (
+            current["macd"] <
+            current["macd_signal"]
+            and current["macd_hist"] < 0
         )
+
+        if macd_bullish:
+            call_score += 15
+            call_confirmations.append(
+                "MACD подтверждает рост"
+            )
+
+        if macd_bearish:
+            put_score += 15
+            put_confirmations.append(
+                "MACD подтверждает падение"
+            )
+
+        # -------------------------------------------------
+        # 4. RSI — 10 баллов
+        # -------------------------------------------------
+
+        rsi = float(current["rsi"])
+
+        if 52 <= rsi <= 68:
+            call_score += 10
+            call_confirmations.append(
+                f"RSI в бычьей зоне: {rsi:.1f}"
+            )
+
+        elif 32 <= rsi <= 48:
+            put_score += 10
+            put_confirmations.append(
+                f"RSI в медвежьей зоне: {rsi:.1f}"
+            )
+
+        # -------------------------------------------------
+        # 5. Bollinger — 10 баллов
+        # -------------------------------------------------
+
+        bb_middle = float(current["bb_middle"])
+        bb_upper = float(current["bb_upper"])
+        bb_lower = float(current["bb_lower"])
+
+        if (
+            close > bb_middle
+            and close < bb_upper
+        ):
+            call_score += 10
+            call_confirmations.append(
+                "Цена в верхней половине Bollinger"
+            )
+
+        if (
+            close < bb_middle
+            and close > bb_lower
+        ):
+            put_score += 10
+            put_confirmations.append(
+                "Цена в нижней половине Bollinger"
+            )
+
+        # -------------------------------------------------
+        # 6. Stochastic — 10 баллов
+        # -------------------------------------------------
+
+        stoch_k = float(current["stoch_k"])
+        stoch_d = float(current["stoch_d"])
 
         if (
             stoch_k > stoch_d
-            and stoch_k < 80
+            and 35 <= stoch_k <= 80
         ):
             call_score += 10
-            confirmations["Stochastic"] = "CALL"
+            call_confirmations.append(
+                f"Stochastic подтверждает CALL: {stoch_k:.1f}"
+            )
 
-        elif (
+        if (
             stoch_k < stoch_d
-            and stoch_k > 20
+            and 20 <= stoch_k <= 65
         ):
             put_score += 10
-            confirmations["Stochastic"] = "PUT"
+            put_confirmations.append(
+                f"Stochastic подтверждает PUT: {stoch_k:.1f}"
+            )
 
-
-        # ====================================================
-        # CANDLE
-        # ====================================================
-
-        candle_body = float(
-            current["body"]
-        )
+        # -------------------------------------------------
+        # 7. Свечное подтверждение — 10 баллов
+        # -------------------------------------------------
 
         body_ratio = float(
             current["body_ratio"]
         )
 
-        if body_ratio >= 0.55:
-
-            if candle_body > 0:
-                call_score += 10
-                confirmations["Свеча"] = "CALL"
-
-            elif candle_body < 0:
-                put_score += 10
-                confirmations["Свеча"] = "PUT"
-
-
-        # ====================================================
-        # SUPPORT / RESISTANCE
-        # ====================================================
-
-        support = float(
-            current["support"]
+        candle_bullish = (
+            current["close"] >
+            current["open"]
         )
 
-        resistance = float(
-            current["resistance"]
+        candle_bearish = (
+            current["close"] <
+            current["open"]
         )
 
-        range_size = (
-            resistance - support
-        )
+        if (
+            candle_bullish
+            and body_ratio >= 0.55
+        ):
+            call_score += 10
+            call_confirmations.append(
+                f"Сильная бычья свеча: body {body_ratio:.0%}"
+            )
 
-        if range_size > 0:
+        if (
+            candle_bearish
+            and body_ratio >= 0.55
+        ):
+            put_score += 10
+            put_confirmations.append(
+                f"Сильная медвежья свеча: body {body_ratio:.0%}"
+            )
 
-            distance_from_support = (
+        # -------------------------------------------------
+        # 8. Support / Resistance — 10 баллов
+        # -------------------------------------------------
+
+        support = float(current["support"])
+        resistance = float(current["resistance"])
+
+        total_range = resistance - support
+
+        if total_range > 0:
+            support_distance = (
                 close - support
-            )
+            ) / total_range
 
-            distance_from_resistance = (
+            resistance_distance = (
                 resistance - close
-            )
+            ) / total_range
 
-            support_zone = (
-                distance_from_support
-                / range_size
-                < 0.20
-            )
-
-            resistance_zone = (
-                distance_from_resistance
-                / range_size
-                < 0.20
-            )
-
-            if support_zone:
+            if support_distance <= 0.25:
                 call_score += 10
-                confirmations[
-                    "Уровень"
-                ] = "CALL"
+                call_confirmations.append(
+                    "Цена находится рядом с поддержкой"
+                )
 
-            elif resistance_zone:
+            if resistance_distance <= 0.25:
                 put_score += 10
-                confirmations[
-                    "Уровень"
-                ] = "PUT"
+                put_confirmations.append(
+                    "Цена находится рядом с сопротивлением"
+                )
 
+        # -------------------------------------------------
+        # 9. Волатильность / качество рынка — 5 баллов
+        # -------------------------------------------------
 
-        # ====================================================
-        # VOLATILITY FILTER
-        # ====================================================
+        atr = float(current["atr"])
 
-        atr = float(
-            current["atr"]
+        atr_median = float(
+            df["atr"].tail(30).median()
         )
 
-        if atr <= 0:
-            return None
+        if atr_median > 0:
+            atr_ratio = atr / atr_median
 
-        candle_range = float(
-            current["range"]
-        )
+            if 0.60 <= atr_ratio <= 1.80:
+                call_score += 5
+                put_score += 5
 
-        # Отбрасываем аномально огромную свечу.
-        if candle_range > atr * 3:
-            return None
-
-
-        # ====================================================
-        # CHOOSE DIRECTION
-        # ====================================================
-
-        if call_score == put_score:
-            return None
+        # -------------------------------------------------
+        # Выбор направления
+        # -------------------------------------------------
 
         if call_score > put_score:
             direction = "CALL"
             quality = call_score
-
-        else:
+            confirmations = call_confirmations
+        elif put_score > call_score:
             direction = "PUT"
             quality = put_score
+            confirmations = put_confirmations
+        else:
+            return None
 
+        score_difference = abs(
+            call_score - put_score
+        )
 
-        # ====================================================
-        # QUALITY FILTER
-        # ====================================================
+        # Если направления почти равны — пропускаем.
+        if score_difference < 20:
+            return None
 
+        # Минимальное качество.
         if quality < MIN_QUALITY:
             return None
 
+        # -------------------------------------------------
+        # Время входа
+        # -------------------------------------------------
 
-        # ====================================================
-        # TIME
-        # ====================================================
+        now = datetime.now(timezone.utc)
 
-        now = datetime.now(
-            TIMEZONE
-        )
+        minutes_to_add = (
+            5 - (now.minute % 5)
+        ) % 5
 
-        entry_time = self._next_entry_time(
-            now
-        )
+        if minutes_to_add == 0:
+            minutes_to_add = 5
 
-        expiry_time = (
-            entry_time
+        entry_time = (
+            now.replace(
+                second=0,
+                microsecond=0,
+            )
             + timedelta(
-                minutes=EXPIRY_MINUTES
+                minutes=minutes_to_add
             )
         )
 
+        expiry_time = (
+            entry_time +
+            timedelta(minutes=5)
+        )
+
+        reasons = [
+            f"CALL score: {call_score:.0f}",
+            f"PUT score: {put_score:.0f}",
+            f"Разница: {score_difference:.0f}",
+            f"RSI: {rsi:.1f}",
+            f"ATR: {atr:.6f}",
+        ]
 
         return Signal(
             pair=pair,
             direction=direction,
+            quality=round(
+                min(100, quality),
+                1,
+            ),
             entry_time=entry_time,
             expiry_time=expiry_time,
-            quality=int(quality),
+            analysis_time=now,
             confirmations=confirmations,
             reasons=reasons,
         )
-
-
-    @staticmethod
-    def _next_entry_time(
-        now: datetime,
-    ) -> datetime:
-
-        minute = now.minute
-
-        step = ENTRY_STEP_MINUTES
-
-        next_minute = (
-            (
-                minute // step
-            ) + 1
-        ) * step
-
-        result = now.replace(
-            second=0,
-            microsecond=0,
-        )
-
-        if next_minute >= 60:
-            result = result.replace(
-                minute=0
-            )
-
-            result += timedelta(
-                hours=1
-            )
-
-        else:
-            result = result.replace(
-                minute=next_minute
-            )
-
-        return result
