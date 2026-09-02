@@ -11,78 +11,41 @@ from config import (
 )
 
 from database import db
-from market import market_client
-from signal_engine import SignalEngine, Signal
+from market import (
+    market_client,
+    OTC_PAIRS,
+)
+
+from signal_engine import (
+    SignalEngine,
+    Signal,
+)
 
 
 # ============================================================
-# НАСТРОЙКИ
+# SETTINGS
 # ============================================================
 
-# Автоматический анализ каждые 5 минут.
 SIGNAL_INTERVAL_MINUTES = 5
 
-
-# Включать OTC-пары.
 ENABLE_OTC = True
 
+MIN_CANDLES_FOR_ANALYSIS = 50
 
-# Московское время.
+
+# ============================================================
+# MOSCOW TIME
+# ============================================================
+
 try:
     from zoneinfo import ZoneInfo
 
-    MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+    MOSCOW_TZ = ZoneInfo(
+        "Europe/Moscow"
+    )
+
 except Exception:
     MOSCOW_TZ = None
-
-
-# ============================================================
-# FALLBACK OTC PAIRS
-# ============================================================
-#
-# Эти пары используются только если market.py не смог
-# вернуть динамический список активов.
-#
-# Для запроса в market.py сохраняется формат без "/" —
-# это наиболее распространённый формат Pocket Option:
-#
-# EURUSD_otc
-# GBPUSD_otc
-# USDJPY_otc
-#
-# Если market.py возвращает собственный список OTC,
-# используются именно его названия.
-# ============================================================
-
-OTC_PAIRS = [
-    "EURUSD_otc",
-    "GBPUSD_otc",
-    "USDJPY_otc",
-    "USDCHF_otc",
-    "AUDUSD_otc",
-    "USDCAD_otc",
-    "NZDUSD_otc",
-    "EURGBP_otc",
-    "EURJPY_otc",
-    "GBPJPY_otc",
-    "AUDCAD_otc",
-    "AUDCHF_otc",
-    "AUDJPY_otc",
-    "CADCHF_otc",
-    "CADJPY_otc",
-    "CHFJPY_otc",
-    "EURAUD_otc",
-    "EURCAD_otc",
-    "EURCHF_otc",
-    "EURNZD_otc",
-    "GBPAUD_otc",
-    "GBPCAD_otc",
-    "GBPCHF_otc",
-    "GBPNZD_otc",
-    "NZDCAD_otc",
-    "NZDCHF_otc",
-    "NZDJPY_otc",
-]
 
 
 class SignalScheduler:
@@ -92,45 +55,48 @@ class SignalScheduler:
     Поддерживает:
 
     - автоматический анализ;
-    - ручной запрос сигнала;
-    - анализ конкретной пары;
-    - анализ любой доступной пары;
-    - обычные пары;
-    - OTC-пары;
-    - фильтр QUALITY;
-    - фильтр PROBABILITY;
+    - ручной запрос;
+    - конкретную пару;
+    - любую обычную пару;
+    - любую OTC пару;
+    - все пары;
+    - QUALITY filter;
+    - PROBABILITY filter;
     - выбор лучшего сигнала;
-    - сохранение сигнала в БД;
-    - автоматическую отправку APPROVED пользователям;
+    - сохранение в БД;
+    - отправку APPROVED пользователям;
     - московское время;
-    - защиту от одновременного запуска анализа.
+    - защиту от параллельных сканов.
     """
 
-    def __init__(self, bot=None):
+    def __init__(
+        self,
+        bot=None,
+    ):
         self.bot = bot
 
         self.engine = SignalEngine()
 
         self.running = False
 
-        # Не позволяет одновременно выполнять
-        # автоматический и ручной анализ.
         self.scan_lock = asyncio.Lock()
 
-        print("[SCHEDULER] Инициализирован")
+        print(
+            "[SCHEDULER] Инициализирован"
+        )
 
         print(
-            f"[SCHEDULER] MIN_QUALITY = "
+            "[SCHEDULER] MIN_QUALITY = "
             f"{MIN_QUALITY}"
         )
 
         print(
-            f"[SCHEDULER] MIN_PROBABILITY = "
+            "[SCHEDULER] MIN_PROBABILITY = "
             f"{MIN_PROBABILITY}%"
         )
 
         print(
-            f"[SCHEDULER] OTC = "
+            "[SCHEDULER] OTC = "
             f"{'ON' if ENABLE_OTC else 'OFF'}"
         )
 
@@ -138,11 +104,10 @@ class SignalScheduler:
     # BOT
     # ============================================================
 
-    def set_bot(self, bot):
-        """
-        Устанавливает экземпляр Telegram Bot.
-        """
-
+    def set_bot(
+        self,
+        bot,
+    ):
         self.bot = bot
 
     # ============================================================
@@ -150,12 +115,11 @@ class SignalScheduler:
     # ============================================================
 
     def now(self) -> datetime:
-        """
-        Возвращает текущее московское время.
-        """
 
         if MOSCOW_TZ is not None:
-            return datetime.now(MOSCOW_TZ)
+            return datetime.now(
+                MOSCOW_TZ
+            )
 
         return datetime.now()
 
@@ -163,17 +127,6 @@ class SignalScheduler:
         self,
         interval: int = SIGNAL_INTERVAL_MINUTES,
     ) -> datetime:
-        """
-        Возвращает ближайшую временную отметку
-        для автоматического анализа.
-
-        Например:
-
-        12:01 -> 12:05
-        12:04 -> 12:05
-        12:05 -> 12:10
-        12:09 -> 12:10
-        """
 
         now = self.now()
 
@@ -182,15 +135,20 @@ class SignalScheduler:
             microsecond=0,
         )
 
-        remainder = current.minute % interval
+        remainder = (
+            current.minute % interval
+        )
 
         if remainder == 0:
+
             return current + timedelta(
                 minutes=interval
             )
 
         return current + timedelta(
-            minutes=interval - remainder
+            minutes=(
+                interval - remainder
+            )
         )
 
     # ============================================================
@@ -201,17 +159,6 @@ class SignalScheduler:
     def is_otc_pair(
         pair: str,
     ) -> bool:
-        """
-        Определяет, является ли актив OTC.
-
-        Поддерживает варианты:
-
-        EURUSD_otc
-        EUR/USD_otc
-        EUR/USD OTC
-        EURUSD-OTC
-        EURUSD OTC
-        """
 
         if not pair:
             return False
@@ -220,12 +167,12 @@ class SignalScheduler:
             str(pair)
             .strip()
             .upper()
-            .replace("-", "_")
         )
 
         return (
-            "_OTC" in normalized
-            or " OTC" in normalized
+            normalized.endswith("_OTC")
+            or normalized.endswith("-OTC")
+            or normalized.endswith(" OTC")
             or normalized.endswith("OTC")
         )
 
@@ -233,38 +180,18 @@ class SignalScheduler:
     def normalize_pair(
         pair: str,
     ) -> str:
-        """
-        Нормализует имя пары, но НЕ меняет OTC
-        в обычную пару.
-
-        Важно:
-        для market.py желательно передавать
-        исходное имя актива.
-        """
 
         if not pair:
             return ""
 
-        pair = str(
+        return str(
             pair
         ).strip()
-
-        return pair.upper()
 
     @staticmethod
     def display_pair(
         pair: str,
     ) -> str:
-        """
-        Красивое отображение пары в Telegram.
-
-        Примеры:
-
-        EURUSD      -> EUR/USD
-        EURUSD_otc  -> EUR/USD OTC
-        EUR/USD     -> EUR/USD
-        EUR/USD OTC -> EUR/USD OTC
-        """
 
         if not pair:
             return "UNKNOWN"
@@ -273,41 +200,43 @@ class SignalScheduler:
             pair
         ).strip().upper()
 
-        # --------------------------------------------------------
-        # OTC
-        # --------------------------------------------------------
-
-        is_otc = SignalScheduler.is_otc_pair(
-            raw
+        is_otc = (
+            SignalScheduler.is_otc_pair(
+                raw
+            )
         )
 
         cleaned = (
             raw
-            .replace("-OTC", "")
-            .replace("_OTC", "")
-            .replace(" OTC", "")
-            .replace("OTC", "")
+            .replace(
+                "-OTC",
+                "",
+            )
+            .replace(
+                "_OTC",
+                "",
+            )
+            .replace(
+                " OTC",
+                "",
+            )
+            .replace(
+                "OTC",
+                "",
+            )
             .strip()
         )
-
-        # --------------------------------------------------------
-        # Уже есть /
-        # --------------------------------------------------------
 
         if "/" in cleaned:
 
             result = cleaned
 
-        # --------------------------------------------------------
-        # EURUSD -> EUR/USD
-        # --------------------------------------------------------
-
-        elif len(cleaned) >= 6:
+        elif len(cleaned) == 6:
 
             result = (
                 cleaned[:3]
                 + "/"
-                + cleaned[3:6]
+                + cleaned[3:]
             )
 
         else:
@@ -327,23 +256,18 @@ class SignalScheduler:
         self,
     ) -> list[str]:
         """
-        Получает список доступных пар.
+        Получает реальные доступные активы.
 
-        ВАЖНО:
+        Критически важно:
 
-        OTC теперь НЕ исключаются.
+        OTC fallback добавляется независимо
+        от HTML asset discovery.
 
-        Если market.py возвращает OTC,
-        они попадут в список.
-
-        Если market.py не возвращает список,
-        используются PAIRS + OTC_PAIRS.
-
-        Исходное имя OTC сохраняется,
-        чтобы market.py получил правильный символ.
+        Поэтому отсутствие OTC в HTML
+        больше не убирает OTC из сканирования.
         """
 
-        dynamic_pairs: list[str] = []
+        dynamic: list[str] = []
 
         try:
 
@@ -353,11 +277,13 @@ class SignalScheduler:
                 None,
             )
 
-            if method is not None:
+            if callable(method):
 
                 result = method()
 
-                if asyncio.iscoroutine(result):
+                if asyncio.iscoroutine(
+                    result
+                ):
                     result = await result
 
                 if result:
@@ -376,118 +302,63 @@ class SignalScheduler:
                         if not normalized:
                             continue
 
-                        is_otc = (
+                        if (
                             self.is_otc_pair(
                                 normalized
                             )
-                        )
-
-                        # ----------------------------------------
-                        # OTC
-                        # ----------------------------------------
-
-                        if is_otc:
+                        ):
 
                             if not ENABLE_OTC:
                                 continue
 
-                            if normalized not in dynamic_pairs:
+                            normalized = (
+                                normalized
+                                .replace(
+                                    "-OTC",
+                                    "_otc",
+                                )
+                                .replace(
+                                    " OTC",
+                                    "_otc",
+                                )
+                            )
 
-                                dynamic_pairs.append(
+                            if normalized not in dynamic:
+                                dynamic.append(
                                     normalized
                                 )
 
-                            continue
+                        else:
 
-                        # ----------------------------------------
-                        # ОБЫЧНЫЕ ПАРЫ
-                        # ----------------------------------------
+                            if (
+                                "/" not in normalized
+                                and len(normalized) < 6
+                            ):
+                                continue
 
-                        # Обычная forex-пара должна иметь
-                        # либо slash, либо 6 символов.
-                        if (
-                            "/" not in normalized
-                            and len(normalized) < 6
-                        ):
-                            continue
-
-                        if normalized not in dynamic_pairs:
-
-                            dynamic_pairs.append(
-                                normalized
-                            )
-
-                    if dynamic_pairs:
-
-                        otc_count = sum(
-                            1
-                            for pair in dynamic_pairs
-                            if self.is_otc_pair(pair)
-                        )
-
-                        regular_count = (
-                            len(dynamic_pairs)
-                            - otc_count
-                        )
-
-                        print(
-                            "[PAIRS] "
-                            f"Динамически найдено: "
-                            f"{len(dynamic_pairs)}"
-                        )
-
-                        print(
-                            "[PAIRS] Обычных: "
-                            f"{regular_count}"
-                        )
-
-                        print(
-                            "[PAIRS] OTC: "
-                            f"{otc_count}"
-                        )
-
-                        if otc_count > 0:
-
-                            print(
-                                "[PAIRS] OTC активы:"
-                            )
-
-                            for otc_pair in dynamic_pairs:
-
-                                if self.is_otc_pair(
-                                    otc_pair
-                                ):
-
-                                    print(
-                                        "  - "
-                                        f"{otc_pair}"
-                                    )
-
-                        return dynamic_pairs
+                            if normalized not in dynamic:
+                                dynamic.append(
+                                    normalized
+                                )
 
         except Exception as exc:
 
             print(
-                "[PAIRS] Ошибка динамического "
-                f"получения: {exc}"
+                "[PAIRS] Ошибка получения "
+                f"доступных активов: {exc}"
             )
 
         # ========================================================
-        # FALLBACK
+        # ADD CONFIG PAIRS
         # ========================================================
-
-        fallback: list[str] = []
-
-        # --------------------------------------------------------
-        # Обычные пары из config.py
-        # --------------------------------------------------------
 
         for pair in PAIRS:
 
-            normalized = (
-                self.normalize_pair(
-                    pair
-                )
+            if not pair:
+                continue
+
+            normalized = self.normalize_pair(
+                pair
             )
 
             if not normalized:
@@ -496,75 +367,129 @@ class SignalScheduler:
             if self.is_otc_pair(
                 normalized
             ):
+                continue
 
-                if not ENABLE_OTC:
-                    continue
+            if (
+                "/" not in normalized
+                and len(normalized) < 6
+            ):
+                continue
 
-            else:
-
-                if (
-                    "/" not in normalized
-                    and len(normalized) < 6
-                ):
-                    continue
-
-            if normalized not in fallback:
-
-                fallback.append(
+            if normalized not in dynamic:
+                dynamic.append(
                     normalized
                 )
 
-        # --------------------------------------------------------
-        # Добавляем OTC
-        # --------------------------------------------------------
+        # ========================================================
+        # ADD OTC FALLBACK
+        # ========================================================
 
         if ENABLE_OTC:
 
             for pair in OTC_PAIRS:
 
+                normalized = self.normalize_pair(
+                    pair
+                )
+
+                if not normalized:
+                    continue
+
+                if not self.is_otc_pair(
+                    normalized
+                ):
+                    continue
+
                 normalized = (
-                    self.normalize_pair(
-                        pair
+                    normalized
+                    .replace(
+                        "-OTC",
+                        "_otc",
+                    )
+                    .replace(
+                        " OTC",
+                        "_otc",
                     )
                 )
 
-                if (
-                    normalized
-                    and normalized not in fallback
-                ):
-
-                    fallback.append(
+                if normalized not in dynamic:
+                    dynamic.append(
                         normalized
                     )
 
+        # ========================================================
+        # FINAL FILTER
+        # ========================================================
+
+        result: list[str] = []
+
+        for pair in dynamic:
+
+            if self.is_otc_pair(pair):
+
+                if not ENABLE_OTC:
+                    continue
+
+            if pair not in result:
+                result.append(pair)
+
         otc_count = sum(
             1
-            for pair in fallback
+            for pair in result
             if self.is_otc_pair(pair)
         )
 
         regular_count = (
-            len(fallback)
-            - otc_count
+            len(result) - otc_count
         )
 
         print(
-            "[PAIRS] Использую fallback:"
+            "[PAIRS] Всего: "
+            f"{len(result)}"
         )
 
         print(
-            f"[PAIRS] Всего: {len(fallback)}"
+            "[PAIRS] Обычных: "
+            f"{regular_count}"
         )
 
         print(
-            f"[PAIRS] Обычных: {regular_count}"
+            "[PAIRS] OTC: "
+            f"{otc_count}"
         )
 
-        print(
-            f"[PAIRS] OTC: {otc_count}"
-        )
+        return result
 
-        return fallback
+    # ============================================================
+    # FILTER PAIRS BY TYPE
+    # ============================================================
+
+    async def get_regular_pairs(
+        self,
+    ) -> list[str]:
+
+        pairs = await self.get_available_pairs()
+
+        return [
+            pair
+            for pair in pairs
+            if not self.is_otc_pair(pair)
+        ]
+
+    async def get_otc_pairs(
+        self,
+    ) -> list[str]:
+
+        if not ENABLE_OTC:
+            return []
+
+        pairs = await self.get_available_pairs()
+
+        return [
+            pair
+            for pair in pairs
+            if self.is_otc_pair(pair)
+        ]
 
     # ============================================================
     # MARKET
@@ -574,20 +499,13 @@ class SignalScheduler:
         self,
         pair: str,
     ):
-        """
-        Получает свечи.
-
-        Поддерживает разные названия методов market.py,
-        чтобы scheduler оставался совместимым
-        с разными версиями MarketClient.
-
-        OTC передаётся в market.py именно в том формате,
-        в котором он пришёл из списка доступных активов.
-        """
 
         pair = self.normalize_pair(
             pair
         )
+
+        if not pair:
+            return None
 
         method_names = (
             "get_candles",
@@ -604,12 +522,8 @@ class SignalScheduler:
                 None,
             )
 
-            if method is None:
+            if not callable(method):
                 continue
-
-            # ----------------------------------------------------
-            # ПОЗИЦИОННЫЙ ВЫЗОВ
-            # ----------------------------------------------------
 
             try:
 
@@ -626,10 +540,6 @@ class SignalScheduler:
                     return result
 
             except TypeError:
-
-                # ------------------------------------------------
-                # ИМЕНОВАННЫЙ ВЫЗОВ
-                # ------------------------------------------------
 
                 try:
 
@@ -648,20 +558,24 @@ class SignalScheduler:
                 except Exception as exc:
 
                     print(
-                        f"[MARKET] {pair}: "
-                        f"{method_name} "
-                        f"symbol= ошибка: {exc}"
+                        f"[MARKET] "
+                        f"{self.display_pair(pair)}: "
+                        f"{method_name}: "
+                        f"{exc}"
                     )
 
             except Exception as exc:
 
                 print(
-                    f"[MARKET] {pair}: "
-                    f"{method_name}: {exc}"
+                    f"[MARKET] "
+                    f"{self.display_pair(pair)}: "
+                    f"{method_name}: "
+                    f"{exc}"
                 )
 
         print(
-            f"[MARKET] {pair}: "
+            f"[MARKET] "
+            f"{self.display_pair(pair)}: "
             "свечи не получены"
         )
 
@@ -675,17 +589,6 @@ class SignalScheduler:
         self,
         pair: str,
     ) -> Signal | None:
-        """
-        Анализирует одну пару.
-
-        Сигнал будет возвращён только если:
-
-        QUALITY >= MIN_QUALITY
-
-        и
-
-        PROBABILITY >= MIN_PROBABILITY
-        """
 
         pair = self.normalize_pair(
             pair
@@ -695,16 +598,11 @@ class SignalScheduler:
             pair
         )
 
-        is_otc = self.is_otc_pair(
-            pair
-        )
-
         try:
 
             print(
                 "[ANALYZE] "
                 f"{display_name}"
-                f"{' [OTC]' if is_otc else ''}"
             )
 
             candles = await self.get_candles(
@@ -714,37 +612,40 @@ class SignalScheduler:
             if candles is None:
 
                 print(
-                    f"[ANALYZE] {display_name}: "
-                    "нет данных"
+                    f"[REJECT] "
+                    f"{display_name}: "
+                    "нет свечей"
                 )
 
                 return None
 
             try:
-
                 candle_count = len(
                     candles
                 )
-
             except Exception:
-
                 candle_count = 0
 
-            if candle_count < 50:
+            if (
+                candle_count
+                < MIN_CANDLES_FOR_ANALYSIS
+            ):
 
                 print(
-                    f"[ANALYZE] {display_name}: "
-                    f"мало свечей: "
-                    f"{candle_count}/50"
+                    f"[REJECT] "
+                    f"{display_name}: "
+                    f"мало свечей "
+                    f"{candle_count}/"
+                    f"{MIN_CANDLES_FOR_ANALYSIS}"
                 )
 
                 return None
 
             signal = None
 
-            # ----------------------------------------------------
-            # SIGNAL ENGINE API COMPATIBILITY
-            # ----------------------------------------------------
+            # ====================================================
+            # ENGINE API
+            # ====================================================
 
             for method_name in (
                 "analyze",
@@ -758,8 +659,43 @@ class SignalScheduler:
                     None,
                 )
 
-                if method is None:
+                if not callable(method):
                     continue
+
+                # ------------------------------------------------
+                # candles + pair
+                # ------------------------------------------------
+
+                try:
+
+                    signal = method(
+                        candles
+                    )
+
+                    if asyncio.iscoroutine(
+                        signal
+                    ):
+                        signal = await signal
+
+                    if signal is not None:
+                        break
+
+                except TypeError:
+                    pass
+
+                except Exception as exc:
+
+                    print(
+                        f"[ENGINE] "
+                        f"{display_name}: "
+                        f"{exc}"
+                    )
+
+                    return None
+
+                # ------------------------------------------------
+                # pair + candles
+                # ------------------------------------------------
 
                 try:
 
@@ -773,31 +709,49 @@ class SignalScheduler:
                     ):
                         signal = await signal
 
-                    break
-
-                except TypeError:
-
-                    try:
-
-                        signal = method(
-                            candles,
-                            pair,
-                        )
-
-                        if asyncio.iscoroutine(
-                            signal
-                        ):
-                            signal = await signal
-
+                    if signal is not None:
                         break
 
-                    except Exception:
-                        continue
+                except TypeError:
+                    pass
 
                 except Exception as exc:
 
                     print(
-                        f"[ENGINE] {display_name}: "
+                        f"[ENGINE] "
+                        f"{display_name}: "
+                        f"{exc}"
+                    )
+
+                    return None
+
+                # ------------------------------------------------
+                # candles + pair
+                # ------------------------------------------------
+
+                try:
+
+                    signal = method(
+                        candles,
+                        pair,
+                    )
+
+                    if asyncio.iscoroutine(
+                        signal
+                    ):
+                        signal = await signal
+
+                    if signal is not None:
+                        break
+
+                except TypeError:
+                    continue
+
+                except Exception as exc:
+
+                    print(
+                        f"[ENGINE] "
+                        f"{display_name}: "
                         f"{exc}"
                     )
 
@@ -806,15 +760,17 @@ class SignalScheduler:
             if signal is None:
 
                 print(
-                    f"[ANALYZE] {display_name}: "
-                    "сигнал не сформирован"
+                    f"[REJECT] "
+                    f"{display_name}: "
+                    "SignalEngine не сформировал "
+                    "сигнал"
                 )
 
                 return None
 
-            # ----------------------------------------------------
+            # ====================================================
             # QUALITY
-            # ----------------------------------------------------
+            # ====================================================
 
             quality = self.get_value(
                 signal,
@@ -822,9 +778,16 @@ class SignalScheduler:
                 0,
             )
 
-            # ----------------------------------------------------
+            try:
+                quality = float(
+                    quality
+                )
+            except Exception:
+                quality = 0.0
+
+            # ====================================================
             # PROBABILITY
-            # ----------------------------------------------------
+            # ====================================================
 
             probability = self.get_value(
                 signal,
@@ -833,29 +796,36 @@ class SignalScheduler:
             )
 
             try:
-
-                quality = float(
-                    quality
-                )
-
-            except Exception:
-
-                quality = 0.0
-
-            try:
-
                 probability = float(
                     probability
                 )
-
             except Exception:
-
                 probability = 0.0
 
+            # ====================================================
+            # DIRECTION
+            # ====================================================
+
+            direction = self.get_value(
+                signal,
+                "direction",
+                "",
+            )
+
+            direction = str(
+                direction
+            ).upper()
+
+            # ====================================================
+            # LOG
+            # ====================================================
+
             print(
-                f"[ANALYZE] {display_name}: "
+                "[ANALYZE] "
+                f"{display_name}: "
                 f"Q={quality:.1f} "
-                f"P={probability:.1f}%"
+                f"P={probability:.1f}% "
+                f"D={direction}"
             )
 
             # ====================================================
@@ -867,8 +837,10 @@ class SignalScheduler:
             ):
 
                 print(
-                    f"[REJECT] {display_name}: "
-                    f"quality {quality:.1f} < "
+                    f"[REJECT] "
+                    f"{display_name}: "
+                    f"QUALITY "
+                    f"{quality:.1f} < "
                     f"{MIN_QUALITY}"
                 )
 
@@ -883,8 +855,9 @@ class SignalScheduler:
             ):
 
                 print(
-                    f"[REJECT] {display_name}: "
-                    f"probability "
+                    f"[REJECT] "
+                    f"{display_name}: "
+                    f"PROBABILITY "
                     f"{probability:.1f}% < "
                     f"{MIN_PROBABILITY}%"
                 )
@@ -892,21 +865,8 @@ class SignalScheduler:
                 return None
 
             # ====================================================
-            # DIRECTION
+            # DIRECTION FILTER
             # ====================================================
-
-            direction = self.get_value(
-                signal,
-                "direction",
-                "",
-            )
-
-            if not direction:
-                return None
-
-            direction = str(
-                direction
-            ).upper()
 
             if direction not in {
                 "CALL",
@@ -916,8 +876,9 @@ class SignalScheduler:
             }:
 
                 print(
-                    f"[REJECT] {display_name}: "
-                    f"неизвестное направление "
+                    f"[REJECT] "
+                    f"{display_name}: "
+                    f"неверное направление "
                     f"{direction}"
                 )
 
@@ -928,7 +889,8 @@ class SignalScheduler:
         except Exception as exc:
 
             print(
-                f"[ANALYZE] {display_name}: "
+                f"[ANALYZE] "
+                f"{display_name}: "
                 f"ошибка {exc}"
             )
 
@@ -944,10 +906,6 @@ class SignalScheduler:
         name: str,
         default=None,
     ):
-        """
-        Универсальное получение значения
-        из dict или объекта.
-        """
 
         if obj is None:
             return default
@@ -956,7 +914,6 @@ class SignalScheduler:
             obj,
             dict,
         ):
-
             return obj.get(
                 name,
                 default,
@@ -969,21 +926,13 @@ class SignalScheduler:
         )
 
     # ============================================================
-    # BEST SIGNAL
+    # CHOOSE BEST
     # ============================================================
 
     def choose_best(
         self,
         signals: list[Signal],
     ) -> Signal | None:
-        """
-        Выбирает самый сильный сигнал.
-
-        Приоритет:
-
-        1. QUALITY
-        2. PROBABILITY
-        """
 
         if not signals:
             return None
@@ -1005,24 +954,18 @@ class SignalScheduler:
             )
 
             try:
-
                 quality = float(
                     quality
                 )
-
             except Exception:
-
-                quality = 0
+                quality = 0.0
 
             try:
-
                 probability = float(
                     probability
                 )
-
             except Exception:
-
-                probability = 0
+                probability = 0.0
 
             if quality < float(
                 MIN_QUALITY
@@ -1056,6 +999,45 @@ class SignalScheduler:
         return valid[0][2]
 
     # ============================================================
+    # SCAN SELECTED PAIRS
+    # ============================================================
+
+    async def scan_pairs(
+        self,
+        pairs: list[str],
+    ) -> Signal | None:
+
+        if not pairs:
+            return None
+
+        signals: list[Signal] = []
+
+        for pair in pairs:
+
+            try:
+
+                signal = await self.analyze_pair(
+                    pair
+                )
+
+                if signal is not None:
+                    signals.append(
+                        signal
+                    )
+
+            except Exception as exc:
+
+                print(
+                    f"[SCAN] "
+                    f"{self.display_pair(pair)}: "
+                    f"{exc}"
+                )
+
+        return self.choose_best(
+            signals
+        )
+
+    # ============================================================
     # MANUAL SIGNAL
     # ============================================================
 
@@ -1064,73 +1046,68 @@ class SignalScheduler:
         pair: str | None = None,
     ) -> Signal | None:
         """
-        Ручной запрос сигнала.
+        pair = конкретный актив:
+            анализируется только он.
 
-        Если pair указан:
-            анализируется только эта пара.
-
-        Если pair отсутствует:
-            анализируются все доступные пары,
-            включая OTC.
+        pair = None:
+            анализируются ВСЕ доступные активы.
         """
 
         async with self.scan_lock:
 
-            # ----------------------------------------------------
-            # КОНКРЕТНАЯ ПАРА
-            # ----------------------------------------------------
+            # ====================================================
+            # SPECIFIC
+            # ====================================================
 
             if pair:
 
-                pair = self.normalize_pair(
+                normalized = self.normalize_pair(
                     pair
                 )
 
                 print(
                     "[MANUAL] Проверяю "
-                    f"{self.display_pair(pair)}"
+                    f"{self.display_pair(normalized)}"
                 )
 
                 return await self.analyze_pair(
-                    pair
+                    normalized
                 )
 
-            # ----------------------------------------------------
-            # ЛЮБАЯ ПАРА
-            # ----------------------------------------------------
+            # ====================================================
+            # ALL
+            # ====================================================
 
             print(
-                "[MANUAL] Проверяю все "
-                "доступные пары, включая OTC"
+                "[MANUAL] Проверяю "
+                "обычные + OTC пары"
             )
 
             pairs = await self.get_available_pairs()
 
             if not pairs:
-                return None
 
-            signals = []
-
-            for current_pair in pairs:
-
-                signal = await self.analyze_pair(
-                    current_pair
+                print(
+                    "[MANUAL] "
+                    "Нет доступных пар"
                 )
 
-                if signal is not None:
+                return None
 
-                    signals.append(
-                        signal
-                    )
+            print(
+                "[MANUAL] Всего пар: "
+                f"{len(pairs)}"
+            )
 
-            best = self.choose_best(
-                signals
+            best = await self.scan_pairs(
+                pairs
             )
 
             if best is None:
 
                 print(
-                    "[MANUAL] Сильный сигнал "
+                    "[MANUAL] "
+                    "Сильный сигнал "
                     "не найден"
                 )
 
@@ -1138,10 +1115,74 @@ class SignalScheduler:
 
             print(
                 "[MANUAL] Лучший сигнал: "
-                f"{self.display_pair(self.get_value(best, 'pair', '?'))}"
+                f"{self.display_pair("
+                    self.get_value(
+                        best,
+                        "pair",
+                        "?",
+                    )
+                )}"
             )
 
             return best
+
+    # ============================================================
+    # MANUAL TYPE
+    # ============================================================
+
+    async def get_manual_signal_by_type(
+        self,
+        signal_type: str,
+    ) -> Signal | None:
+        """
+        signal_type:
+
+        regular
+        otc
+        all
+        """
+
+        async with self.scan_lock:
+
+            signal_type = (
+                str(
+                    signal_type
+                )
+                .strip()
+                .lower()
+            )
+
+            if signal_type == "regular":
+
+                pairs = await self.get_regular_pairs()
+
+            elif signal_type == "otc":
+
+                pairs = await self.get_otc_pairs()
+
+            else:
+
+                pairs = await self.get_available_pairs()
+
+            if not pairs:
+
+                print(
+                    "[MANUAL] "
+                    f"{signal_type}: "
+                    "нет пар"
+                )
+
+                return None
+
+            print(
+                "[MANUAL] "
+                f"{signal_type}: "
+                f"проверяю {len(pairs)} пар"
+            )
+
+            return await self.scan_pairs(
+                pairs
+            )
 
     # ============================================================
     # AUTOMATIC SCAN
@@ -1151,21 +1192,6 @@ class SignalScheduler:
         self,
         bot=None,
     ):
-        """
-        Один полный автоматический проход.
-
-        Анализируются все доступные пары,
-        включая OTC.
-
-        Из них выбирается лучший сигнал.
-
-        Если сильного сигнала нет —
-        пользователям ничего не отправляется.
-
-        Если сигнал есть —
-        он сохраняется в БД и отправляется
-        APPROVED пользователям.
-        """
 
         if bot is not None:
             self.bot = bot
@@ -1185,7 +1211,9 @@ class SignalScheduler:
 
             print(
                 "[SCAN] "
-                f"{self.now().strftime('%d.%m.%Y %H:%M:%S')} МСК"
+                f"{self.now().strftime("
+                    '%d.%m.%Y %H:%M:%S'
+                )} МСК"
             )
 
             print("=" * 60)
@@ -1195,7 +1223,8 @@ class SignalScheduler:
             if not pairs:
 
                 print(
-                    "[SCAN] Нет доступных пар"
+                    "[SCAN] "
+                    "Нет доступных пар"
                 )
 
                 return None
@@ -1226,44 +1255,23 @@ class SignalScheduler:
                 f"{otc_count}"
             )
 
-            signals = []
-
-            for pair in pairs:
-
-                try:
-
-                    signal = await self.analyze_pair(
-                        pair
-                    )
-
-                    if signal is not None:
-
-                        signals.append(
-                            signal
-                        )
-
-                except Exception as exc:
-
-                    print(
-                        f"[SCAN] {pair}: "
-                        f"{exc}"
-                    )
-
-            best = self.choose_best(
-                signals
+            best = await self.scan_pairs(
+                pairs
             )
 
             if best is None:
 
                 print(
-                    "[SCAN] Сильного сигнала "
+                    "[SCAN] "
+                    "Сильного сигнала "
                     "не найдено"
                 )
 
                 return None
 
             print(
-                "[SCAN] ============================="
+                "[SCAN] "
+                "============================="
             )
 
             print(
@@ -1277,20 +1285,21 @@ class SignalScheduler:
             )
 
             print(
-                "[SCAN] ============================="
+                "[SCAN] "
+                "============================="
             )
 
-            # ----------------------------------------------------
+            # ====================================================
             # SAVE
-            # ----------------------------------------------------
+            # ====================================================
 
             await self.save_signal(
                 best
             )
 
-            # ----------------------------------------------------
+            # ====================================================
             # SEND
-            # ----------------------------------------------------
+            # ====================================================
 
             await self.send_to_users(
                 best
@@ -1306,12 +1315,6 @@ class SignalScheduler:
         self,
         signal: Signal,
     ):
-        """
-        Сохраняет сигнал в БД.
-
-        Поддерживает новую и старую сигнатуру
-        db.save_signal().
-        """
 
         method = getattr(
             db,
@@ -1319,7 +1322,7 @@ class SignalScheduler:
             None,
         )
 
-        if method is None:
+        if not callable(method):
             return
 
         try:
@@ -1367,13 +1370,12 @@ class SignalScheduler:
                 ),
             }
 
-            # ----------------------------------------------------
-            # CONFIRMATIONS
-            # ----------------------------------------------------
-
             if isinstance(
                 data["confirmations"],
-                (list, tuple),
+                (
+                    list,
+                    tuple,
+                ),
             ):
 
                 data["confirmations"] = ", ".join(
@@ -1383,13 +1385,12 @@ class SignalScheduler:
                     )
                 )
 
-            # ----------------------------------------------------
-            # REASONS
-            # ----------------------------------------------------
-
             if isinstance(
                 data["reasons"],
-                (list, tuple),
+                (
+                    list,
+                    tuple,
+                ),
             ):
 
                 data["reasons"] = ", ".join(
@@ -1398,10 +1399,6 @@ class SignalScheduler:
                         data["reasons"],
                     )
                 )
-
-            # ----------------------------------------------------
-            # DATETIME
-            # ----------------------------------------------------
 
             for key in (
                 "entry_time",
@@ -1417,10 +1414,6 @@ class SignalScheduler:
 
                     data[key] = value.isoformat()
 
-            # ----------------------------------------------------
-            # NEW DATABASE API
-            # ----------------------------------------------------
-
             try:
 
                 result = method(
@@ -1430,14 +1423,9 @@ class SignalScheduler:
                 if asyncio.iscoroutine(
                     result
                 ):
-
                     await result
 
             except TypeError:
-
-                # ------------------------------------------------
-                # OLD DATABASE API
-                # ------------------------------------------------
 
                 try:
 
@@ -1448,36 +1436,30 @@ class SignalScheduler:
                     if asyncio.iscoroutine(
                         result
                     ):
-
                         await result
 
                 except Exception as exc:
 
                     print(
-                        f"[DB] Ошибка сохранения: "
+                        "[DB] Ошибка сохранения: "
                         f"{exc}"
                     )
 
         except Exception as exc:
 
             print(
-                f"[DB] Ошибка: {exc}"
+                "[DB] Ошибка: "
+                f"{exc}"
             )
 
     # ============================================================
-    # SEND USERS
+    # SEND
     # ============================================================
 
     async def send_to_users(
         self,
         signal: Signal,
     ):
-        """
-        Отправляет сигнал всем одобренным пользователям.
-
-        Автоматически отправляются только пользователям,
-        которых возвращает db.get_approved_users().
-        """
 
         if self.bot is None:
             return
@@ -1486,10 +1468,16 @@ class SignalScheduler:
 
             users = db.get_approved_users()
 
+            if asyncio.iscoroutine(
+                users
+            ):
+                users = await users
+
         except Exception as exc:
 
             print(
-                f"[SEND] Ошибка БД: {exc}"
+                "[SEND] Ошибка БД: "
+                f"{exc}"
             )
 
             return
@@ -1497,7 +1485,8 @@ class SignalScheduler:
         if not users:
 
             print(
-                "[SEND] Нет одобренных пользователей"
+                "[SEND] Нет одобренных "
+                "пользователей"
             )
 
             return
@@ -1549,7 +1538,7 @@ class SignalScheduler:
                 )
 
         print(
-            f"[SEND] Отправлено: "
+            "[SEND] Отправлено: "
             f"{sent}/{len(users)}"
         )
 
@@ -1561,9 +1550,6 @@ class SignalScheduler:
         self,
         signal: Signal,
     ) -> str:
-        """
-        Формат Telegram-сообщения сигнала.
-        """
 
         raw_pair = self.get_value(
             signal,
@@ -1633,82 +1619,52 @@ class SignalScheduler:
             direction_text = "PUT ↓"
 
         # ========================================================
-        # ENTRY TIME
+        # TIME FORMATTER
         # ========================================================
 
-        if isinstance(
-            entry_time,
-            datetime,
-        ):
+        def format_time(
+            value,
+        ) -> str:
 
-            # Если datetime пришёл без timezone,
-            # считаем его московским.
-            if entry_time.tzinfo is None:
+            if isinstance(
+                value,
+                datetime,
+            ):
 
-                entry_time = entry_time.replace(
-                    tzinfo=MOSCOW_TZ
-                    if MOSCOW_TZ is not None
-                    else None
+                if (
+                    value.tzinfo is None
+                ):
+
+                    if MOSCOW_TZ is not None:
+                        value = value.replace(
+                            tzinfo=MOSCOW_TZ
+                        )
+
+                elif MOSCOW_TZ is not None:
+
+                    value = value.astimezone(
+                        MOSCOW_TZ
+                    )
+
+                return (
+                    value.strftime(
+                        "%H:%M"
+                    )
+                    + " МСК"
                 )
 
-            elif MOSCOW_TZ is not None:
+            if value:
+                return str(value)
 
-                entry_time = entry_time.astimezone(
-                    MOSCOW_TZ
-                )
+            return "—"
 
-            entry_text = (
-                entry_time.strftime(
-                    "%H:%M"
-                )
-                + " МСК"
-            )
+        entry_text = format_time(
+            entry_time
+        )
 
-        else:
-
-            entry_text = (
-                str(entry_time)
-                if entry_time
-                else "—"
-            )
-
-        # ========================================================
-        # EXPIRY TIME
-        # ========================================================
-
-        if isinstance(
-            expiry_time,
-            datetime,
-        ):
-
-            if expiry_time.tzinfo is None:
-
-                expiry_time = expiry_time.replace(
-                    tzinfo=MOSCOW_TZ
-                    if MOSCOW_TZ is not None
-                    else None
-                )
-
-            elif MOSCOW_TZ is not None:
-
-                expiry_time = expiry_time.astimezone(
-                    MOSCOW_TZ
-                )
-
-            expiry_text = (
-                expiry_time.strftime(
-                    "%H:%M"
-                )
-                + " МСК"
-            )
-
-        else:
-
-            expiry_text = (
-                str(expiry_time)
-                if expiry_time
-                else "—"
-            )
+        expiry_text = format_time(
+            expiry_time
+        )
 
         # ========================================================
         # QUALITY
@@ -1750,7 +1706,10 @@ class SignalScheduler:
 
         if isinstance(
             confirmations,
-            (list, tuple),
+            (
+                list,
+                tuple,
+            ),
         ):
 
             for confirmation in confirmations:
@@ -1765,13 +1724,10 @@ class SignalScheduler:
                 if confirmation.startswith(
                     "✅"
                 ):
-
                     confirmation_lines.append(
                         confirmation
                     )
-
                 else:
-
                     confirmation_lines.append(
                         f"✅ {confirmation}"
                     )
@@ -1782,48 +1738,40 @@ class SignalScheduler:
                 confirmations
             ).strip()
 
-            if confirmation:
+            if "," in confirmation:
 
-                if "," in confirmation:
+                for item in confirmation.split(
+                    ","
+                ):
 
-                    for item in confirmation.split(
-                        ","
-                    ):
+                    item = item.strip()
 
-                        item = item.strip()
+                    if not item:
+                        continue
 
-                        if not item:
-                            continue
-
-                        if item.startswith(
-                            "✅"
-                        ):
-
-                            confirmation_lines.append(
-                                item
-                            )
-
-                        else:
-
-                            confirmation_lines.append(
-                                f"✅ {item}"
-                            )
-
-                else:
-
-                    if confirmation.startswith(
+                    if item.startswith(
                         "✅"
                     ):
-
                         confirmation_lines.append(
-                            confirmation
+                            item
                         )
-
                     else:
-
                         confirmation_lines.append(
-                            f"✅ {confirmation}"
+                            f"✅ {item}"
                         )
+
+            elif confirmation:
+
+                if confirmation.startswith(
+                    "✅"
+                ):
+                    confirmation_lines.append(
+                        confirmation
+                    )
+                else:
+                    confirmation_lines.append(
+                        f"✅ {confirmation}"
+                    )
 
         # ========================================================
         # MESSAGE
@@ -1862,23 +1810,6 @@ class SignalScheduler:
         self,
         bot=None,
     ):
-        """
-        Основной автоматический цикл.
-
-        Сигналы проверяются каждые 5 минут:
-
-        00:00
-        00:05
-        00:10
-        00:15
-        ...
-
-        Проверяются как обычные пары,
-        так и OTC.
-
-        Если сильного сигнала нет,
-        пользователям ничего не отправляется.
-        """
 
         if bot is not None:
             self.bot = bot
@@ -1886,8 +1817,8 @@ class SignalScheduler:
         self.running = True
 
         print(
-            "[SCHEDULER] Автоматический "
-            "режим запущен"
+            "[SCHEDULER] "
+            "Автоматический режим запущен"
         )
 
         while self.running:
@@ -1908,7 +1839,8 @@ class SignalScheduler:
                     wait_seconds = 0
 
                 print(
-                    "[SCHEDULER] Следующий анализ: "
+                    "[SCHEDULER] "
+                    "Следующий анализ: "
                     f"{next_time.strftime('%H:%M:%S')} МСК"
                 )
 
@@ -1919,23 +1851,15 @@ class SignalScheduler:
                 if not self.running:
                     break
 
-                # ------------------------------------------------
-                # АВТОМАТИЧЕСКИЙ СКАН
-                # ------------------------------------------------
-
                 await self.scan_once()
-
-                # ------------------------------------------------
-                # Защита от мгновенного повторного запуска.
-                # ------------------------------------------------
 
                 await asyncio.sleep(2)
 
             except asyncio.CancelledError:
 
                 print(
-                    "[SCHEDULER] Получена команда "
-                    "остановки"
+                    "[SCHEDULER] "
+                    "Получена команда остановки"
                 )
 
                 break
@@ -1943,7 +1867,7 @@ class SignalScheduler:
             except Exception as exc:
 
                 print(
-                    f"[SCHEDULER] Ошибка: "
+                    "[SCHEDULER] Ошибка: "
                     f"{exc}"
                 )
 
@@ -1962,8 +1886,5 @@ class SignalScheduler:
     # ============================================================
 
     def stop(self):
-        """
-        Останавливает автоматический цикл.
-        """
 
         self.running = False
