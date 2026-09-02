@@ -5,3 +5,4 @@ aiohttp==3.12.15
 python-dotenv==1.1.1
 pandas==2.3.2
 numpy==2.3.2
+BinaryOptionsToolsV2==0.2.12
