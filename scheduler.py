@@ -1,253 +1,229 @@
 import asyncio
 import logging
-from typing import Optional
-
-from aiogram import Bot
+from datetime import datetime
 
 from config import (
-    AUTO_SIGNALS_ENABLED,
-    DEFAULT_PAIRS,
-    EXPIRY_MINUTES,
-    MIN_QUALITY,
+    ADMIN_ID,
+    AUTO_SCAN_SECONDS,
+    PAIRS,
     TIMEZONE,
 )
-from database import Database
-from market import MarketClient
+from database import db
+from market import market_client
 from signal_engine import Signal, SignalEngine
-
 
 logger = logging.getLogger(__name__)
 
 
 class SignalScheduler:
-
-    def __init__(
-        self,
-        bot: Bot,
-        database: Database,
-        market: MarketClient,
-        engine: SignalEngine,
-    ):
+    def __init__(self, bot):
         self.bot = bot
-        self.database = database
-        self.market = market
-        self.engine = engine
+        self.engine = SignalEngine()
+        self.analysis_lock = asyncio.Lock()
 
-        self.running = False
+    async def find_best_signal(self) -> Signal | None:
+        async with self.analysis_lock:
 
-
-    async def find_best_signal(
-        self,
-    ) -> Optional[Signal]:
-
-        best_signal = None
-
-        for pair in DEFAULT_PAIRS:
-
-            try:
-                candles = await self.market.get_candles(
+            async def analyze_pair(pair: str):
+                candles = await market_client.get_candles(
                     pair
                 )
 
                 if candles is None:
-                    continue
+                    return None
 
-                signal = self.engine.analyze(
-                    pair,
-                    candles,
-                )
+                try:
+                    return self.engine.analyze(
+                        pair,
+                        candles,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Ошибка анализа %s",
+                        pair,
+                    )
+                    return None
 
-                if signal is None:
-                    continue
-
-                if (
-                    best_signal is None
-                    or signal.quality
-                    > best_signal.quality
-                ):
-                    best_signal = signal
-
-            except Exception:
-                logger.exception(
-                    "Ошибка анализа %s",
-                    pair,
-                )
-
-        return best_signal
-
-
-    async def run(
-        self,
-    ) -> None:
-
-        if not AUTO_SIGNALS_ENABLED:
-            logger.info(
-                "Автоматические сигналы отключены."
+            results = await asyncio.gather(
+                *[
+                    analyze_pair(pair)
+                    for pair in PAIRS
+                ],
+                return_exceptions=True,
             )
-            return
 
-        if self.running:
-            return
+            signals = []
 
-        self.running = True
+            for result in results:
+                if isinstance(result, Signal):
+                    signals.append(result)
 
-        logger.info(
-            "Signal scheduler started."
+            if not signals:
+                return None
+
+            signals.sort(
+                key=lambda signal: signal.quality,
+                reverse=True,
+            )
+
+            return signals[0]
+
+    @staticmethod
+    def format_signal(signal: Signal) -> str:
+        entry_msk = signal.entry_time.astimezone(
+            TIMEZONE
         )
 
-        try:
+        expiry_msk = signal.expiry_time.astimezone(
+            TIMEZONE
+        )
 
-            while True:
-
-                signal = (
-                    await self.find_best_signal()
-                )
-
-                if signal is not None:
-
-                    await self.send_signal(
-                        signal
-                    )
-
-                else:
-
-                    logger.info(
-                        "Сильный сигнал не найден."
-                    )
-
-                # Проверяем рынок каждые 60 секунд.
-                await asyncio.sleep(60)
-
-        except asyncio.CancelledError:
-
-            logger.info(
-                "Signal scheduler stopped."
-            )
-
-            raise
-
-        except Exception:
-
-            logger.exception(
-                "Scheduler crashed."
-            )
-
-            await asyncio.sleep(10)
-
-        finally:
-            self.running = False
-
-
-    async def send_signal(
-        self,
-        signal: Signal,
-    ) -> None:
-
-        confirmations_text = []
-
-        for name, direction in (
-            signal.confirmations.items()
-        ):
-
-            if direction == "CALL":
-                mark = "🟢"
-            elif direction == "PUT":
-                mark = "🔴"
-            else:
-                mark = "⚪"
-
-            confirmations_text.append(
-                f"{mark} {name}"
-            )
+        if signal.direction == "CALL":
+            direction = "🟢 CALL ↑"
+        else:
+            direction = "🔴 PUT ↓"
 
         confirmations = "\n".join(
-            confirmations_text
+            f"• {item}"
+            for item in signal.confirmations[:6]
         )
 
-        direction_text = (
-            "🟢 CALL ↑"
-            if signal.direction == "CALL"
-            else "🔴 PUT ↓"
-        )
-
-        message = (
-            f"<b>{direction_text}</b>\n\n"
-            f"💱 <b>{signal.pair}</b>\n\n"
-            f"⏰ <b>ВХОД:</b> "
-            f"{signal.entry_time.strftime('%H:%M')} МСК\n"
-            f"🎯 <b>ЭКСПИРАЦИЯ:</b> "
-            f"{signal.expiry_time.strftime('%H:%M')} МСК\n\n"
-            f"📊 <b>QUALITY:</b> "
-            f"{signal.quality}/100\n\n"
-            f"<b>Подтверждения:</b>\n"
+        return (
+            "🚨 <b>НОВЫЙ СИГНАЛ</b>\n\n"
+            f"<b>{direction}</b>\n\n"
+            f"💱 Пара: <b>{signal.pair}</b>\n"
+            f"⏰ ВХОД: <b>{entry_msk:%H:%M} МСК</b>\n"
+            f"🎯 ЭКСПИРАЦИЯ: "
+            f"<b>{expiry_msk:%H:%M} МСК</b>\n"
+            f"📊 QUALITY: "
+            f"<b>{signal.quality:.0f}/100</b>\n\n"
+            "🔎 <b>Подтверждения:</b>\n"
             f"{confirmations}\n\n"
-            f"⚠️ Сигнал не является гарантией "
-            f"прибыльной сделки."
+            "⚠️ Сигнал является аналитическим "
+            "прогнозом, а не гарантией результата."
         )
 
-        self.database.save_signal(
+    async def save_signal(
+        self,
+        signal: Signal,
+    ) -> int | None:
+
+        entry_iso = signal.entry_time.isoformat()
+
+        if db.signal_exists(
+            signal.pair,
+            signal.direction,
+            entry_iso,
+        ):
+            return None
+
+        signal_id = db.save_signal(
             pair=signal.pair,
             direction=signal.direction,
-            entry_time=signal.entry_time.isoformat(),
-            expiry_time=signal.expiry_time.isoformat(),
             quality=signal.quality,
-            score_details=message,
+            entry_time=entry_iso,
+            expiry_time=signal.expiry_time.isoformat(),
+            analysis_time=signal.analysis_time.isoformat(),
+            confirmations=signal.confirmations,
+            reasons=signal.reasons,
         )
 
-        # Пока рассылаем только одобренным пользователям.
-        # Список берём из БД.
-        await self._send_to_approved_users(
-            message
-        )
+        return signal_id
 
-
-    async def _send_to_approved_users(
+    async def send_to_user(
         self,
-        message: str,
-    ) -> None:
+        user_id: int,
+        signal: Signal,
+    ):
+        try:
+            await self.bot.send_message(
+                user_id,
+                self.format_signal(signal),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Не удалось отправить сигнал %s: %s",
+                user_id,
+                exc,
+            )
 
-        # SQLite-запрос здесь сделаем через
-        # отдельный метод ниже.
-        users = self._get_approved_users()
+    async def send_automatic_signal(
+        self,
+        signal: Signal,
+    ):
+        signal_id = await self.save_signal(
+            signal
+        )
 
-        for user_id in users:
+        if signal_id is None:
+            logger.info(
+                "Сигнал уже существует: %s %s %s",
+                signal.pair,
+                signal.direction,
+                signal.entry_time,
+            )
+            return
 
-            try:
+        users = db.get_approved_users()
 
-                await self.bot.send_message(
+        if ADMIN_ID and ADMIN_ID not in users:
+            users.append(ADMIN_ID)
+
+        if not users:
+            logger.info(
+                "Нет пользователей для отправки сигнала"
+            )
+            return
+
+        await asyncio.gather(
+            *[
+                self.send_to_user(
                     user_id,
-                    message,
+                    signal,
                 )
+                for user_id in users
+            ],
+            return_exceptions=True,
+        )
+
+        logger.info(
+            "Сигнал #%s отправлен: %s %s %.0f",
+            signal_id,
+            signal.pair,
+            signal.direction,
+            signal.quality,
+        )
+
+    async def run(self):
+        logger.info(
+            "Автоматический сканер запущен"
+        )
+
+        while True:
+            try:
+                signal = await self.find_best_signal()
+
+                if signal:
+                    await self.send_automatic_signal(
+                        signal
+                    )
+                else:
+                    logger.info(
+                        "Сильного сигнала сейчас нет"
+                    )
+
+            except asyncio.CancelledError:
+                raise
 
             except Exception:
-
                 logger.exception(
-                    "Не удалось отправить сигнал %s",
-                    user_id,
+                    "Ошибка scheduler"
                 )
 
-
-    def _get_approved_users(
-        self,
-    ) -> list[int]:
-
-        with self.database.lock:
-
-            cursor = (
-                self.database.connection.cursor()
+            await asyncio.sleep(
+                AUTO_SCAN_SECONDS
             )
 
-            cursor.execute(
-                """
-                SELECT user_id
-                FROM users
-                WHERE status = 'approved'
-                """
-            )
 
-            rows = cursor.fetchall()
-
-        return [
-            int(row["user_id"])
-            for row in rows
-        ]
+scheduler_instance = None
