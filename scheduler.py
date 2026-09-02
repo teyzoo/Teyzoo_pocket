@@ -15,9 +15,13 @@ from market import market_client
 from signal_engine import SignalEngine, Signal
 
 
-# Интервал автоматического анализа.
-# Не берём его из config.py, чтобы не было ошибки импорта.
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+
+# Автоматический анализ каждые 5 минут.
 SIGNAL_INTERVAL_MINUTES = 5
+
 
 # Московское время.
 try:
@@ -32,18 +36,30 @@ class SignalScheduler:
     """
     Планировщик сигналов.
 
-    Совместим с:
-        scheduler = SignalScheduler(bot)
+    Поддерживает:
 
-    и:
-        scheduler.run()
+    - автоматический анализ;
+    - ручной запрос сигнала;
+    - анализ конкретной пары;
+    - анализ любой доступной пары;
+    - фильтр QUALITY;
+    - фильтр PROBABILITY;
+    - выбор лучшего сигнала;
+    - сохранение сигнала в БД;
+    - автоматическую отправку APPROVED пользователям;
+    - московское время;
+    - защиту от одновременного запуска анализа.
     """
 
     def __init__(self, bot=None):
         self.bot = bot
+
         self.engine = SignalEngine()
 
         self.running = False
+
+        # Не позволяет одновременно выполнять
+        # автоматический и ручной анализ.
         self.scan_lock = asyncio.Lock()
 
         print("[SCHEDULER] Инициализирован")
@@ -60,6 +76,10 @@ class SignalScheduler:
     # ============================================================
 
     def set_bot(self, bot):
+        """
+        Устанавливает экземпляр Telegram Bot.
+        """
+
         self.bot = bot
 
     # ============================================================
@@ -67,6 +87,10 @@ class SignalScheduler:
     # ============================================================
 
     def now(self) -> datetime:
+        """
+        Возвращает текущее московское время.
+        """
+
         if MOSCOW_TZ is not None:
             return datetime.now(MOSCOW_TZ)
 
@@ -76,6 +100,17 @@ class SignalScheduler:
         self,
         interval: int = SIGNAL_INTERVAL_MINUTES,
     ) -> datetime:
+        """
+        Возвращает ближайшую временную отметку
+        для автоматического анализа.
+
+        Например:
+
+        12:01 -> 12:05
+        12:04 -> 12:05
+        12:05 -> 12:10
+        12:09 -> 12:10
+        """
 
         now = self.now()
 
@@ -102,13 +137,16 @@ class SignalScheduler:
     async def get_available_pairs(
         self,
     ) -> list[str]:
-
         """
-        Пытаемся получить динамический список
+        Пытается получить динамический список пар
         из market.py.
 
-        Если market.py пока не умеет динамически
-        получать пары — используем PAIRS из config.py.
+        Если market.py не предоставляет список,
+        используется PAIRS из config.py.
+
+        OTC намеренно исключаются, поскольку обычные
+        рыночные котировки Twelve Data не являются
+        OTC-котировками Pocket Option.
         """
 
         try:
@@ -138,12 +176,11 @@ class SignalScheduler:
                             pair
                         ).strip().upper()
 
-                        # Не используем OTC,
-                        # потому что обычный Twelve Data
-                        # не даёт OTC-котировки Pocket Option.
+                        # OTC не используем.
                         if "OTC" in pair:
                             continue
 
+                        # Нужен формат EUR/USD.
                         if "/" not in pair:
                             continue
 
@@ -151,6 +188,7 @@ class SignalScheduler:
                             cleaned.append(pair)
 
                     if cleaned:
+
                         print(
                             "[PAIRS] Динамически найдено: "
                             f"{len(cleaned)}"
@@ -159,12 +197,16 @@ class SignalScheduler:
                         return cleaned
 
         except Exception as exc:
+
             print(
                 "[PAIRS] Ошибка динамического "
                 f"получения: {exc}"
             )
 
-        # Резервный список.
+        # --------------------------------------------------------
+        # FALLBACK
+        # --------------------------------------------------------
+
         fallback = []
 
         for pair in PAIRS:
@@ -197,9 +239,12 @@ class SignalScheduler:
         self,
         pair: str,
     ):
-
         """
-        Совместимость с разными версиями market.py.
+        Получает свечи.
+
+        Поддерживает разные названия методов market.py,
+        чтобы scheduler оставался совместимым
+        с разными версиями MarketClient.
         """
 
         method_names = (
@@ -220,6 +265,10 @@ class SignalScheduler:
             if method is None:
                 continue
 
+            # ----------------------------------------------------
+            # ПОЗИЦИОННЫЙ ВЫЗОВ
+            # ----------------------------------------------------
+
             try:
 
                 result = method(pair)
@@ -231,6 +280,10 @@ class SignalScheduler:
                     return result
 
             except TypeError:
+
+                # ------------------------------------------------
+                # ИМЕНОВАННЫЙ ВЫЗОВ
+                # ------------------------------------------------
 
                 try:
 
@@ -269,6 +322,17 @@ class SignalScheduler:
         self,
         pair: str,
     ) -> Signal | None:
+        """
+        Анализирует одну пару.
+
+        Сигнал будет возвращён только если:
+
+        QUALITY >= MIN_QUALITY
+
+        и
+
+        PROBABILITY >= MIN_PROBABILITY
+        """
 
         pair = str(
             pair
@@ -281,10 +345,12 @@ class SignalScheduler:
             )
 
             if candles is None:
+
                 print(
                     f"[ANALYZE] {pair}: "
                     "нет данных"
                 )
+
                 return None
 
             try:
@@ -306,7 +372,10 @@ class SignalScheduler:
 
             signal = None
 
-            # Поддержка нескольких API SignalEngine.
+            # ----------------------------------------------------
+            # SIGNAL ENGINE API COMPATIBILITY
+            # ----------------------------------------------------
+
             for method_name in (
                 "analyze",
                 "generate_signal",
@@ -371,11 +440,19 @@ class SignalScheduler:
 
                 return None
 
+            # ----------------------------------------------------
+            # QUALITY
+            # ----------------------------------------------------
+
             quality = self.get_value(
                 signal,
                 "quality",
                 0,
             )
+
+            # ----------------------------------------------------
+            # PROBABILITY
+            # ----------------------------------------------------
 
             probability = self.get_value(
                 signal,
@@ -384,17 +461,23 @@ class SignalScheduler:
             )
 
             try:
+
                 quality = float(
                     quality
                 )
+
             except Exception:
+
                 quality = 0.0
 
             try:
+
                 probability = float(
                     probability
                 )
+
             except Exception:
+
                 probability = 0.0
 
             print(
@@ -435,6 +518,10 @@ class SignalScheduler:
                 )
 
                 return None
+
+            # ====================================================
+            # DIRECTION
+            # ====================================================
 
             direction = self.get_value(
                 signal,
@@ -485,6 +572,10 @@ class SignalScheduler:
         name: str,
         default=None,
     ):
+        """
+        Универсальное получение значения
+        из dict или объекта.
+        """
 
         if obj is None:
             return default
@@ -493,6 +584,7 @@ class SignalScheduler:
             obj,
             dict,
         ):
+
             return obj.get(
                 name,
                 default,
@@ -512,6 +604,14 @@ class SignalScheduler:
         self,
         signals: list[Signal],
     ) -> Signal | None:
+        """
+        Выбирает самый сильный сигнал.
+
+        Приоритет:
+
+        1. QUALITY
+        2. PROBABILITY
+        """
 
         if not signals:
             return None
@@ -533,17 +633,23 @@ class SignalScheduler:
             )
 
             try:
+
                 quality = float(
                     quality
                 )
+
             except Exception:
+
                 quality = 0
 
             try:
+
                 probability = float(
                     probability
                 )
+
             except Exception:
+
                 probability = 0
 
             if quality < float(
@@ -585,10 +691,23 @@ class SignalScheduler:
         self,
         pair: str | None = None,
     ) -> Signal | None:
+        """
+        Ручной запрос сигнала.
+
+        Если pair указан:
+            анализируется только эта пара.
+
+        Если pair отсутствует:
+            анализируются все доступные пары,
+            после чего выбирается лучшая.
+        """
 
         async with self.scan_lock:
 
-            # Конкретная пара.
+            # ----------------------------------------------------
+            # КОНКРЕТНАЯ ПАРА
+            # ----------------------------------------------------
+
             if pair:
 
                 pair = str(
@@ -603,7 +722,10 @@ class SignalScheduler:
                     pair
                 )
 
-            # Любая пара.
+            # ----------------------------------------------------
+            # ЛЮБАЯ ПАРА
+            # ----------------------------------------------------
+
             print(
                 "[MANUAL] Проверяю все доступные пары"
             )
@@ -622,6 +744,7 @@ class SignalScheduler:
                 )
 
                 if signal is not None:
+
                     signals.append(
                         signal
                     )
@@ -654,6 +777,19 @@ class SignalScheduler:
         self,
         bot=None,
     ):
+        """
+        Один полный автоматический проход.
+
+        Анализируются все доступные пары.
+        Из них выбирается лучший сигнал.
+
+        Если сильного сигнала нет —
+        пользователям ничего не отправляется.
+
+        Если сигнал есть —
+        он сохраняется в БД и отправляется
+        APPROVED пользователям.
+        """
 
         if bot is not None:
             self.bot = bot
@@ -670,10 +806,12 @@ class SignalScheduler:
 
             print("")
             print("=" * 60)
+
             print(
                 "[SCAN] "
                 f"{self.now().strftime('%d.%m.%Y %H:%M:%S')} МСК"
             )
+
             print("=" * 60)
 
             pairs = await self.get_available_pairs()
@@ -702,6 +840,7 @@ class SignalScheduler:
                     )
 
                     if signal is not None:
+
                         signals.append(
                             signal
                         )
@@ -744,9 +883,17 @@ class SignalScheduler:
                 "[SCAN] ============================="
             )
 
+            # ----------------------------------------------------
+            # SAVE
+            # ----------------------------------------------------
+
             await self.save_signal(
                 best
             )
+
+            # ----------------------------------------------------
+            # SEND
+            # ----------------------------------------------------
 
             await self.send_to_users(
                 best
@@ -762,6 +909,12 @@ class SignalScheduler:
         self,
         signal: Signal,
     ):
+        """
+        Сохраняет сигнал в БД.
+
+        Поддерживает новую и старую сигнатуру
+        db.save_signal().
+        """
 
         method = getattr(
             db,
@@ -817,6 +970,10 @@ class SignalScheduler:
                 ),
             }
 
+            # ----------------------------------------------------
+            # CONFIRMATIONS
+            # ----------------------------------------------------
+
             if isinstance(
                 data["confirmations"],
                 (list, tuple),
@@ -828,6 +985,10 @@ class SignalScheduler:
                         data["confirmations"],
                     )
                 )
+
+            # ----------------------------------------------------
+            # REASONS
+            # ----------------------------------------------------
 
             if isinstance(
                 data["reasons"],
@@ -841,7 +1002,10 @@ class SignalScheduler:
                     )
                 )
 
-            # datetime -> ISO.
+            # ----------------------------------------------------
+            # DATETIME
+            # ----------------------------------------------------
+
             for key in (
                 "entry_time",
                 "expiry_time",
@@ -856,6 +1020,10 @@ class SignalScheduler:
 
                     data[key] = value.isoformat()
 
+            # ----------------------------------------------------
+            # NEW DATABASE API
+            # ----------------------------------------------------
+
             try:
 
                 result = method(
@@ -865,11 +1033,15 @@ class SignalScheduler:
                 if asyncio.iscoroutine(
                     result
                 ):
+
                     await result
 
             except TypeError:
 
-                # Совместимость со старой БД.
+                # ------------------------------------------------
+                # OLD DATABASE API
+                # ------------------------------------------------
+
                 try:
 
                     result = method(
@@ -879,6 +1051,7 @@ class SignalScheduler:
                     if asyncio.iscoroutine(
                         result
                     ):
+
                         await result
 
                 except Exception as exc:
@@ -902,6 +1075,13 @@ class SignalScheduler:
         self,
         signal: Signal,
     ):
+        """
+        Отправляет сигнал всем одобренным пользователям.
+
+        Важно:
+        автоматически отправляются только пользователям,
+        которых возвращает db.get_approved_users().
+        """
 
         if self.bot is None:
             return
@@ -985,6 +1165,25 @@ class SignalScheduler:
         self,
         signal: Signal,
     ) -> str:
+        """
+        Формат Telegram-сообщения сигнала.
+
+        Пример:
+
+        🔴 PUT ↓
+
+        💱 USD/JPY
+
+        ⏰ ВХОД: 00:00 МСК
+        🎯 ЭКСПИРАЦИЯ: 00:05 МСК
+
+        📊 QUALITY: 90/100
+        📈 ШАНС: 87%
+
+        ✅ EMA тренд вниз
+        ✅ Импульс вниз
+        ✅ MACD подтверждает PUT
+        """
 
         pair = self.get_value(
             signal,
@@ -1032,6 +1231,10 @@ class SignalScheduler:
             direction
         ).upper()
 
+        # ========================================================
+        # DIRECTION
+        # ========================================================
+
         if direction in {
             "CALL",
             "UP",
@@ -1045,9 +1248,9 @@ class SignalScheduler:
             emoji = "🔴"
             direction_text = "PUT ↓"
 
-        # --------------------------------------------------------
-        # TIME
-        # --------------------------------------------------------
+        # ========================================================
+        # ENTRY TIME
+        # ========================================================
 
         if isinstance(
             entry_time,
@@ -1069,6 +1272,10 @@ class SignalScheduler:
                 else "—"
             )
 
+        # ========================================================
+        # EXPIRY TIME
+        # ========================================================
+
         if isinstance(
             expiry_time,
             datetime,
@@ -1089,9 +1296,9 @@ class SignalScheduler:
                 else "—"
             )
 
-        # --------------------------------------------------------
-        # NUMBERS
-        # --------------------------------------------------------
+        # ========================================================
+        # QUALITY
+        # ========================================================
 
         try:
 
@@ -1105,6 +1312,10 @@ class SignalScheduler:
                 quality
             )
 
+        # ========================================================
+        # PROBABILITY
+        # ========================================================
+
         try:
 
             probability_text = (
@@ -1117,43 +1328,108 @@ class SignalScheduler:
                 f"{probability}%"
             )
 
-        # --------------------------------------------------------
+        # ========================================================
         # CONFIRMATIONS
-        # --------------------------------------------------------
+        # ========================================================
+
+        confirmation_lines = []
 
         if isinstance(
             confirmations,
             (list, tuple),
         ):
 
-            confirmations_text = ", ".join(
-                str(x)
-                for x in confirmations
-            )
+            for confirmation in confirmations:
 
-        else:
+                confirmation = str(
+                    confirmation
+                ).strip()
 
-            confirmations_text = str(
-                confirmations or ""
-            )
+                if not confirmation:
+                    continue
+
+                # Если движок уже добавил emoji,
+                # не добавляем второй.
+                if confirmation.startswith("✅"):
+
+                    confirmation_lines.append(
+                        confirmation
+                    )
+
+                else:
+
+                    confirmation_lines.append(
+                        f"✅ {confirmation}"
+                    )
+
+        elif confirmations:
+
+            confirmation = str(
+                confirmations
+            ).strip()
+
+            if confirmation:
+
+                # Поддержка старого формата,
+                # когда подтверждения могли приходить
+                # одной строкой через запятую.
+                if "," in confirmation:
+
+                    for item in confirmation.split(","):
+
+                        item = item.strip()
+
+                        if not item:
+                            continue
+
+                        if item.startswith("✅"):
+
+                            confirmation_lines.append(
+                                item
+                            )
+
+                        else:
+
+                            confirmation_lines.append(
+                                f"✅ {item}"
+                            )
+
+                else:
+
+                    if confirmation.startswith("✅"):
+
+                        confirmation_lines.append(
+                            confirmation
+                        )
+
+                    else:
+
+                        confirmation_lines.append(
+                            f"✅ {confirmation}"
+                        )
+
+        # ========================================================
+        # MESSAGE
+        # ========================================================
 
         lines = [
             f"{emoji} {direction_text}",
             "",
             f"💱 {pair}",
+            "",
             f"⏰ ВХОД: {entry_text}",
             f"🎯 ЭКСПИРАЦИЯ: {expiry_text}",
+            "",
             f"📊 QUALITY: {quality_text}/100",
             f"📈 ШАНС: {probability_text}",
         ]
 
-        if confirmations_text:
+        if confirmation_lines:
 
             lines.extend(
                 [
                     "",
-                    "✅ Подтверждения:",
-                    confirmations_text,
+                    *confirmation_lines,
                 ]
             )
 
@@ -1169,6 +1445,20 @@ class SignalScheduler:
         self,
         bot=None,
     ):
+        """
+        Основной автоматический цикл.
+
+        Сигналы проверяются каждые 5 минут:
+
+        00:00
+        00:05
+        00:10
+        00:15
+        ...
+
+        Если сильного сигнала нет,
+        ничего пользователям не отправляется.
+        """
 
         if bot is not None:
             self.bot = bot
@@ -1209,9 +1499,16 @@ class SignalScheduler:
                 if not self.running:
                     break
 
+                # ------------------------------------------------
+                # АВТОМАТИЧЕСКИЙ СКАН
+                # ------------------------------------------------
+
                 await self.scan_once()
 
-                # Защита от повторного запуска.
+                # ------------------------------------------------
+                # Защита от мгновенного повторного запуска.
+                # ------------------------------------------------
+
                 await asyncio.sleep(2)
 
             except asyncio.CancelledError:
@@ -1245,10 +1542,8 @@ class SignalScheduler:
     # ============================================================
 
     def stop(self):
+        """
+        Останавливает автоматический цикл.
+        """
 
         self.running = False
-
-
-# Глобальный экземпляр для совместимости
-# с другими файлами проекта.
-scheduler_instance = SignalScheduler()
