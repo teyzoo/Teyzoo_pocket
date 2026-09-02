@@ -10,6 +10,7 @@ from config import (
     MIN_PROBABILITY,
     TIMEZONE,
 )
+
 from database import db
 from market import market_client
 from signal_engine import Signal, SignalEngine
@@ -19,18 +20,47 @@ class SignalScheduler:
     """
     Автоматический и ручной поиск сигналов.
 
+    Совместим с текущим main.py:
+
+        scheduler = SignalScheduler(bot)
+
+    и:
+
+        scheduler.run()
+
     Список пар получается динамически.
     """
 
-    def __init__(self):
+    def __init__(self, bot=None):
+        # Бот сохраняем внутри scheduler.
+        # Это нужно потому, что main.py запускает:
+        #
+        # scheduler.run()
+        #
+        # без передачи bot.
+
+        self.bot = bot
+
         self.engine = SignalEngine(
             min_probability=MIN_PROBABILITY,
         )
 
         self._running = False
+
         self._lock = asyncio.Lock()
 
         self._available_pairs: list[str] = []
+
+    # ============================================================
+    # BOT
+    # ============================================================
+
+    def set_bot(self, bot) -> None:
+        """
+        Позволяет установить/обновить Telegram Bot.
+        """
+
+        self.bot = bot
 
     # ============================================================
     # TIME
@@ -60,7 +90,9 @@ class SignalScheduler:
 
         print("")
         print("=" * 70)
-        print("🌐 REFRESHING AVAILABLE POCKET OPTION PAIRS")
+        print(
+            "🌐 REFRESHING AVAILABLE POCKET OPTION PAIRS"
+        )
         print("=" * 70)
 
         try:
@@ -69,28 +101,38 @@ class SignalScheduler:
             )
 
         except Exception as exc:
+
             print(
                 "❌ Ошибка получения списка пар:"
             )
+
             print(
                 f"   {type(exc).__name__}: {exc}"
             )
+
             traceback.print_exc()
 
             return self._available_pairs.copy()
 
         if pairs:
+
             self._available_pairs = list(
-                dict.fromkeys(pairs)
+                dict.fromkeys(
+                    pair.upper().strip()
+                    for pair in pairs
+                    if pair
+                )
             )
 
         print("")
+
         print(
             f"📋 AVAILABLE PAIRS: "
             f"{len(self._available_pairs)}"
         )
 
         if self._available_pairs:
+
             print(
                 "   "
                 + ", ".join(
@@ -103,7 +145,7 @@ class SignalScheduler:
         return self._available_pairs.copy()
 
     # ============================================================
-    # ANALYZE ONE
+    # ANALYZE ONE PAIR
     # ============================================================
 
     async def _analyze_pair(
@@ -112,11 +154,13 @@ class SignalScheduler:
     ) -> Optional[Signal]:
 
         print("")
+
         print(
             f"🔍 Проверка пары: {pair}"
         )
 
         try:
+
             candles = await (
                 market_client.get_candles(
                     pair
@@ -124,10 +168,12 @@ class SignalScheduler:
             )
 
         except Exception as exc:
+
             print(
                 f"❌ {pair}: "
-                f"ошибка получения свечей"
+                "ошибка получения свечей"
             )
+
             print(
                 f"   {type(exc).__name__}: "
                 f"{exc}"
@@ -136,6 +182,7 @@ class SignalScheduler:
             return None
 
         if candles is None:
+
             print(
                 f"⚪ {pair}: "
                 "нет доступных свечей"
@@ -149,12 +196,14 @@ class SignalScheduler:
         )
 
         try:
+
             signal = self.engine.analyze(
                 pair=pair,
                 candles=candles,
             )
 
         except Exception as exc:
+
             print(
                 f"💥 {pair}: "
                 "SignalEngine exception"
@@ -170,6 +219,7 @@ class SignalScheduler:
             return None
 
         if signal is None:
+
             print(
                 f"⚪ {pair}: "
                 "NO VALID SIGNAL"
@@ -197,21 +247,24 @@ class SignalScheduler:
 
         async with self._lock:
 
-            # ----------------------------------------------------
+            # ====================================================
             # SPECIFIC PAIR
-            # ----------------------------------------------------
+            # ====================================================
 
             if pair is not None:
 
                 pair = pair.strip().upper()
 
                 print("")
+
                 print(
                     "#" * 70
                 )
+
                 print(
                     f"🎯 MANUAL ANALYSIS: {pair}"
                 )
+
                 print(
                     "#" * 70
                 )
@@ -223,6 +276,7 @@ class SignalScheduler:
                 )
 
                 if signal is None:
+
                     print(
                         f"⚪ {pair}: "
                         "сильного сигнала нет."
@@ -230,15 +284,16 @@ class SignalScheduler:
 
                 return signal
 
-            # ----------------------------------------------------
-            # DYNAMIC PAIR DISCOVERY
-            # ----------------------------------------------------
+            # ====================================================
+            # ALL AVAILABLE PAIRS
+            # ====================================================
 
             pairs = await (
                 self.refresh_pairs()
             )
 
             if not pairs:
+
                 print(
                     "❌ Нет доступных пар."
                 )
@@ -246,35 +301,40 @@ class SignalScheduler:
                 return None
 
             print("")
+
             print(
                 "#" * 70
             )
+
             print(
                 "🔀 ANALYZING ALL AVAILABLE PAIRS"
             )
+
             print(
                 f"📋 Количество: {len(pairs)}"
             )
+
             print(
                 f"📈 Minimum chance: "
                 f"{MIN_PROBABILITY}%"
             )
+
             print(
                 "#" * 70
             )
 
-            # ----------------------------------------------------
+            # ====================================================
             # CONCURRENT ANALYSIS
-            # ----------------------------------------------------
+            # ====================================================
 
-            semaphore = asyncio.Semaphore(
-                5
-            )
+            semaphore = asyncio.Semaphore(5)
 
             async def analyze_limited(
                 current_pair: str,
             ):
+
                 async with semaphore:
+
                     return await (
                         self._analyze_pair(
                             current_pair
@@ -294,12 +354,15 @@ class SignalScheduler:
             valid_signals: list[Signal] = []
 
             print("")
+
             print(
                 "-" * 70
             )
+
             print(
                 "📋 FINAL ANALYSIS SUMMARY"
             )
+
             print(
                 "-" * 70
             )
@@ -313,6 +376,7 @@ class SignalScheduler:
                     result,
                     Exception,
                 ):
+
                     print(
                         f"💥 {current_pair}: "
                         f"{type(result).__name__}: "
@@ -322,6 +386,7 @@ class SignalScheduler:
                     continue
 
                 if result is None:
+
                     print(
                         f"⚪ {current_pair}: "
                         "NO SIGNAL"
@@ -344,9 +409,9 @@ class SignalScheduler:
                 "-" * 70
             )
 
-            # ----------------------------------------------------
-            # NOTHING
-            # ----------------------------------------------------
+            # ====================================================
+            # NO SIGNAL
+            # ====================================================
 
             if not valid_signals:
 
@@ -366,9 +431,9 @@ class SignalScheduler:
 
                 return None
 
-            # ----------------------------------------------------
-            # BEST
-            # ----------------------------------------------------
+            # ====================================================
+            # BEST SIGNAL
+            # ====================================================
 
             best_signal = max(
                 valid_signals,
@@ -382,6 +447,7 @@ class SignalScheduler:
             )
 
             print("")
+
             print(
                 "🏆 BEST AVAILABLE SIGNAL"
             )
@@ -416,7 +482,7 @@ class SignalScheduler:
             return best_signal
 
     # ============================================================
-    # FORMAT
+    # FORMAT SIGNAL
     # ============================================================
 
     def format_signal(
@@ -425,10 +491,13 @@ class SignalScheduler:
     ) -> str:
 
         if signal.direction == "CALL":
+
             direction_text = (
                 "🟢 CALL ↑"
             )
+
         else:
+
             direction_text = (
                 "🔴 PUT ↓"
             )
@@ -477,6 +546,7 @@ class SignalScheduler:
             for confirmation in (
                 signal.confirmations
             ):
+
                 lines.append(
                     f"• {confirmation}"
                 )
@@ -484,7 +554,7 @@ class SignalScheduler:
         return "\n".join(lines)
 
     # ============================================================
-    # SAVE
+    # SAVE SIGNAL
     # ============================================================
 
     def save_signal(
@@ -501,6 +571,7 @@ class SignalScheduler:
             direction=signal.direction,
             entry_time=entry_time,
         ):
+
             print(
                 f"⚠️ Дубликат сигнала: "
                 f"{signal.pair} "
@@ -536,7 +607,7 @@ class SignalScheduler:
         return signal_id
 
     # ============================================================
-    # SEND
+    # SEND SIGNAL
     # ============================================================
 
     async def send_signal_to_users(
@@ -545,9 +616,18 @@ class SignalScheduler:
         signal: Signal,
     ) -> int:
 
+        if bot is None:
+
+            print(
+                "⚠️ Telegram Bot не передан."
+            )
+
+            return 0
+
         users = db.get_approved_users()
 
         if not users:
+
             print(
                 "ℹ️ APPROVED пользователей нет."
             )
@@ -570,6 +650,7 @@ class SignalScheduler:
                 continue
 
             try:
+
                 await bot.send_message(
                     chat_id=int(user_id),
                     text=message,
@@ -578,6 +659,7 @@ class SignalScheduler:
                 sent += 1
 
             except Exception as exc:
+
                 print(
                     f"❌ Ошибка отправки "
                     f"{user_id}: "
@@ -601,13 +683,22 @@ class SignalScheduler:
         bot=None,
     ) -> Optional[Signal]:
 
+        # Если bot передали непосредственно в scan_once,
+        # сохраняем его.
+
+        if bot is not None:
+            self.bot = bot
+
         print("")
+
         print(
             "=" * 70
         )
+
         print(
             "🤖 AUTO SCAN"
         )
+
         print(
             "=" * 70
         )
@@ -633,12 +724,21 @@ class SignalScheduler:
             signal
         )
 
-        if bot is not None:
+        # Используем сохранённый bot.
+        if self.bot is not None:
+
             await (
                 self.send_signal_to_users(
-                    bot,
+                    self.bot,
                     signal,
                 )
+            )
+
+        else:
+
+            print(
+                "⚠️ Bot отсутствует — "
+                "сигнал не отправлен."
             )
 
         print(
@@ -652,7 +752,7 @@ class SignalScheduler:
         return signal
 
     # ============================================================
-    # MANUAL
+    # MANUAL SIGNAL
     # ============================================================
 
     async def get_manual_signal(
@@ -661,6 +761,7 @@ class SignalScheduler:
     ) -> Optional[Signal]:
 
         print("")
+
         print(
             "🎯 MANUAL SIGNAL REQUEST"
         )
@@ -672,6 +773,7 @@ class SignalScheduler:
         )
 
         if signal is not None:
+
             self.save_signal(
                 signal
             )
@@ -679,7 +781,7 @@ class SignalScheduler:
         return signal
 
     # ============================================================
-    # LOOP
+    # MAIN LOOP
     # ============================================================
 
     async def run(
@@ -687,7 +789,21 @@ class SignalScheduler:
         bot=None,
     ) -> None:
 
+        # Если run получил bot — сохраняем его.
+        #
+        # В текущем main.py bot не передаётся:
+        #
+        #     scheduler.run()
+        #
+        # поэтому используется bot из:
+        #
+        #     SignalScheduler(bot)
+
+        if bot is not None:
+            self.bot = bot
+
         if self._running:
+
             print(
                 "⚠️ Scheduler уже работает."
             )
@@ -697,20 +813,30 @@ class SignalScheduler:
         self._running = True
 
         print("")
+
         print(
             "=" * 70
         )
+
         print(
             "🚀 SIGNAL SCHEDULER STARTED"
         )
+
         print(
             f"📈 Minimum probability: "
             f"{self.engine.min_probability}%"
         )
+
         print(
             f"📊 Minimum quality: "
             f"{self.engine.min_quality}"
         )
+
+        print(
+            f"🤖 Telegram bot: "
+            f"{'CONNECTED' if self.bot else 'NOT SET'}"
+        )
+
         print(
             "=" * 70
         )
@@ -727,11 +853,10 @@ class SignalScheduler:
 
                 try:
 
-                    await self.scan_once(
-                        bot=bot
-                    )
+                    await self.scan_once()
 
                 except asyncio.CancelledError:
+
                     raise
 
                 except Exception as exc:
@@ -778,6 +903,7 @@ class SignalScheduler:
             raise
 
         finally:
+
             self._running = False
 
 
