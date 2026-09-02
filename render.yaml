@@ -5,9 +5,12 @@ services:
 
     buildCommand: pip install -r requirements.txt
 
-    startCommand: python main.py
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
 
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+
       - key: BOT_TOKEN
         sync: false
 
@@ -20,17 +23,11 @@ services:
       - key: MIN_QUALITY
         value: "85"
 
-      - key: MIN_CANDLES
-        value: "100"
+      - key: AUTO_SCAN_SECONDS
+        value: "60"
 
-      - key: TIMEFRAME
+      - key: CANDLE_INTERVAL
         value: "5min"
 
-      - key: ENTRY_STEP_MINUTES
-        value: "5"
-
-      - key: EXPIRY_MINUTES
-        value: "5"
-
-      - key: AUTO_SIGNALS_ENABLED
-        value: "true"
+      - key: CANDLE_LIMIT
+        value: "200"
