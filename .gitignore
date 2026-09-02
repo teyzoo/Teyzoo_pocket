@@ -7,3 +7,4 @@ __pycache__/
 .pytest_cache/
 .idea/
 .vscode/
+signal_bot.db
