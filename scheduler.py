@@ -11,6 +11,7 @@ from config import (
 )
 
 from database import db
+
 from market import (
     market_client,
     OTC_PAIRS,
@@ -34,7 +35,7 @@ MIN_CANDLES_FOR_ANALYSIS = 50
 
 
 # ============================================================
-# MOSCOW TIME
+# TIMEZONE
 # ============================================================
 
 try:
@@ -49,30 +50,12 @@ except Exception:
 
 
 class SignalScheduler:
-    """
-    Планировщик сигналов.
-
-    Поддерживает:
-
-    - автоматический анализ;
-    - ручной запрос;
-    - конкретную пару;
-    - любую обычную пару;
-    - любую OTC пару;
-    - все пары;
-    - QUALITY filter;
-    - PROBABILITY filter;
-    - выбор лучшего сигнала;
-    - сохранение в БД;
-    - отправку APPROVED пользователям;
-    - московское время;
-    - защиту от параллельных сканов.
-    """
 
     def __init__(
         self,
         bot=None,
     ):
+
         self.bot = bot
 
         self.engine = SignalEngine()
@@ -136,18 +119,26 @@ class SignalScheduler:
         )
 
         remainder = (
-            current.minute % interval
+            current.minute
+            % interval
         )
 
         if remainder == 0:
 
-            return current + timedelta(
-                minutes=interval
+            return (
+                current
+                + timedelta(
+                    minutes=interval
+                )
             )
 
-        return current + timedelta(
-            minutes=(
-                interval - remainder
+        return (
+            current
+            + timedelta(
+                minutes=(
+                    interval
+                    - remainder
+                )
             )
         )
 
@@ -163,17 +154,17 @@ class SignalScheduler:
         if not pair:
             return False
 
-        normalized = (
+        value = (
             str(pair)
             .strip()
-            .upper()
+            .lower()
         )
 
         return (
-            normalized.endswith("_OTC")
-            or normalized.endswith("-OTC")
-            or normalized.endswith(" OTC")
-            or normalized.endswith("OTC")
+            value.endswith("_otc")
+            or value.endswith("-otc")
+            or value.endswith(" otc")
+            or value.endswith("otc")
         )
 
     @staticmethod
@@ -196,42 +187,43 @@ class SignalScheduler:
         if not pair:
             return "UNKNOWN"
 
-        raw = str(
-            pair
-        ).strip().upper()
+        raw = (
+            str(pair)
+            .strip()
+            .upper()
+        )
 
-        is_otc = (
+        otc = (
             SignalScheduler.is_otc_pair(
                 raw
             )
         )
 
-        cleaned = (
-            raw
-            .replace(
-                "-OTC",
-                "",
-            )
-            .replace(
-                "_OTC",
-                "",
-            )
-            .replace(
-                " OTC",
-                "",
-            )
-            .replace(
-                "OTC",
-                "",
-            )
-            .strip()
-        )
+        cleaned = raw
 
-        if "/" in cleaned:
+        for suffix in (
+            "_OTC",
+            "-OTC",
+            " OTC",
+            "OTC",
+        ):
 
-            result = cleaned
+            if cleaned.endswith(
+                suffix
+            ):
 
-        elif len(cleaned) == 6:
+                cleaned = cleaned[
+                    :-len(suffix)
+                ]
+
+                break
+
+        cleaned = cleaned.strip()
+
+        if (
+            len(cleaned) == 6
+            and cleaned.isalpha()
+        ):
 
             result = (
                 cleaned[:3]
@@ -243,7 +235,7 @@ class SignalScheduler:
 
             result = cleaned
 
-        if is_otc:
+        if otc:
             result += " OTC"
 
         return result
@@ -255,19 +247,12 @@ class SignalScheduler:
     async def get_available_pairs(
         self,
     ) -> list[str]:
-        """
-        Получает реальные доступные активы.
 
-        Критически важно:
+        result: list[str] = []
 
-        OTC fallback добавляется независимо
-        от HTML asset discovery.
-
-        Поэтому отсутствие OTC в HTML
-        больше не убирает OTC из сканирования.
-        """
-
-        dynamic: list[str] = []
+        # --------------------------------------------------------
+        # MARKET CLIENT
+        # --------------------------------------------------------
 
         try:
 
@@ -279,19 +264,16 @@ class SignalScheduler:
 
             if callable(method):
 
-                result = method()
+                pairs = method()
 
                 if asyncio.iscoroutine(
-                    result
+                    pairs
                 ):
-                    result = await result
+                    pairs = await pairs
 
-                if result:
+                if pairs:
 
-                    for pair in result:
-
-                        if not pair:
-                            continue
+                    for pair in pairs:
 
                         normalized = (
                             self.normalize_pair(
@@ -306,59 +288,32 @@ class SignalScheduler:
                             self.is_otc_pair(
                                 normalized
                             )
+                            and not ENABLE_OTC
                         ):
+                            continue
 
-                            if not ENABLE_OTC:
-                                continue
-
-                            normalized = (
+                        if normalized not in result:
+                            result.append(
                                 normalized
-                                .replace(
-                                    "-OTC",
-                                    "_otc",
-                                )
-                                .replace(
-                                    " OTC",
-                                    "_otc",
-                                )
                             )
-
-                            if normalized not in dynamic:
-                                dynamic.append(
-                                    normalized
-                                )
-
-                        else:
-
-                            if (
-                                "/" not in normalized
-                                and len(normalized) < 6
-                            ):
-                                continue
-
-                            if normalized not in dynamic:
-                                dynamic.append(
-                                    normalized
-                                )
 
         except Exception as exc:
 
             print(
-                "[PAIRS] Ошибка получения "
-                f"доступных активов: {exc}"
+                "[PAIRS] Ошибка: "
+                f"{exc}"
             )
 
-        # ========================================================
-        # ADD CONFIG PAIRS
-        # ========================================================
+        # --------------------------------------------------------
+        # NORMAL FALLBACK
+        # --------------------------------------------------------
 
         for pair in PAIRS:
 
-            if not pair:
-                continue
-
-            normalized = self.normalize_pair(
-                pair
+            normalized = (
+                self.normalize_pair(
+                    pair
+                )
             )
 
             if not normalized:
@@ -369,27 +324,23 @@ class SignalScheduler:
             ):
                 continue
 
-            if (
-                "/" not in normalized
-                and len(normalized) < 6
-            ):
-                continue
-
-            if normalized not in dynamic:
-                dynamic.append(
+            if normalized not in result:
+                result.append(
                     normalized
                 )
 
-        # ========================================================
-        # ADD OTC FALLBACK
-        # ========================================================
+        # --------------------------------------------------------
+        # OTC FALLBACK
+        # --------------------------------------------------------
 
         if ENABLE_OTC:
 
             for pair in OTC_PAIRS:
 
-                normalized = self.normalize_pair(
-                    pair
+                normalized = (
+                    self.normalize_pair(
+                        pair
+                    )
                 )
 
                 if not normalized:
@@ -400,47 +351,29 @@ class SignalScheduler:
                 ):
                     continue
 
-                normalized = (
-                    normalized
-                    .replace(
-                        "-OTC",
-                        "_otc",
-                    )
-                    .replace(
-                        " OTC",
-                        "_otc",
-                    )
-                )
-
-                if normalized not in dynamic:
-                    dynamic.append(
+                if normalized not in result:
+                    result.append(
                         normalized
                     )
 
-        # ========================================================
-        # FINAL FILTER
-        # ========================================================
+        # --------------------------------------------------------
+        # FINAL
+        # --------------------------------------------------------
 
-        result: list[str] = []
-
-        for pair in dynamic:
-
-            if self.is_otc_pair(pair):
-
-                if not ENABLE_OTC:
-                    continue
-
-            if pair not in result:
-                result.append(pair)
+        regular_count = sum(
+            1
+            for pair in result
+            if not self.is_otc_pair(
+                pair
+            )
+        )
 
         otc_count = sum(
             1
             for pair in result
-            if self.is_otc_pair(pair)
-        )
-
-        regular_count = (
-            len(result) - otc_count
+            if self.is_otc_pair(
+                pair
+            )
         )
 
         print(
@@ -461,19 +394,23 @@ class SignalScheduler:
         return result
 
     # ============================================================
-    # FILTER PAIRS BY TYPE
+    # TYPE FILTERS
     # ============================================================
 
     async def get_regular_pairs(
         self,
     ) -> list[str]:
 
-        pairs = await self.get_available_pairs()
+        pairs = (
+            await self.get_available_pairs()
+        )
 
         return [
             pair
             for pair in pairs
-            if not self.is_otc_pair(pair)
+            if not self.is_otc_pair(
+                pair
+            )
         ]
 
     async def get_otc_pairs(
@@ -483,16 +420,20 @@ class SignalScheduler:
         if not ENABLE_OTC:
             return []
 
-        pairs = await self.get_available_pairs()
+        pairs = (
+            await self.get_available_pairs()
+        )
 
         return [
             pair
             for pair in pairs
-            if self.is_otc_pair(pair)
+            if self.is_otc_pair(
+                pair
+            )
         ]
 
     # ============================================================
-    # MARKET
+    # CANDLES
     # ============================================================
 
     async def get_candles(
@@ -500,21 +441,56 @@ class SignalScheduler:
         pair: str,
     ):
 
+        if not pair:
+            return None
+
         pair = self.normalize_pair(
             pair
         )
 
-        if not pair:
-            return None
+        # --------------------------------------------------------
+        # Main method
+        # --------------------------------------------------------
 
-        method_names = (
+        method = getattr(
+            market_client,
             "get_candles",
+            None,
+        )
+
+        if callable(method):
+
+            try:
+
+                result = method(
+                    pair
+                )
+
+                if asyncio.iscoroutine(
+                    result
+                ):
+                    result = await result
+
+                if result is not None:
+                    return result
+
+            except Exception as exc:
+
+                print(
+                    f"[MARKET] "
+                    f"{self.display_pair(pair)}: "
+                    f"{exc}"
+                )
+
+        # --------------------------------------------------------
+        # Compatibility
+        # --------------------------------------------------------
+
+        for method_name in (
             "fetch_candles",
             "get_history",
             "get_data",
-        )
-
-        for method_name in method_names:
+        ):
 
             method = getattr(
                 market_client,
@@ -539,50 +515,19 @@ class SignalScheduler:
                 if result is not None:
                     return result
 
-            except TypeError:
-
-                try:
-
-                    result = method(
-                        symbol=pair
-                    )
-
-                    if asyncio.iscoroutine(
-                        result
-                    ):
-                        result = await result
-
-                    if result is not None:
-                        return result
-
-                except Exception as exc:
-
-                    print(
-                        f"[MARKET] "
-                        f"{self.display_pair(pair)}: "
-                        f"{method_name}: "
-                        f"{exc}"
-                    )
-
             except Exception as exc:
 
                 print(
                     f"[MARKET] "
-                    f"{self.display_pair(pair)}: "
+                    f"{self.display_pair(pair)} "
                     f"{method_name}: "
                     f"{exc}"
                 )
 
-        print(
-            f"[MARKET] "
-            f"{self.display_pair(pair)}: "
-            "свечи не получены"
-        )
-
         return None
 
     # ============================================================
-    # ENGINE
+    # ANALYZE
     # ============================================================
 
     async def analyze_pair(
@@ -594,7 +539,7 @@ class SignalScheduler:
             pair
         )
 
-        display_name = self.display_pair(
+        display = self.display_pair(
             pair
         )
 
@@ -602,7 +547,7 @@ class SignalScheduler:
 
             print(
                 "[ANALYZE] "
-                f"{display_name}"
+                f"{display}"
             )
 
             candles = await self.get_candles(
@@ -612,8 +557,7 @@ class SignalScheduler:
             if candles is None:
 
                 print(
-                    f"[REJECT] "
-                    f"{display_name}: "
+                    f"[REJECT] {display}: "
                     "нет свечей"
                 )
 
@@ -632,8 +576,7 @@ class SignalScheduler:
             ):
 
                 print(
-                    f"[REJECT] "
-                    f"{display_name}: "
+                    f"[REJECT] {display}: "
                     f"мало свечей "
                     f"{candle_count}/"
                     f"{MIN_CANDLES_FOR_ANALYSIS}"
@@ -644,89 +587,21 @@ class SignalScheduler:
             signal = None
 
             # ====================================================
-            # ENGINE API
+            # ENGINE
             # ====================================================
 
-            for method_name in (
+            method = getattr(
+                self.engine,
                 "analyze",
-                "generate_signal",
-                "get_signal",
-            ):
+                None,
+            )
 
-                method = getattr(
-                    self.engine,
-                    method_name,
-                    None,
-                )
-
-                if not callable(method):
-                    continue
+            if callable(method):
 
                 # ------------------------------------------------
-                # candles + pair
-                # ------------------------------------------------
-
-                try:
-
-                    signal = method(
-                        candles
-                    )
-
-                    if asyncio.iscoroutine(
-                        signal
-                    ):
-                        signal = await signal
-
-                    if signal is not None:
-                        break
-
-                except TypeError:
-                    pass
-
-                except Exception as exc:
-
-                    print(
-                        f"[ENGINE] "
-                        f"{display_name}: "
-                        f"{exc}"
-                    )
-
-                    return None
-
-                # ------------------------------------------------
-                # pair + candles
-                # ------------------------------------------------
-
-                try:
-
-                    signal = method(
-                        pair,
-                        candles,
-                    )
-
-                    if asyncio.iscoroutine(
-                        signal
-                    ):
-                        signal = await signal
-
-                    if signal is not None:
-                        break
-
-                except TypeError:
-                    pass
-
-                except Exception as exc:
-
-                    print(
-                        f"[ENGINE] "
-                        f"{display_name}: "
-                        f"{exc}"
-                    )
-
-                    return None
-
-                # ------------------------------------------------
-                # candles + pair
+                # Current engine format:
+                #
+                # analyze(candles, pair)
                 # ------------------------------------------------
 
                 try:
@@ -741,29 +616,118 @@ class SignalScheduler:
                     ):
                         signal = await signal
 
-                    if signal is not None:
-                        break
-
                 except TypeError:
-                    continue
+
+                    signal = None
 
                 except Exception as exc:
 
                     print(
-                        f"[ENGINE] "
-                        f"{display_name}: "
+                        f"[ENGINE] {display}: "
                         f"{exc}"
                     )
 
                     return None
+
+                # ------------------------------------------------
+                # Compatibility:
+                # analyze(candles)
+                # ------------------------------------------------
+
+                if signal is None:
+
+                    try:
+
+                        signal = method(
+                            candles
+                        )
+
+                        if asyncio.iscoroutine(
+                            signal
+                        ):
+                            signal = await signal
+
+                    except TypeError:
+
+                        signal = None
+
+                    except Exception as exc:
+
+                        print(
+                            f"[ENGINE] "
+                            f"{display}: "
+                            f"{exc}"
+                        )
+
+                        return None
+
+            # ====================================================
+            # OTHER ENGINE METHODS
+            # ====================================================
+
+            if signal is None:
+
+                for method_name in (
+                    "generate_signal",
+                    "get_signal",
+                ):
+
+                    method = getattr(
+                        self.engine,
+                        method_name,
+                        None,
+                    )
+
+                    if not callable(method):
+                        continue
+
+                    try:
+
+                        signal = method(
+                            candles,
+                            pair,
+                        )
+
+                        if asyncio.iscoroutine(
+                            signal
+                        ):
+                            signal = await signal
+
+                    except TypeError:
+
+                        try:
+
+                            signal = method(
+                                candles
+                            )
+
+                            if asyncio.iscoroutine(
+                                signal
+                            ):
+                                signal = await signal
+
+                        except Exception:
+                            signal = None
+
+                    except Exception as exc:
+
+                        print(
+                            f"[ENGINE] "
+                            f"{display}: "
+                            f"{exc}"
+                        )
+
+                        signal = None
+
+                    if signal is not None:
+                        break
 
             if signal is None:
 
                 print(
-                    f"[REJECT] "
-                    f"{display_name}: "
-                    "SignalEngine не сформировал "
-                    "сигнал"
+                    f"[REJECT] {display}: "
+                    "SignalEngine "
+                    "не сформировал сигнал"
                 )
 
                 return None
@@ -779,10 +743,13 @@ class SignalScheduler:
             )
 
             try:
+
                 quality = float(
                     quality
                 )
+
             except Exception:
+
                 quality = 0.0
 
             # ====================================================
@@ -796,10 +763,13 @@ class SignalScheduler:
             )
 
             try:
+
                 probability = float(
                     probability
                 )
+
             except Exception:
+
                 probability = 0.0
 
             # ====================================================
@@ -816,13 +786,9 @@ class SignalScheduler:
                 direction
             ).upper()
 
-            # ====================================================
-            # LOG
-            # ====================================================
-
             print(
                 "[ANALYZE] "
-                f"{display_name}: "
+                f"{display}: "
                 f"Q={quality:.1f} "
                 f"P={probability:.1f}% "
                 f"D={direction}"
@@ -837,8 +803,7 @@ class SignalScheduler:
             ):
 
                 print(
-                    f"[REJECT] "
-                    f"{display_name}: "
+                    f"[REJECT] {display}: "
                     f"QUALITY "
                     f"{quality:.1f} < "
                     f"{MIN_QUALITY}"
@@ -855,8 +820,7 @@ class SignalScheduler:
             ):
 
                 print(
-                    f"[REJECT] "
-                    f"{display_name}: "
+                    f"[REJECT] {display}: "
                     f"PROBABILITY "
                     f"{probability:.1f}% < "
                     f"{MIN_PROBABILITY}%"
@@ -876,9 +840,8 @@ class SignalScheduler:
             }:
 
                 print(
-                    f"[REJECT] "
-                    f"{display_name}: "
-                    f"неверное направление "
+                    f"[REJECT] {display}: "
+                    "неверное направление "
                     f"{direction}"
                 )
 
@@ -889,8 +852,7 @@ class SignalScheduler:
         except Exception as exc:
 
             print(
-                f"[ANALYZE] "
-                f"{display_name}: "
+                f"[ANALYZE] {display}: "
                 f"ошибка {exc}"
             )
 
@@ -926,7 +888,7 @@ class SignalScheduler:
         )
 
     # ============================================================
-    # CHOOSE BEST
+    # BEST SIGNAL
     # ============================================================
 
     def choose_best(
@@ -999,7 +961,7 @@ class SignalScheduler:
         return valid[0][2]
 
     # ============================================================
-    # SCAN SELECTED PAIRS
+    # SCAN
     # ============================================================
 
     async def scan_pairs(
@@ -1016,8 +978,10 @@ class SignalScheduler:
 
             try:
 
-                signal = await self.analyze_pair(
-                    pair
+                signal = (
+                    await self.analyze_pair(
+                        pair
+                    )
                 )
 
                 if signal is not None:
@@ -1045,140 +1009,84 @@ class SignalScheduler:
         self,
         pair: str | None = None,
     ) -> Signal | None:
-        """
-        pair = конкретный актив:
-            анализируется только он.
-
-        pair = None:
-            анализируются ВСЕ доступные активы.
-        """
 
         async with self.scan_lock:
 
-            # ====================================================
-            # SPECIFIC
-            # ====================================================
+            # ----------------------------------------------------
+            # SPECIFIC PAIR
+            # ----------------------------------------------------
 
             if pair:
 
-                normalized = self.normalize_pair(
+                pair = self.normalize_pair(
                     pair
                 )
 
                 print(
                     "[MANUAL] Проверяю "
-                    f"{self.display_pair(normalized)}"
+                    f"{self.display_pair(pair)}"
                 )
 
                 return await self.analyze_pair(
-                    normalized
+                    pair
                 )
 
-            # ====================================================
+            # ----------------------------------------------------
             # ALL
-            # ====================================================
+            # ----------------------------------------------------
 
             print(
-                "[MANUAL] Проверяю "
-                "обычные + OTC пары"
+                "[MANUAL] "
+                "Проверяю обычные + OTC"
             )
 
-            pairs = await self.get_available_pairs()
+            pairs = (
+                await self.get_available_pairs()
+            )
 
             if not pairs:
 
-                print(
-                    "[MANUAL] "
-                    "Нет доступных пар"
-                )
-
                 return None
 
-            print(
-                "[MANUAL] Всего пар: "
-                f"{len(pairs)}"
-            )
-
-            best = await self.scan_pairs(
+            return await self.scan_pairs(
                 pairs
             )
 
-            if best is None:
-
-                print(
-                    "[MANUAL] "
-                    "Сильный сигнал "
-                    "не найден"
-                )
-
-                return None
-
-            print(
-                "[MANUAL] Лучший сигнал: "
-                f"{self.display_pair("
-                    self.get_value(
-                        best,
-                        "pair",
-                        "?",
-                    )
-                )}"
-            )
-
-            return best
-
     # ============================================================
-    # MANUAL TYPE
+    # SIGNAL BY TYPE
     # ============================================================
 
     async def get_manual_signal_by_type(
         self,
         signal_type: str,
     ) -> Signal | None:
-        """
-        signal_type:
-
-        regular
-        otc
-        all
-        """
 
         async with self.scan_lock:
 
-            signal_type = (
-                str(
-                    signal_type
-                )
-                .strip()
-                .lower()
-            )
+            signal_type = str(
+                signal_type
+            ).strip().lower()
 
             if signal_type == "regular":
 
-                pairs = await self.get_regular_pairs()
+                pairs = (
+                    await self.get_regular_pairs()
+                )
 
             elif signal_type == "otc":
 
-                pairs = await self.get_otc_pairs()
+                pairs = (
+                    await self.get_otc_pairs()
+                )
 
             else:
 
-                pairs = await self.get_available_pairs()
-
-            if not pairs:
-
-                print(
-                    "[MANUAL] "
-                    f"{signal_type}: "
-                    "нет пар"
+                pairs = (
+                    await self.get_available_pairs()
                 )
 
+            if not pairs:
                 return None
-
-            print(
-                "[MANUAL] "
-                f"{signal_type}: "
-                f"проверяю {len(pairs)} пар"
-            )
 
             return await self.scan_pairs(
                 pairs
@@ -1206,19 +1114,21 @@ class SignalScheduler:
 
         async with self.scan_lock:
 
+            now = self.now()
+
             print("")
             print("=" * 60)
 
             print(
                 "[SCAN] "
-                f"{self.now().strftime("
-                    '%d.%m.%Y %H:%M:%S'
-                )} МСК"
+                f"{now.strftime('%d.%m.%Y %H:%M:%S')} МСК"
             )
 
             print("=" * 60)
 
-            pairs = await self.get_available_pairs()
+            pairs = (
+                await self.get_available_pairs()
+            )
 
             if not pairs:
 
@@ -1229,20 +1139,20 @@ class SignalScheduler:
 
                 return None
 
+            regular_count = sum(
+                1
+                for pair in pairs
+                if not self.is_otc_pair(
+                    pair
+                )
+            )
+
             otc_count = sum(
                 1
                 for pair in pairs
-                if self.is_otc_pair(pair)
-            )
-
-            regular_count = (
-                len(pairs)
-                - otc_count
-            )
-
-            print(
-                "[SCAN] Проверяю "
-                f"{len(pairs)} пар"
+                if self.is_otc_pair(
+                    pair
+                )
             )
 
             print(
@@ -1270,11 +1180,6 @@ class SignalScheduler:
                 return None
 
             print(
-                "[SCAN] "
-                "============================="
-            )
-
-            print(
                 "[SCAN] НАЙДЕН СИГНАЛ"
             )
 
@@ -1284,22 +1189,9 @@ class SignalScheduler:
                 )
             )
 
-            print(
-                "[SCAN] "
-                "============================="
-            )
-
-            # ====================================================
-            # SAVE
-            # ====================================================
-
             await self.save_signal(
                 best
             )
-
-            # ====================================================
-            # SEND
-            # ====================================================
 
             await self.send_to_users(
                 best
@@ -1378,10 +1270,12 @@ class SignalScheduler:
                 ),
             ):
 
-                data["confirmations"] = ", ".join(
-                    map(
-                        str,
-                        data["confirmations"],
+                data["confirmations"] = (
+                    ", ".join(
+                        map(
+                            str,
+                            data["confirmations"],
+                        )
                     )
                 )
 
@@ -1393,10 +1287,12 @@ class SignalScheduler:
                 ),
             ):
 
-                data["reasons"] = ", ".join(
-                    map(
-                        str,
-                        data["reasons"],
+                data["reasons"] = (
+                    ", ".join(
+                        map(
+                            str,
+                            data["reasons"],
+                        )
                     )
                 )
 
@@ -1412,7 +1308,9 @@ class SignalScheduler:
                     datetime,
                 ):
 
-                    data[key] = value.isoformat()
+                    data[key] = (
+                        value.isoformat()
+                    )
 
             try:
 
@@ -1427,28 +1325,19 @@ class SignalScheduler:
 
             except TypeError:
 
-                try:
+                result = method(
+                    signal
+                )
 
-                    result = method(
-                        signal
-                    )
-
-                    if asyncio.iscoroutine(
-                        result
-                    ):
-                        await result
-
-                except Exception as exc:
-
-                    print(
-                        "[DB] Ошибка сохранения: "
-                        f"{exc}"
-                    )
+                if asyncio.iscoroutine(
+                    result
+                ):
+                    await result
 
         except Exception as exc:
 
             print(
-                "[DB] Ошибка: "
+                "[DB] Ошибка сохранения: "
                 f"{exc}"
             )
 
@@ -1483,12 +1372,6 @@ class SignalScheduler:
             return
 
         if not users:
-
-            print(
-                "[SEND] Нет одобренных "
-                "пользователей"
-            )
-
             return
 
         text = self.format_signal(
@@ -1533,8 +1416,8 @@ class SignalScheduler:
             except Exception as exc:
 
                 print(
-                    f"[SEND] Ошибка "
-                    f"{user}: {exc}"
+                    f"[SEND] Ошибка: "
+                    f"{exc}"
                 )
 
         print(
@@ -1543,7 +1426,7 @@ class SignalScheduler:
         )
 
     # ============================================================
-    # FORMAT SIGNAL
+    # FORMAT
     # ============================================================
 
     def format_signal(
@@ -1551,21 +1434,21 @@ class SignalScheduler:
         signal: Signal,
     ) -> str:
 
-        raw_pair = self.get_value(
-            signal,
-            "pair",
-            "UNKNOWN",
-        )
-
         pair = self.display_pair(
-            raw_pair
+            self.get_value(
+                signal,
+                "pair",
+                "UNKNOWN",
+            )
         )
 
-        direction = self.get_value(
-            signal,
-            "direction",
-            "",
-        )
+        direction = str(
+            self.get_value(
+                signal,
+                "direction",
+                "",
+            )
+        ).upper()
 
         quality = self.get_value(
             signal,
@@ -1597,13 +1480,9 @@ class SignalScheduler:
             [],
         )
 
-        direction = str(
-            direction
-        ).upper()
-
-        # ========================================================
+        # --------------------------------------------------------
         # DIRECTION
-        # ========================================================
+        # --------------------------------------------------------
 
         if direction in {
             "CALL",
@@ -1618,9 +1497,9 @@ class SignalScheduler:
             emoji = "🔴"
             direction_text = "PUT ↓"
 
-        # ========================================================
-        # TIME FORMATTER
-        # ========================================================
+        # --------------------------------------------------------
+        # TIME
+        # --------------------------------------------------------
 
         def format_time(
             value,
@@ -1631,9 +1510,7 @@ class SignalScheduler:
                 datetime,
             ):
 
-                if (
-                    value.tzinfo is None
-                ):
+                if value.tzinfo is None:
 
                     if MOSCOW_TZ is not None:
                         value = value.replace(
@@ -1658,49 +1535,31 @@ class SignalScheduler:
 
             return "—"
 
-        entry_text = format_time(
-            entry_time
-        )
-
-        expiry_text = format_time(
-            expiry_time
-        )
-
-        # ========================================================
-        # QUALITY
-        # ========================================================
+        # --------------------------------------------------------
+        # NUMBERS
+        # --------------------------------------------------------
 
         try:
-
             quality_text = (
                 f"{float(quality):.0f}"
             )
-
         except Exception:
-
             quality_text = str(
                 quality
             )
 
-        # ========================================================
-        # PROBABILITY
-        # ========================================================
-
         try:
-
             probability_text = (
                 f"{float(probability):.0f}%"
             )
-
         except Exception:
-
             probability_text = (
                 f"{probability}%"
             )
 
-        # ========================================================
+        # --------------------------------------------------------
         # CONFIRMATIONS
-        # ========================================================
+        # --------------------------------------------------------
 
         confirmation_lines = []
 
@@ -1712,81 +1571,76 @@ class SignalScheduler:
             ),
         ):
 
-            for confirmation in confirmations:
+            for item in confirmations:
 
-                confirmation = str(
-                    confirmation
+                item = str(
+                    item
                 ).strip()
 
-                if not confirmation:
+                if not item:
                     continue
 
-                if confirmation.startswith(
+                if item.startswith(
                     "✅"
                 ):
+
                     confirmation_lines.append(
-                        confirmation
+                        item
                     )
+
                 else:
+
                     confirmation_lines.append(
-                        f"✅ {confirmation}"
+                        f"✅ {item}"
                     )
 
         elif confirmations:
 
-            confirmation = str(
+            text = str(
                 confirmations
             ).strip()
 
-            if "," in confirmation:
+            for item in text.split(
+                ","
+            ):
 
-                for item in confirmation.split(
-                    ","
-                ):
+                item = item.strip()
 
-                    item = item.strip()
+                if not item:
+                    continue
 
-                    if not item:
-                        continue
-
-                    if item.startswith(
-                        "✅"
-                    ):
-                        confirmation_lines.append(
-                            item
-                        )
-                    else:
-                        confirmation_lines.append(
-                            f"✅ {item}"
-                        )
-
-            elif confirmation:
-
-                if confirmation.startswith(
+                if item.startswith(
                     "✅"
                 ):
+
                     confirmation_lines.append(
-                        confirmation
-                    )
-                else:
-                    confirmation_lines.append(
-                        f"✅ {confirmation}"
+                        item
                     )
 
-        # ========================================================
+                else:
+
+                    confirmation_lines.append(
+                        f"✅ {item}"
+                    )
+
+        # --------------------------------------------------------
         # MESSAGE
-        # ========================================================
+        # --------------------------------------------------------
 
         lines = [
             f"{emoji} {direction_text}",
             "",
             f"💱 {pair}",
             "",
-            f"⏰ ВХОД: {entry_text}",
-            f"🎯 ЭКСПИРАЦИЯ: {expiry_text}",
+            f"⏰ ВХОД: "
+            f"{format_time(entry_time)}",
+            f"🎯 ЭКСПИРАЦИЯ: "
+            f"{format_time(expiry_time)}",
             "",
-            f"📊 QUALITY: {quality_text}/100",
-            f"📈 ШАНС: {probability_text}",
+            f"📊 QUALITY: "
+            f"{quality_text}/100",
+            f"📈 ШАНС: "
+            f"{probability_text}",
         ]
 
         if confirmation_lines:
@@ -1803,7 +1657,7 @@ class SignalScheduler:
         )
 
     # ============================================================
-    # MAIN LOOP
+    # RUN
     # ============================================================
 
     async def run(
@@ -1853,14 +1707,11 @@ class SignalScheduler:
 
                 await self.scan_once()
 
-                await asyncio.sleep(2)
+                await asyncio.sleep(
+                    2
+                )
 
             except asyncio.CancelledError:
-
-                print(
-                    "[SCHEDULER] "
-                    "Получена команда остановки"
-                )
 
                 break
 
