@@ -1,13 +1,10 @@
 from __future__ import annotations
-
 import asyncio
 import re
 import time
 from typing import Any, Optional
-
 import aiohttp
 import pandas as pd
-
 from config import (
     ASSET_DISCOVERY_CACHE_SECONDS,
     ASSET_DISCOVERY_ENABLED,
@@ -17,1979 +14,922 @@ from config import (
     POCKET_OPTION_ASSETS_URL,
     TWELVE_DATA_API_KEY,
 )
-
 try:
     from config import POCKET_OPTION_SSID
 except ImportError:
     POCKET_OPTION_SSID = ""
-
+try:
+    # Не импортируем библиотеку при запуске файла.
+    # Она понадобится только если реально используется OTC.
+    from pocketoptionapi import PocketOption
+except ImportError:
+    PocketOption = None
 TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
-
-
+REQUEST_TIMEOUT = 15
+POCKET_CONNECT_TIMEOUT = 20
+# Большой offset нужен Pocket Option для стабильного получения истории.
+POCKET_HISTORY_OFFSET = 45000
+# Максимальное количество попыток получить свечи.
+MAX_OTC_RETRIES = 2
 class MarketClient:
     """
-    Единый клиент рыночных данных.
-
+    Источник рыночных данных.
     Обычные Forex:
-        EUR/USD
-        GBP/USD
-        USD/JPY
-
-        -> Twelve Data
-
-    OTC Pocket Option:
-        EUR/USD OTC
-        GBP/USD OTC
-        Gold OTC
-        Bitcoin OTC
-        и т.д.
-
-        -> Pocket Option API/WebSocket client,
-           если POCKET_OPTION_SSID задан.
-
+        Twelve Data
+    Pocket Option OTC:
+        Pocket Option WebSocket API, если задан POCKET_OPTION_SSID.
     ВАЖНО:
-    OTC никогда не преобразуется в обычный EUR/USD.
+        Без SSID Pocket Option OTC свечи невозможно достоверно получить
+        из публичного API Pocket Option. Поэтому OTC в таком случае
+        возвращает None, а не подменяется обычным Forex.
     """
-
-    def __init__(self):
+    def __init__(self) -> None:
         self.session: Optional[aiohttp.ClientSession] = None
-
         self._asset_cache: list[str] = []
-        self._asset_cache_time: float = 0
-        self._asset_lock = asyncio.Lock()
-
+        self._asset_cache_time: float = 0.0
         self._pocket_client: Any = None
         self._pocket_lock = asyncio.Lock()
         self._pocket_ready = False
-
     # ============================================================
-    # SESSION
+    # HTTP
     # ============================================================
-
     async def _get_session(self) -> aiohttp.ClientSession:
-        if (
-            self.session is None
-            or self.session.closed
-        ):
-            timeout = aiohttp.ClientTimeout(
-                total=30
-            )
-
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
             self.session = aiohttp.ClientSession(
-                timeout=timeout
+                timeout=timeout,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 "
+                        "(compatible; TeyzooSignalBot/1.0)"
+                    )
+                },
             )
-
         return self.session
-
     async def close(self) -> None:
         """
-        Полностью закрывает HTTP и Pocket Option
-        подключения.
+        Закрывает HTTP и Pocket Option соединения.
         """
-
-        if (
-            self.session is not None
-            and not self.session.closed
-        ):
-            await self.session.close()
-
-        self.session = None
-
         await self._close_pocket_client()
-
+        if self.session is not None and not self.session.closed:
+            await self.session.close()
+        self.session = None
     # ============================================================
-    # PAIR / ASSET HELPERS
+    # SYMBOL HELPERS
     # ============================================================
-
     @staticmethod
     def is_otc(value: str) -> bool:
-        """
-        Определяет, является ли актив OTC.
-
-        Поддерживает:
-
-            EUR/USD OTC
-            EURUSD OTC
-            EURUSD_otc
-            EURUSD-OTC
-        """
-
         if not value:
             return False
-
-        value = str(value).strip().upper()
-
-        return bool(
-            re.search(
-                r"(?:\s|_|-)?OTC$",
-                value,
-            )
+        value = str(value).strip().lower()
+        return (
+            value.endswith("_otc")
+            or value.endswith(" otc")
+            or value.endswith("-otc")
+            or value.endswith("otc")
         )
-
     @staticmethod
     def _clean_asset_name(value: str) -> str:
-        """
-        Чистит название актива, сохраняя OTC.
-        """
-
         if not value:
             return ""
-
-        value = (
-            str(value)
-            .replace("&AMP;", "&")
-            .strip()
-        )
-
-        value = re.sub(
-            r"\s+",
-            " ",
-            value,
-        )
-
+        value = str(value).strip()
+        value = re.sub(r"\s+", " ", value)
         return value
-
     @staticmethod
-    def _normalize_forex_pair(
-        value: str,
-    ) -> Optional[str]:
+    def _normalize_forex_pair(value: str) -> Optional[str]:
         """
-        Нормализует ТОЛЬКО обычную Forex-пару.
-
-        OTC здесь специально НЕ удаляется.
-
         EUR/USD -> EUR/USD
         EURUSD  -> EUR/USD
-        EUR-USD -> EUR/USD
-        EUR_USD -> EUR/USD
+        OTC намеренно не проходит через этот метод.
         """
-
         if not value:
             return None
-
-        value = str(value).upper().strip()
-
-        if MarketClient.is_otc(value):
+        value = str(value).strip().upper()
+        if "OTC" in value:
             return None
-
-        value = value.replace(
-            "-",
-            "/",
-        )
-
-        value = value.replace(
-            "_",
-            "/",
-        )
-
-        value = value.replace(
-            "\\",
-            "/",
-        )
-
-        compact = value.replace(
-            "/",
-            "",
-        )
-
-        if (
-            len(compact) == 6
-            and compact.isalpha()
-        ):
-            return (
-                f"{compact[:3]}/"
-                f"{compact[3:]}"
-            )
-
-        match = re.fullmatch(
-            r"([A-Z]{3})/([A-Z]{3})",
-            value,
-        )
-
-        if match:
-            return (
-                f"{match.group(1)}/"
-                f"{match.group(2)}"
-            )
-
-        return None
-
+        value = value.replace(" ", "")
+        value = value.replace("-", "/")
+        value = value.replace("_", "/")
+        match = re.fullmatch(r"([A-Z]{3})/?([A-Z]{3})", value)
+        if not match:
+            return None
+        return f"{match.group(1)}/{match.group(2)}"
     @staticmethod
-    def normalize_otc_symbol(
-        value: str,
-    ) -> Optional[str]:
+    def normalize_otc_symbol(value: str) -> Optional[str]:
         """
-        Преобразует отображаемое имя Pocket Option
-        в символ API.
-
-        EUR/USD OTC
-            ->
-        EURUSD_otc
-
-        EURUSD OTC
-            ->
-        EURUSD_otc
+        Приводит название OTC к Pocket Option symbol.
+        EUR/USD OTC -> EURUSD_otc
+        EURUSD OTC  -> EURUSD_otc
+        Gold OTC    -> Gold_otc
         """
-
         if not value:
             return None
-
         raw = str(value).strip()
-
         if not MarketClient.is_otc(raw):
             return None
-
-        raw = re.sub(
-            r"(?:\s|_|-)OTC$",
+        # Убираем различные варианты OTC.
+        clean = re.sub(
+            r"[\s_\-]*otc$",
             "",
             raw,
             flags=re.IGNORECASE,
         )
-
-        raw = raw.upper().strip()
-
-        # Валютная пара.
-        compact = re.sub(
-            r"[^A-Z]",
-            "",
-            raw,
-        )
-
-        if (
-            len(compact) == 6
-            and compact.isalpha()
-        ):
+        clean = clean.strip()
+        # Forex:
+        compact = re.sub(r"[^A-Za-z]", "", clean).upper()
+        if len(compact) == 6:
             return f"{compact}_otc"
-
-        # Другие OTC активы.
-        #
-        # Например:
-        # Gold OTC -> Gold_otc
-        # Bitcoin OTC -> Bitcoin_otc
-        #
-        # Для таких активов сохраняем название.
-        clean = re.sub(
-            r"[^A-Za-z0-9]+",
-            "_",
-            raw,
-        ).strip("_")
-
-        if not clean:
-            return None
-
-        return f"{clean}_otc"
-
-    @staticmethod
-    def display_asset_name(
-        value: str,
-    ) -> str:
-        """
-        Приводит API symbol обратно к понятному
-        названию для Telegram.
-
-        EURUSD_otc -> EUR/USD OTC
-        """
-
-        if not value:
-            return ""
-
-        raw = str(value).strip()
-
-        if raw.lower().endswith("_otc"):
-            base = raw[:-4]
-
-            compact = re.sub(
-                r"[^A-Za-z]",
-                "",
-                base,
-            )
-
-            if (
-                len(compact) == 6
-                and compact.isalpha()
-            ):
-                return (
-                    f"{compact[:3].upper()}/"
-                    f"{compact[3:].upper()} OTC"
-                )
-
-            return f"{base} OTC"
-
-        normalized = (
-            MarketClient._normalize_forex_pair(
-                raw
-            )
-        )
-
-        if normalized:
-            return normalized
-
-        return raw
-
-    # ============================================================
-    # FOREX CHECK
-    # ============================================================
-
-    @staticmethod
-    def _is_forex_pair(
-        pair: str,
-    ) -> bool:
-        normalized = (
-            MarketClient._normalize_forex_pair(
-                pair
-            )
-        )
-
+        # Остальные активы.
+        normalized = re.sub(r"\s+", "", clean)
         if not normalized:
-            return False
-
-        base, quote = normalized.split("/")
-
-        return (
-            len(base) == 3
-            and len(quote) == 3
-            and base.isalpha()
-            and quote.isalpha()
-        )
-
-    # ============================================================
-    # POCKET OPTION ASSET DISCOVERY
-    # ============================================================
-
-    async def discover_pocket_assets(
-        self,
-    ) -> list[str]:
+            return None
+        return f"{normalized}_otc"
+    @staticmethod
+    def display_asset_name(value: str) -> str:
         """
-        Получает актуальные активы Pocket Option.
-
-        Возвращает:
-
-            EUR/USD
-            GBP/USD
-            EUR/USD OTC
-            Gold OTC
-            Bitcoin OTC
-            ...
-
-        OTC НЕ удаляется.
+        Преобразует техническое имя в понятное пользователю.
         """
-
+        if not value:
+            return value
+        value = str(value).strip()
+        if value.lower().endswith("_otc"):
+            base = value[:-4]
+            if len(base) == 6 and base.isalpha():
+                base = base.upper()
+                return f"{base[:3]}/{base[3:]} OTC"
+            return f"{base} OTC"
+        return value
+    @staticmethod
+    def _is_forex_pair(value: str) -> bool:
+        return MarketClient._normalize_forex_pair(value) is not None
+    # ============================================================
+    # ASSET DISCOVERY
+    # ============================================================
+    async def discover_pocket_assets(self) -> list[str]:
+        """
+        Получает список активов с публичной страницы Pocket Option.
+        Это только discovery.
+        Получение свечей OTC всё равно требует авторизованного
+        Pocket Option WebSocket.
+        """
         if not ASSET_DISCOVERY_ENABLED:
-            print(
-                "ℹ️ Asset discovery отключён."
-            )
-
-            return self._fallback_assets()
-
+            return list(FALLBACK_PAIRS)
         now = time.monotonic()
-
         if (
             self._asset_cache
-            and (
-                now - self._asset_cache_time
-                < ASSET_DISCOVERY_CACHE_SECONDS
-            )
+            and now - self._asset_cache_time
+            < ASSET_DISCOVERY_CACHE_SECONDS
         ):
-            return self._asset_cache.copy()
-
-        async with self._asset_lock:
-            now = time.monotonic()
-
-            if (
-                self._asset_cache
-                and (
-                    now - self._asset_cache_time
-                    < ASSET_DISCOVERY_CACHE_SECONDS
+            return list(self._asset_cache)
+        try:
+            session = await self._get_session()
+            async with session.get(
+                POCKET_OPTION_ASSETS_URL
+            ) as response:
+                if response.status != 200:
+                    return list(FALLBACK_PAIRS)
+                html = await response.text(
+                    errors="ignore"
                 )
-            ):
-                return self._asset_cache.copy()
-
-            print("")
-            print(
-                "🌐 Получение актуального списка "
-                "активов Pocket Option..."
-            )
-
-            try:
-                session = await self._get_session()
-
-                headers = {
-                    "User-Agent": (
-                        "Mozilla/5.0 "
-                        "(iPhone; CPU iPhone OS 17_0 "
-                        "like Mac OS X) "
-                        "AppleWebKit/605.1.15 "
-                        "Version/17.0 Mobile/15E148 "
-                        "Safari/604.1"
-                    ),
-                    "Accept": (
-                        "text/html,"
-                        "application/xhtml+xml,"
-                        "application/xml;q=0.9,"
-                        "*/*;q=0.8"
-                    ),
-                    "Accept-Language": (
-                        "en-US,en;q=0.9"
-                    ),
-                }
-
-                async with session.get(
-                    POCKET_OPTION_ASSETS_URL,
-                    headers=headers,
-                ) as response:
-
-                    if response.status != 200:
-                        print(
-                            "⚠️ Pocket Option assets "
-                            f"HTTP {response.status}"
-                        )
-
-                        return self._fallback_assets()
-
-                    html = await response.text(
-                        errors="ignore"
-                    )
-
-            except Exception as exc:
-                print(
-                    "⚠️ Не удалось получить список "
-                    "Pocket Option:"
-                )
-
-                print(
-                    f"   {type(exc).__name__}: {exc}"
-                )
-
-                return self._fallback_assets()
-
-            assets = self._parse_pocket_assets(
-                html
-            )
-
-            if not assets:
-                print(
-                    "⚠️ Не удалось извлечь активы "
-                    "из Pocket Option."
-                )
-
-                return self._fallback_assets()
-
-            self._asset_cache = assets
-            self._asset_cache_time = (
-                time.monotonic()
-            )
-
-            normal_count = sum(
-                1
-                for asset in assets
-                if not self.is_otc(asset)
-            )
-
-            otc_count = sum(
-                1
-                for asset in assets
-                if self.is_otc(asset)
-            )
-
-            print(
-                "✅ Pocket Option assets:"
-            )
-
-            print(
-                f"   Обычные: {normal_count}"
-            )
-
-            print(
-                f"   OTC: {otc_count}"
-            )
-
-            print(
-                f"   Всего: {len(assets)}"
-            )
-
-            return assets.copy()
-
-    async def discover_pocket_pairs(
-        self,
-    ) -> list[str]:
+            assets = self._parse_pocket_assets(html)
+            if assets:
+                self._asset_cache = assets
+                self._asset_cache_time = now
+                return list(assets)
+        except Exception:
+            pass
+        return list(FALLBACK_PAIRS)
+    async def discover_pocket_pairs(self) -> list[str]:
         """
-        Совместимость со старым scheduler.py.
-
+        Совместимость со старым кодом.
         Возвращает только обычные Forex-пары.
-        Для всех активов используется
-        discover_pocket_assets().
         """
-
-        assets = (
-            await self.discover_pocket_assets()
-        )
-
-        result: list[str] = []
-
-        for asset in assets:
-            if self.is_otc(asset):
-                continue
-
-            normalized = (
-                self._normalize_forex_pair(
-                    asset
-                )
-            )
-
-            if (
-                normalized
-                and normalized not in result
-            ):
-                result.append(normalized)
-
-        if not result:
-            return self._fallback_assets()
-
-        return result
-
-    # ============================================================
-    # PARSE POCKET OPTION PAGE
-    # ============================================================
-
-    def _parse_pocket_assets(
-        self,
-        html: str,
-    ) -> list[str]:
-        """
-        Извлекает обычные и OTC активы.
-
-        Сначала ищет валютные OTC:
-            EUR/USD OTC
-
-        Затем остальные OTC:
-            Gold OTC
-            Bitcoin OTC
-            Tesla OTC
-
-        И затем обычные Forex.
-        """
-
-        if not html:
-            return []
-
-        text = html.upper()
-
-        found: list[str] = []
-
-        def add_asset(
-            asset: str,
-        ) -> None:
-            asset = self._clean_asset_name(
-                asset
-            )
-
-            if not asset:
-                return
-
-            if asset not in found:
-                found.append(asset)
-
-        # --------------------------------------------------------
-        # 1. Валютные OTC.
-        # --------------------------------------------------------
-
-        otc_forex_patterns = [
-            r"\b([A-Z]{3}\s*/\s*[A-Z]{3}\s+OTC)\b",
-            r"\b([A-Z]{3}\s*[A-Z]{3}\s+OTC)\b",
-            r"\b([A-Z]{3}\s*[-_]\s*[A-Z]{3}\s+OTC)\b",
-        ]
-
-        for pattern in otc_forex_patterns:
-            matches = re.findall(
-                pattern,
-                text,
-            )
-
-            for match in matches:
-                normalized = (
-                    MarketClient._normalize_otc_display(
-                        match
-                    )
-                )
-
-                if normalized:
-                    add_asset(normalized)
-
-        # --------------------------------------------------------
-        # 2. Обычные валютные пары.
-        # --------------------------------------------------------
-
-        normal_patterns = [
-            r"\b([A-Z]{3}\s*/\s*[A-Z]{3})\b",
-            r"\b([A-Z]{3}[A-Z]{3})\b",
-        ]
-
-        for pattern in normal_patterns:
-            matches = re.findall(
-                pattern,
-                text,
-            )
-
-            for match in matches:
-                normalized = (
-                    self._normalize_forex_pair(
-                        match
-                    )
-                )
-
-                if not normalized:
-                    continue
-
-                base, quote = normalized.split("/")
-
-                if base == quote:
-                    continue
-
-                add_asset(normalized)
-
-        # --------------------------------------------------------
-        # 3. Другие OTC активы.
-        #
-        # Берём названия непосредственно перед OTC.
-        #
-        # Примеры:
-        # Gold OTC
-        # Bitcoin OTC
-        # Tesla OTC
-        # Microsoft OTC
-        # --------------------------------------------------------
-
-        other_otc_patterns = [
-            r"\b([A-Z][A-Z0-9&.\- ]{1,50}?)\s+OTC\b",
-        ]
-
-        for pattern in other_otc_patterns:
-            matches = re.findall(
-                pattern,
-                text,
-            )
-
-            for match in matches:
-                candidate = (
-                    self._clean_asset_name(
-                        match
-                    )
-                )
-
-                if not candidate:
-                    continue
-
-                candidate = candidate.strip()
-
-                # Не добавляем мусор.
-                if len(candidate) < 2:
-                    continue
-
-                # Если это валютная пара —
-                # она уже обработана.
-                if re.fullmatch(
-                    r"[A-Z]{3}\s*/\s*[A-Z]{3}",
-                    candidate,
-                ):
-                    continue
-
-                if re.fullmatch(
-                    r"[A-Z]{6}",
-                    candidate,
-                ):
-                    continue
-
-                # HTML/служебный мусор.
-                forbidden = {
-                    "ASSET IS AVAILABLE",
-                    "AVAILABLE",
-                    "TRADING",
-                    "CURRENT",
-                    "OPTION",
-                    "PAYOUT",
-                    "CURRENCY",
-                    "COMMODITIES",
-                    "STOCKS",
-                    "CRYPTOCURRENCIES",
-                    "INDICES",
-                }
-
-                if candidate in forbidden:
-                    continue
-
-                add_asset(
-                    f"{candidate} OTC"
-                )
-
-        # --------------------------------------------------------
-        # 4. Финальная очистка.
-        # --------------------------------------------------------
-
-        cleaned: list[str] = []
-
-        for asset in found:
-            asset = re.sub(
-                r"\s+",
-                " ",
-                asset,
-            ).strip()
-
-            if not asset:
-                continue
-
-            if asset not in cleaned:
-                cleaned.append(asset)
-
-        return cleaned
-
-    @staticmethod
-    def _normalize_otc_display(
-        value: str,
-    ) -> Optional[str]:
-        """
-        EURUSD OTC / EUR/USD OTC
-        ->
-        EUR/USD OTC
-        """
-
-        if not value:
-            return None
-
-        raw = str(value).upper().strip()
-
-        raw = re.sub(
-            r"\s+",
-            " ",
-            raw,
-        )
-
-        raw = re.sub(
-            r"\s*OTC$",
-            "",
-            raw,
-        ).strip()
-
-        compact = re.sub(
-            r"[^A-Z]",
-            "",
-            raw,
-        )
-
-        if (
-            len(compact) == 6
-            and compact.isalpha()
-        ):
-            if compact[:3] == compact[3:]:
-                return None
-
-            return (
-                f"{compact[:3]}/"
-                f"{compact[3:]} OTC"
-            )
-
-        return None
-
-    # ============================================================
-    # FALLBACK
-    # ============================================================
-
-    def _fallback_assets(self) -> list[str]:
-        """
-        Fallback для обычных Forex.
-
-        OTC намеренно здесь не выдумываем:
-        без актуального Pocket Option списка
-        нельзя гарантировать доступность OTC.
-        """
-
-        print(
-            "🔄 Используем fallback список "
-            "обычных FX-пар."
-        )
-
+        assets = await self.discover_pocket_assets()
         pairs: list[str] = []
-
-        for pair in FALLBACK_PAIRS:
-            normalized = (
-                self._normalize_forex_pair(
-                    pair
-                )
-            )
-
-            if (
-                normalized
-                and self._is_forex_pair(
-                    normalized
-                )
-                and normalized not in pairs
-            ):
-                pairs.append(normalized)
-
-        return pairs
-
-    # ============================================================
-    # AVAILABLE PAIRS / ASSETS
-    # ============================================================
-
-    async def get_available_pairs(
-        self,
-    ) -> list[str]:
-        """
-        Возвращает обычные + OTC активы.
-
-        ВАЖНО:
-        Для обычных Forex дополнительно проверяем
-        Twelve Data.
-
-        Для OTC проверка Twelve Data НЕ используется.
-        """
-
-        assets = (
-            await self.discover_pocket_assets()
-        )
-
-        if not assets:
-            return self._fallback_assets()
-
-        normal_assets: list[str] = []
-        otc_assets: list[str] = []
-
         for asset in assets:
-            if self.is_otc(asset):
-                if asset not in otc_assets:
-                    otc_assets.append(asset)
-
-                continue
-
-            normalized = (
-                self._normalize_forex_pair(
-                    asset
+            normalized = self._normalize_forex_pair(asset)
+            if normalized and normalized not in pairs:
+                pairs.append(normalized)
+        if not pairs:
+            return list(FALLBACK_PAIRS)
+        return pairs
+    def _parse_pocket_assets(self, html: str) -> list[str]:
+        """
+        Эвристический парсер названий активов.
+        Мы не используем найденные OTC-имена как доказательство
+        наличия свечей. Они только добавляются в список активов.
+        """
+        found: list[str] = []
+        if not html:
+            return found
+        patterns = [
+            r"\b([A-Z]{3}/[A-Z]{3})\s*OTC\b",
+            r"\b([A-Z]{6})[_\-\s]OTC\b",
+            r"\b([A-Za-z][A-Za-z0-9 .&_-]{1,30})\s+OTC\b",
+        ]
+        for pattern in patterns:
+            try:
+                matches = re.findall(
+                    pattern,
+                    html,
+                    flags=re.IGNORECASE,
                 )
-            )
-
-            if (
-                normalized
-                and normalized not in normal_assets
-            ):
-                normal_assets.append(normalized)
-
-        print("")
-        print(
-            f"🔎 Обычных FX-кандидатов: "
-            f"{len(normal_assets)}"
-        )
-
-        print(
-            f"🔎 OTC-кандидатов: "
-            f"{len(otc_assets)}"
-        )
-
-        # --------------------------------------------------------
-        # Проверяем обычные пары через Twelve Data.
-        # --------------------------------------------------------
-
-        available_normal: list[str] = []
-
-        semaphore = asyncio.Semaphore(5)
-
-        async def check_normal(
-            pair: str,
-        ):
-            async with semaphore:
-                candles = await self.get_candles(
-                    pair,
-                    log_errors=False,
+            except Exception:
+                matches = []
+            for match in matches:
+                value = (
+                    match[0]
+                    if isinstance(match, tuple)
+                    else match
                 )
-
-                if (
-                    candles is not None
-                    and len(candles) >= 80
-                ):
-                    return pair
-
-                return None
-
-        if normal_assets:
-            results = await asyncio.gather(
-                *[
-                    check_normal(pair)
-                    for pair in normal_assets
-                ],
-                return_exceptions=True,
+                value = self._clean_asset_name(value)
+                if not value:
+                    continue
+                if self._is_forex_pair(value):
+                    normalized = self._normalize_forex_pair(value)
+                    if normalized:
+                        found.append(normalized)
+                    continue
+                otc = self.normalize_otc_symbol(
+                    f"{value} OTC"
+                )
+                if otc:
+                    found.append(otc)
+        # Также ищем обычные Forex.
+        normal_pattern = r"\b([A-Z]{3}/[A-Z]{3})\b"
+        try:
+            normal_matches = re.findall(
+                normal_pattern,
+                html,
+                flags=re.IGNORECASE,
             )
-
-            for result in results:
-                if (
-                    isinstance(result, str)
-                    and result not in available_normal
-                ):
-                    available_normal.append(
-                        result
-                    )
-
-        # --------------------------------------------------------
-        # OTC НЕ проверяем Twelve Data.
-        #
-        # Если SSID есть — scheduler сможет
-        # запросить реальные OTC свечи.
-        # --------------------------------------------------------
-
+        except Exception:
+            normal_matches = []
+        for value in normal_matches:
+            normalized = self._normalize_forex_pair(value)
+            if normalized:
+                found.append(normalized)
+        # Уникализация.
         result: list[str] = []
-
-        for pair in available_normal:
-            if pair not in result:
-                result.append(pair)
-
-        for asset in otc_assets:
+        for asset in found:
             if asset not in result:
                 result.append(asset)
-
-        print("")
-        print(
-            "📊 Доступные активы для анализатора:"
-        )
-
-        print(
-            f"   Обычные FX: "
-            f"{len(available_normal)}"
-        )
-
-        print(
-            f"   OTC: "
-            f"{len(otc_assets)}"
-        )
-
-        print(
-            f"   Всего: "
-            f"{len(result)}"
-        )
-
-        if otc_assets:
-            print("")
-            print(
-                "🟣 OTC:"
-            )
-            print(
-                "   "
-                + ", ".join(
-                    otc_assets
-                )
-            )
-
         return result
-
-    # ============================================================
-    # OTC CLIENT
-    # ============================================================
-
-    async def _ensure_pocket_client(
-        self,
-    ) -> bool:
+    def _fallback_assets(self) -> list[str]:
+        return list(FALLBACK_PAIRS)
+    async def get_available_pairs(self) -> list[str]:
         """
-        Создаёт Pocket Option client.
-
-        Используется только если установлен:
-            POCKET_OPTION_SSID
-
-        Поддерживает библиотеку pocketoptionapi.
+        Возвращает активы, которые реально можно анализировать.
+        Обычные Forex:
+            проверяются через Twelve Data.
+        OTC:
+            добавляются ТОЛЬКО если доступен Pocket Option SSID.
+        Это важно:
+            если SSID отсутствует, бот не будет выбирать OTC,
+            после чего получать None и ломать анализ.
         """
-
-        if self._pocket_ready:
+        discovered = await self.discover_pocket_assets()
+        result: list[str] = []
+        for asset in discovered:
+            if self.is_otc(asset):
+                # OTC нельзя считать доступным только потому,
+                # что название найдено на странице.
+                if self._pocket_ssid_available():
+                    if asset not in result:
+                        result.append(asset)
+                continue
+            pair = self._normalize_forex_pair(asset)
+            if not pair:
+                continue
+            # Проверяем, что Twelve Data реально может дать свечи.
+            try:
+                candles = await self._get_twelve_data_candles(
+                    pair,
+                    limit=5,
+                )
+                if candles is not None and not candles.empty:
+                    if pair not in result:
+                        result.append(pair)
+            except Exception:
+                continue
+        if not result:
+            return list(FALLBACK_PAIRS)
+        return result
+    # ============================================================
+    # POCKET OPTION
+    # ============================================================
+    @staticmethod
+    def _pocket_ssid_available() -> bool:
+        return bool(
+            isinstance(POCKET_OPTION_SSID, str)
+            and POCKET_OPTION_SSID.strip()
+        )
+    async def _ensure_pocket_client(self) -> bool:
+        """
+        Подключает Pocket Option только когда требуется OTC.
+        ВАЖНО:
+            SSID берётся только из environment variable.
+            В коде/репозитории он не хранится.
+        """
+        if self._pocket_ready and self._pocket_client is not None:
             return True
-
-        if not POCKET_OPTION_SSID:
-            print(
-                "⚠️ POCKET_OPTION_SSID не задан."
-            )
-
-            print(
-                "⚠️ OTC-свечи Pocket Option "
-                "пока недоступны."
-            )
-
+        if not self._pocket_ssid_available():
             return False
-
+        if PocketOption is None:
+            return False
         async with self._pocket_lock:
-
-            if self._pocket_ready:
+            if (
+                self._pocket_ready
+                and self._pocket_client is not None
+            ):
                 return True
-
             try:
-                from pocketoptionapi import (
-                    PocketOption,
-                )
-            except ImportError:
-                print(
-                    "❌ Не установлен "
-                    "pocketoptionapi."
-                )
-
-                print(
-                    "❌ Невозможно получить "
-                    "реальные OTC-свечи."
-                )
-
-                return False
-
-            try:
-                print("")
-                print(
-                    "🔌 Подключение к "
-                    "Pocket Option..."
-                )
-
                 client = PocketOption(
                     POCKET_OPTION_SSID
                 )
-
-                # Библиотека синхронная.
-                # Подключение выносим из event loop.
-                connected = await asyncio.to_thread(
-                    client.connect
+                # connect() у этой библиотеки синхронный.
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        client.connect
+                    ),
+                    timeout=POCKET_CONNECT_TIMEOUT,
                 )
-
-                # Некоторые версии возвращают:
-                # (True, None)
-                # Некоторые — True.
-                ok = False
-
-                if isinstance(
-                    connected,
-                    tuple,
-                ):
-                    ok = bool(
-                        connected[0]
-                    )
+                # Разные версии библиотеки возвращают:
+                #   bool
+                #   tuple(bool, error)
+                #   None
+                #
+                # Поэтому проверяем мягко.
+                if isinstance(result, tuple):
+                    connected = bool(result[0])
+                elif isinstance(result, bool):
+                    connected = result
                 else:
-                    ok = bool(
-                        connected
-                    )
-
-                if not ok:
-                    print(
-                        "❌ Pocket Option "
-                        "не подключён."
-                    )
-
-                    return False
-
-                # Ждём WebSocket/time sync.
-                for _ in range(100):
-
+                    connected = True
+                if not connected:
                     try:
-                        check_connect = (
-                            await asyncio.to_thread(
-                                client.check_connect
-                            )
+                        client.close()
+                    except Exception:
+                        pass
+                    return False
+                # Ждём готовности WebSocket.
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    try:
+                        connected_now = bool(
+                            client.check_connect()
                         )
                     except Exception:
-                        check_connect = True
-
-                    if not check_connect:
-                        await asyncio.sleep(
-                            0.1
-                        )
-                        continue
-
+                        connected_now = True
                     try:
-                        synced = (
-                            await asyncio.to_thread(
-                                client.is_time_synced
-                            )
+                        synced = bool(
+                            client.is_time_synced()
                         )
                     except Exception:
                         synced = True
-
-                    if synced:
+                    if connected_now and synced:
                         break
-
-                    await asyncio.sleep(
-                        0.1
-                    )
-
+                    await asyncio.sleep(0.25)
                 self._pocket_client = client
                 self._pocket_ready = True
-
-                print(
-                    "✅ Pocket Option "
-                    "подключён."
-                )
-
                 return True
-
-            except Exception as exc:
-                print(
-                    "❌ Ошибка подключения "
-                    "Pocket Option:"
-                )
-
-                print(
-                    f"   {type(exc).__name__}: "
-                    f"{exc}"
-                )
-
+            except Exception:
                 self._pocket_client = None
                 self._pocket_ready = False
-
                 return False
-
-    async def _close_pocket_client(
-        self,
-    ) -> None:
-        """
-        Безопасно закрывает Pocket Option client.
-        """
-
-        client = self._pocket_client
-
-        self._pocket_client = None
-        self._pocket_ready = False
-
-        if client is None:
-            return
-
-        close_methods = [
-            "close",
-            "disconnect",
-            "shutdown",
-        ]
-
-        for method_name in close_methods:
-            method = getattr(
-                client,
-                method_name,
-                None,
-            )
-
-            if method is None:
-                continue
-
+    async def _close_pocket_client(self) -> None:
+        async with self._pocket_lock:
+            client = self._pocket_client
+            self._pocket_client = None
+            self._pocket_ready = False
+            if client is None:
+                return
             try:
-                await asyncio.to_thread(
-                    method
-                )
+                if hasattr(client, "close"):
+                    await asyncio.to_thread(
+                        client.close
+                    )
+                elif hasattr(client, "disconnect"):
+                    await asyncio.to_thread(
+                        client.disconnect
+                    )
             except Exception:
                 pass
-
-            break
-
+    async def get_otc_candles(
+        self,
+        symbol: str,
+        interval: int = CANDLE_INTERVAL,
+        limit: int = CANDLE_LIMIT,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Получает настоящие Pocket Option OTC свечи.
+        Требуется POCKET_OPTION_SSID.
+        Пример:
+            EURUSD_otc
+        """
+        otc_symbol = self.normalize_otc_symbol(symbol)
+        if not otc_symbol:
+            return None
+        if not await self._ensure_pocket_client():
+            return None
+        client = self._pocket_client
+        if client is None:
+            return None
+        period = int(interval)
+        for attempt in range(MAX_OTC_RETRIES):
+            try:
+                # Подписка помогает Pocket Option подготовить
+                # поток/историю конкретного актива.
+                try:
+                    await asyncio.to_thread(
+                        client.subscribe,
+                        otc_symbol,
+                        period=period,
+                    )
+                except TypeError:
+                    try:
+                        await asyncio.to_thread(
+                            client.subscribe,
+                            otc_symbol,
+                            period,
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+                candles = None
+                # Основной метод старой stable_api.
+                if hasattr(
+                    client,
+                    "get_historical_candles",
+                ):
+                    try:
+                        candles = await asyncio.to_thread(
+                            client.get_historical_candles,
+                            otc_symbol,
+                            period=period,
+                            offset=POCKET_HISTORY_OFFSET,
+                            count_request=1,
+                        )
+                    except TypeError:
+                        candles = await asyncio.to_thread(
+                            client.get_historical_candles,
+                            otc_symbol,
+                            period,
+                            POCKET_HISTORY_OFFSET,
+                            1,
+                        )
+                # Некоторые версии имеют get_candles.
+                elif hasattr(client, "get_candles"):
+                    try:
+                        candles = await asyncio.to_thread(
+                            client.get_candles,
+                            otc_symbol,
+                            period,
+                            POCKET_HISTORY_OFFSET,
+                        )
+                    except TypeError:
+                        candles = await asyncio.to_thread(
+                            client.get_candles,
+                            otc_symbol,
+                            period,
+                            limit,
+                        )
+                df = self._pocket_candles_to_dataframe(
+                    candles
+                )
+                if df is None or df.empty:
+                    raise RuntimeError(
+                        "Pocket Option returned no OTC candles"
+                    )
+                # Оставляем достаточно данных для индикаторов.
+                if limit > 0 and len(df) > limit:
+                    df = df.tail(limit).copy()
+                if len(df) < 10:
+                    raise RuntimeError(
+                        "Not enough OTC candles"
+                    )
+                return df
+            except Exception:
+                if attempt + 1 < MAX_OTC_RETRIES:
+                    await asyncio.sleep(1.0)
+                    continue
+                # Возможно, соединение умерло.
+                self._pocket_ready = False
+                return None
+        return None
     # ============================================================
-    # CANDLES ROUTER
+    # PUBLIC CANDLES API
     # ============================================================
-
     async def get_candles(
         self,
         pair: str,
-        log_errors: bool = True,
+        interval: int = CANDLE_INTERVAL,
+        limit: int = CANDLE_LIMIT,
     ) -> Optional[pd.DataFrame]:
         """
-        Главный метод получения свечей.
-
-        Обычный:
-            EUR/USD
-                -> Twelve Data
-
+        Главная функция получения свечей.
         OTC:
-            EUR/USD OTC
-                -> Pocket Option
+            Pocket Option
+        Обычные пары:
+            Twelve Data
         """
-
         if not pair:
             return None
-
         if self.is_otc(pair):
             return await self.get_otc_candles(
                 pair,
-                log_errors=log_errors,
+                interval=interval,
+                limit=limit,
             )
-
-        normalized = (
-            self._normalize_forex_pair(
-                pair
-            )
-        )
-
+        normalized = self._normalize_forex_pair(pair)
         if not normalized:
-            if log_errors:
-                print(
-                    f"❌ Invalid asset: {pair}"
-                )
-
             return None
-
         return await self._get_twelve_data_candles(
             normalized,
-            log_errors=log_errors,
+            limit=limit,
+            interval=interval,
         )
-
     # ============================================================
     # TWELVE DATA
     # ============================================================
-
     async def _get_twelve_data_candles(
         self,
         pair: str,
-        log_errors: bool = True,
+        limit: int = CANDLE_LIMIT,
+        interval: int = CANDLE_INTERVAL,
     ) -> Optional[pd.DataFrame]:
-
+        """
+        Twelve Data источник для обычного Forex.
+        """
         if not TWELVE_DATA_API_KEY:
-            if log_errors:
-                print(
-                    "❌ TWELVE_DATA_API_KEY "
-                    "не задан."
-                )
-
             return None
-
+        normalized = self._normalize_forex_pair(pair)
+        if not normalized:
+            return None
+        # Twelve Data использует формат EUR/USD.
+        symbol = normalized
+        interval_name = self._twelve_interval(interval)
+        params = {
+            "symbol": symbol,
+            "interval": interval_name,
+            "outputsize": max(1, int(limit)),
+            "apikey": TWELVE_DATA_API_KEY,
+            "format": "JSON",
+        }
         try:
             session = await self._get_session()
-
-            params = {
-                "symbol": pair,
-                "interval": CANDLE_INTERVAL,
-                "outputsize": CANDLE_LIMIT,
-                "apikey": TWELVE_DATA_API_KEY,
-                "format": "JSON",
-            }
-
             async with session.get(
                 TWELVE_DATA_URL,
                 params=params,
             ) as response:
-
                 if response.status != 200:
-                    if log_errors:
-                        print(
-                            f"❌ Twelve Data "
-                            f"{pair}: HTTP "
-                            f"{response.status}"
-                        )
-
                     return None
-
-                data = await response.json(
+                payload = await response.json(
                     content_type=None
                 )
-
-        except asyncio.TimeoutError:
-
-            if log_errors:
-                print(
-                    f"❌ Twelve Data "
-                    f"{pair}: timeout"
-                )
-
+        except Exception:
             return None
-
-        except Exception as exc:
-
-            if log_errors:
-                print(
-                    f"❌ Twelve Data "
-                    f"{pair}: "
-                    f"{type(exc).__name__}: "
-                    f"{exc}"
-                )
-
+        if not isinstance(payload, dict):
             return None
-
-        if not isinstance(
-            data,
-            dict,
-        ):
-            if log_errors:
-                print(
-                    f"❌ {pair}: "
-                    "неверный ответ API"
-                )
-
+        if "values" not in payload:
             return None
-
-        if data.get("status") == "error":
-
-            if log_errors:
-                print(
-                    f"❌ Twelve Data "
-                    f"{pair}: "
-                    f"{data.get('message', 'API error')}"
-                )
-
+        values = payload.get("values")
+        if not isinstance(values, list):
             return None
-
-        values = data.get(
-            "values"
-        )
-
-        if not values:
-
-            if log_errors:
-                print(
-                    f"❌ {pair}: "
-                    "API не вернул свечи"
-                )
-
-            return None
-
         return self._candles_to_dataframe(
-            values,
-            pair,
-            log_errors,
+            values
         )
-
+    @staticmethod
+    def _twelve_interval(seconds: int) -> str:
+        seconds = int(seconds)
+        mapping = {
+            1: "1min",
+            5: "5min",
+            15: "15min",
+            30: "30min",
+            60: "1h",
+            300: "5h",
+        }
+        # Для твоего бота основное значение — 60 секунд.
+        # Twelve Data использует 1min для минутных свечей.
+        if seconds == 60:
+            return "1min"
+        if seconds in mapping:
+            return mapping[seconds]
+        # Безопасный fallback.
+        if seconds % 60 == 0:
+            return f"{seconds // 60}min"
+        return "1min"
     # ============================================================
-    # OTC CANDLES
+    # DATAFRAME NORMALIZATION
     # ============================================================
-
-    async def get_otc_candles(
-        self,
-        pair: str,
-        log_errors: bool = True,
-    ) -> Optional[pd.DataFrame]:
-        """
-        Получает реальные OTC-свечи через
-        Pocket Option.
-
-        Пример:
-
-            EUR/USD OTC
-                ->
-            EURUSD_otc
-        """
-
-        symbol = self.normalize_otc_symbol(
-            pair
-        )
-
-        if not symbol:
-            if log_errors:
-                print(
-                    f"❌ Неверный OTC asset: "
-                    f"{pair}"
-                )
-
-            return None
-
-        ready = (
-            await self._ensure_pocket_client()
-        )
-
-        if not ready:
-            if log_errors:
-                print(
-                    f"⚠️ OTC {pair}: "
-                    "Pocket Option client "
-                    "не готов."
-                )
-
-            return None
-
-        client = self._pocket_client
-
-        try:
-            period = (
-                self._interval_to_seconds(
-                    CANDLE_INTERVAL
-                )
-            )
-
-            # Подписываемся на поток.
-            subscribe = getattr(
-                client,
-                "subscribe",
-                None,
-            )
-
-            if subscribe is not None:
-                try:
-                    await asyncio.to_thread(
-                        subscribe,
-                        symbol,
-                        period=period,
-                    )
-                except TypeError:
-                    await asyncio.to_thread(
-                        subscribe,
-                        symbol,
-                        period,
-                    )
-
-            # История.
-            get_history = getattr(
-                client,
-                "get_historical_candles",
-                None,
-            )
-
-            if get_history is None:
-                if log_errors:
-                    print(
-                        "❌ Pocket Option client "
-                        "не имеет "
-                        "get_historical_candles()."
-                    )
-
-                return None
-
-            try:
-                candles = await asyncio.to_thread(
-                    get_history,
-                    symbol,
-                    period=period,
-                    offset=45000,
-                    count_request=1,
-                )
-
-            except TypeError:
-
-                candles = await asyncio.to_thread(
-                    get_history,
-                    symbol,
-                    period,
-                    45000,
-                    1,
-                )
-
-            if not candles:
-                if log_errors:
-                    print(
-                        f"❌ OTC {pair}: "
-                        "Pocket Option не вернул "
-                        "свечи."
-                    )
-
-                return None
-
-            df = self._pocket_candles_to_dataframe(
-                candles,
-                pair,
-                log_errors,
-            )
-
-            if (
-                df is not None
-                and len(df) > CANDLE_LIMIT
-            ):
-                df = df.tail(
-                    CANDLE_LIMIT
-                ).reset_index(
-                    drop=True
-                )
-
-            return df
-
-        except Exception as exc:
-
-            if log_errors:
-                print(
-                    f"❌ OTC {pair}: "
-                    f"{type(exc).__name__}: "
-                    f"{exc}"
-                )
-
-            return None
-
-    # ============================================================
-    # POCKET CANDLES -> DATAFRAME
-    # ============================================================
-
-    def _pocket_candles_to_dataframe(
-        self,
-        candles: Any,
-        pair: str,
-        log_errors: bool = True,
-    ) -> Optional[pd.DataFrame]:
-        """
-        Нормализует различные форматы свечей
-        pocketoptionapi.
-        """
-
-        try:
-            rows: list[dict[str, Any]] = []
-
-            if isinstance(
-                candles,
-                pd.DataFrame,
-            ):
-                df = candles.copy()
-
-            else:
-                if isinstance(
-                    candles,
-                    dict,
-                ):
-                    if "data" in candles:
-                        candles = candles[
-                            "data"
-                        ]
-
-                    elif "candles" in candles:
-                        candles = candles[
-                            "candles"
-                        ]
-
-                for candle in candles:
-
-                    if isinstance(
-                        candle,
-                        dict,
-                    ):
-                        timestamp = (
-                            candle.get(
-                                "timestamp",
-                                candle.get(
-                                    "time",
-                                    candle.get(
-                                        "from"
-                                    ),
-                                ),
-                            )
-                        )
-
-                        open_price = (
-                            candle.get(
-                                "open"
-                            )
-                        )
-
-                        high_price = (
-                            candle.get(
-                                "high"
-                            )
-                        )
-
-                        low_price = (
-                            candle.get(
-                                "low"
-                            )
-                        )
-
-                        close_price = (
-                            candle.get(
-                                "close"
-                            )
-                        )
-
-                    else:
-                        timestamp = getattr(
-                            candle,
-                            "timestamp",
-                            getattr(
-                                candle,
-                                "time",
-                                getattr(
-                                    candle,
-                                    "from",
-                                    None,
-                                ),
-                            ),
-                        )
-
-                        open_price = getattr(
-                            candle,
-                            "open",
-                            None,
-                        )
-
-                        high_price = getattr(
-                            candle,
-                            "high",
-                            None,
-                        )
-
-                        low_price = getattr(
-                            candle,
-                            "low",
-                            None,
-                        )
-
-                        close_price = getattr(
-                            candle,
-                            "close",
-                            None,
-                        )
-
-                    if (
-                        timestamp is None
-                        or open_price is None
-                        or high_price is None
-                        or low_price is None
-                        or close_price is None
-                    ):
-                        continue
-
-                    rows.append(
-                        {
-                            "datetime": timestamp,
-                            "open": open_price,
-                            "high": high_price,
-                            "low": low_price,
-                            "close": close_price,
-                        }
-                    )
-
-                if not rows:
-                    if log_errors:
-                        print(
-                            f"❌ OTC {pair}: "
-                            "не удалось распознать "
-                            "формат свечей."
-                        )
-
-                    return None
-
-                df = pd.DataFrame(
-                    rows
-                )
-
-            if df.empty:
-                return None
-
-            # ----------------------------------------------------
-            # Возможные имена времени.
-            # ----------------------------------------------------
-
-            if "datetime" not in df.columns:
-
-                for candidate in (
-                    "timestamp",
-                    "time",
-                    "from",
-                    "date",
-                ):
-                    if (
-                        candidate
-                        in df.columns
-                    ):
-                        df = df.rename(
-                            columns={
-                                candidate:
-                                    "datetime"
-                            }
-                        )
-
-                        break
-
-            # ----------------------------------------------------
-            # Иногда библиотека отдаёт Unix timestamp.
-            # ----------------------------------------------------
-
-            if "datetime" not in df.columns:
-                if log_errors:
-                    print(
-                        f"❌ OTC {pair}: "
-                        "нет времени свечи."
-                    )
-
-                return None
-
-            numeric_columns = [
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-            ]
-
-            for column in numeric_columns:
-
-                if column in df.columns:
-                    df[column] = pd.to_numeric(
-                        df[column],
-                        errors="coerce",
-                    )
-
-            timestamp_series = df[
-                "datetime"
-            ]
-
-            # Если timestamp числовой —
-            # определяем секунды/миллисекунды.
-            if pd.api.types.is_numeric_dtype(
-                timestamp_series
-            ):
-                maximum = (
-                    pd.to_numeric(
-                        timestamp_series,
-                        errors="coerce",
-                    ).max()
-                )
-
-                unit = (
-                    "ms"
-                    if maximum > 10_000_000_000
-                    else "s"
-                )
-
-                df["datetime"] = (
-                    pd.to_datetime(
-                        timestamp_series,
-                        unit=unit,
-                        utc=True,
-                        errors="coerce",
-                    )
-                )
-
-            else:
-                df["datetime"] = (
-                    pd.to_datetime(
-                        timestamp_series,
-                        utc=True,
-                        errors="coerce",
-                    )
-                )
-
-            required = [
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-
-            missing = [
-                column
-                for column in required
-                if column not in df.columns
-            ]
-
-            if missing:
-                if log_errors:
-                    print(
-                        f"❌ OTC {pair}: "
-                        "отсутствуют поля "
-                        + ", ".join(
-                            missing
-                        )
-                    )
-
-                return None
-
-            df = df.dropna(
-                subset=[
-                    "datetime",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                ]
-            )
-
-            df = df.sort_values(
-                "datetime"
-            ).drop_duplicates(
-                subset=["datetime"],
-                keep="last",
-            ).reset_index(
-                drop=True
-            )
-
-            if df.empty:
-                return None
-
-            return df
-
-        except Exception as exc:
-
-            if log_errors:
-                print(
-                    f"❌ OTC {pair}: "
-                    "ошибка обработки свечей: "
-                    f"{type(exc).__name__}: "
-                    f"{exc}"
-                )
-
-            return None
-
-    # ============================================================
-    # GENERIC CANDLES -> DATAFRAME
-    # ============================================================
-
+    @staticmethod
     def _candles_to_dataframe(
-        self,
-        values: Any,
-        pair: str,
-        log_errors: bool = True,
+        candles: Any,
     ) -> Optional[pd.DataFrame]:
-
+        """
+        Нормализация Twelve Data.
+        """
+        if candles is None:
+            return None
         try:
-            df = pd.DataFrame(
-                values
-            )
-
-            if "datetime" not in df.columns:
-
-                if log_errors:
-                    print(
-                        f"❌ {pair}: "
-                        "нет datetime"
-                    )
-
+            df = pd.DataFrame(candles)
+        except Exception:
+            return None
+        if df.empty:
+            return None
+        # Twelve Data:
+        # datetime, open, high, low, close, volume
+        rename_map = {
+            "datetime": "timestamp",
+            "date": "timestamp",
+            "time": "timestamp",
+        }
+        df = df.rename(
+            columns=rename_map
+        )
+        required = [
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+        for column in required:
+            if column not in df.columns:
                 return None
-
-            df["datetime"] = pd.to_datetime(
-                df["datetime"],
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            )
+        if "timestamp" not in df.columns:
+            return None
+        try:
+            df["timestamp"] = pd.to_datetime(
+                df["timestamp"],
                 utc=True,
                 errors="coerce",
             )
-
-            numeric_columns = [
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-            ]
-
-            for column in numeric_columns:
-
-                if column in df.columns:
-                    df[column] = pd.to_numeric(
-                        df[column],
-                        errors="coerce",
-                    )
-
-            required = [
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-
-            missing = [
-                column
-                for column in required
-                if column not in df.columns
-            ]
-
-            if missing:
-
-                if log_errors:
-                    print(
-                        f"❌ {pair}: "
-                        "отсутствуют поля "
-                        + ", ".join(
-                            missing
-                        )
-                    )
-
-                return None
-
-            df = df.dropna(
-                subset=[
-                    "datetime",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                ]
-            )
-
-            df = df.sort_values(
-                "datetime"
-            ).drop_duplicates(
-                subset=["datetime"],
-                keep="last",
-            ).reset_index(
-                drop=True
-            )
-
-            if df.empty:
-
-                if log_errors:
-                    print(
-                        f"❌ {pair}: "
-                        "после очистки DataFrame "
-                        "пуст."
-                    )
-
-                return None
-
-            return df
-
-        except Exception as exc:
-
-            if log_errors:
-                print(
-                    f"❌ {pair}: "
-                    "ошибка обработки DataFrame: "
-                    f"{type(exc).__name__}: "
-                    f"{exc}"
-                )
-
+        except Exception:
             return None
-
+        df = df.dropna(
+            subset=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+        )
+        if df.empty:
+            return None
+        df = df.sort_values(
+            "timestamp"
+        )
+        df = df.drop_duplicates(
+            subset=["timestamp"],
+            keep="last",
+        )
+        df = df.reset_index(
+            drop=True
+        )
+        return df
+    @staticmethod
+    def _pocket_candles_to_dataframe(
+        candles: Any,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Нормализует разные форматы свечей Pocket Option.
+        """
+        if candles is None:
+            return None
+        # DataFrame уже готов.
+        if isinstance(candles, pd.DataFrame):
+            df = candles.copy()
+        elif isinstance(candles, dict):
+            # Иногда API возвращает:
+            # {"candles": [...]}
+            for key in (
+                "candles",
+                "data",
+                "history",
+                "values",
+            ):
+                if key in candles:
+                    nested = candles[key]
+                    if isinstance(
+                        nested,
+                        (list, tuple),
+                    ):
+                        candles = nested
+                        break
+            if isinstance(candles, dict):
+                try:
+                    df = pd.DataFrame(
+                        [candles]
+                    )
+                except Exception:
+                    return None
+            else:
+                try:
+                    df = pd.DataFrame(
+                        candles
+                    )
+                except Exception:
+                    return None
+        elif isinstance(
+            candles,
+            (list, tuple),
+        ):
+            try:
+                rows: list[dict[str, Any]] = []
+                for item in candles:
+                    if isinstance(item, dict):
+                        rows.append(item)
+                    elif hasattr(
+                        item,
+                        "__dict__",
+                    ):
+                        rows.append(
+                            dict(item.__dict__)
+                        )
+                    else:
+                        rows.append(
+                            item
+                        )
+                df = pd.DataFrame(rows)
+            except Exception:
+                return None
+        else:
+            # Один объект Candle.
+            if hasattr(
+                candles,
+                "__dict__",
+            ):
+                try:
+                    df = pd.DataFrame(
+                        [dict(candles.__dict__)]
+                    )
+                except Exception:
+                    return None
+            else:
+                return None
+        if df.empty:
+            return None
+        # Унификация названий.
+        normalized_columns = {}
+        for column in df.columns:
+            clean = str(column).strip().lower()
+            normalized_columns[column] = clean
+        df = df.rename(
+            columns=normalized_columns
+        )
+        aliases = {
+            "time": "timestamp",
+            "ts": "timestamp",
+            "at": "timestamp",
+            "datetime": "timestamp",
+            "date": "timestamp",
+            "open_price": "open",
+            "openprice": "open",
+            "high_price": "high",
+            "highprice": "high",
+            "low_price": "low",
+            "lowprice": "low",
+            "close_price": "close",
+            "closeprice": "close",
+        }
+        df = df.rename(
+            columns=aliases
+        )
+        required = [
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+        # Иногда timestamp находится под "id".
+        if "timestamp" not in df.columns:
+            for candidate in (
+                "timestamp",
+                "time",
+                "ts",
+                "date",
+            ):
+                if candidate in df.columns:
+                    df["timestamp"] = df[
+                        candidate
+                    ]
+                    break
+        for column in required:
+            if column not in df.columns:
+                return None
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            )
+        if "timestamp" not in df.columns:
+            return None
+        # Timestamp может быть:
+        # Unix seconds
+        # Unix milliseconds
+        # datetime string
+        raw_timestamp = df[
+            "timestamp"
+        ]
+        numeric_timestamp = pd.to_numeric(
+            raw_timestamp,
+            errors="coerce",
+        )
+        if (
+            numeric_timestamp.notna().any()
+        ):
+            median_value = float(
+                numeric_timestamp.dropna().median()
+            )
+            if median_value > 100_000_000_000:
+                # milliseconds
+                df["timestamp"] = pd.to_datetime(
+                    numeric_timestamp,
+                    unit="ms",
+                    utc=True,
+                    errors="coerce",
+                )
+            else:
+                # seconds
+                df["timestamp"] = pd.to_datetime(
+                    numeric_timestamp,
+                    unit="s",
+                    utc=True,
+                    errors="coerce",
+                )
+        else:
+            df["timestamp"] = pd.to_datetime(
+                raw_timestamp,
+                utc=True,
+                errors="coerce",
+            )
+        df = df.dropna(
+            subset=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+        )
+        if df.empty:
+            return None
+        df = df.sort_values(
+            "timestamp"
+        )
+        df = df.drop_duplicates(
+            subset=["timestamp"],
+            keep="last",
+        )
+        df = df.reset_index(
+            drop=True
+        )
+        return df
     # ============================================================
-    # INTERVAL
+    # TIMEFRAME
     # ============================================================
-
     @staticmethod
     def _interval_to_seconds(
-        interval: str,
+        interval: Any,
     ) -> int:
-        """
-        Преобразует:
-
-            1min
-            5min
-            15min
-            1h
-
-        в секунды.
-        """
-
-        if not interval:
-            return 60
-
+        if isinstance(
+            interval,
+            int,
+        ):
+            return interval
+        if isinstance(
+            interval,
+            float,
+        ):
+            return int(interval)
         value = str(
             interval
         ).strip().lower()
-
-        match = re.fullmatch(
-            r"(\d+)\s*(s|sec|secs|m|min|mins|h|hour|hours|d|day|days)",
-            value,
-        )
-
-        if not match:
+        mapping = {
+            "1s": 1,
+            "5s": 5,
+            "15s": 15,
+            "30s": 30,
+            "1m": 60,
+            "5m": 300,
+            "15m": 900,
+            "30m": 1800,
+            "1h": 3600,
+        }
+        if value in mapping:
+            return mapping[value]
+        try:
+            return int(value)
+        except ValueError:
             return 60
-
-        amount = int(
-            match.group(1)
-        )
-
-        unit = match.group(2)
-
-        if unit in {
-            "s",
-            "sec",
-            "secs",
-        }:
-            return amount
-
-        if unit in {
-            "m",
-            "min",
-            "mins",
-        }:
-            return amount * 60
-
-        if unit in {
-            "h",
-            "hour",
-            "hours",
-        }:
-            return amount * 3600
-
-        if unit in {
-            "d",
-            "day",
-            "days",
-        }:
-            return amount * 86400
-
-        return 60
-
-
 # ================================================================
 # GLOBAL CLIENT
 # ================================================================
-
 market_client = MarketClient()
