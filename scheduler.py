@@ -23,6 +23,10 @@ from signal_engine import SignalEngine, Signal
 SIGNAL_INTERVAL_MINUTES = 5
 
 
+# Включать OTC-пары.
+ENABLE_OTC = True
+
+
 # Московское время.
 try:
     from zoneinfo import ZoneInfo
@@ -30,6 +34,55 @@ try:
     MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 except Exception:
     MOSCOW_TZ = None
+
+
+# ============================================================
+# FALLBACK OTC PAIRS
+# ============================================================
+#
+# Эти пары используются только если market.py не смог
+# вернуть динамический список активов.
+#
+# Для запроса в market.py сохраняется формат без "/" —
+# это наиболее распространённый формат Pocket Option:
+#
+# EURUSD_otc
+# GBPUSD_otc
+# USDJPY_otc
+#
+# Если market.py возвращает собственный список OTC,
+# используются именно его названия.
+# ============================================================
+
+OTC_PAIRS = [
+    "EURUSD_otc",
+    "GBPUSD_otc",
+    "USDJPY_otc",
+    "USDCHF_otc",
+    "AUDUSD_otc",
+    "USDCAD_otc",
+    "NZDUSD_otc",
+    "EURGBP_otc",
+    "EURJPY_otc",
+    "GBPJPY_otc",
+    "AUDCAD_otc",
+    "AUDCHF_otc",
+    "AUDJPY_otc",
+    "CADCHF_otc",
+    "CADJPY_otc",
+    "CHFJPY_otc",
+    "EURAUD_otc",
+    "EURCAD_otc",
+    "EURCHF_otc",
+    "EURNZD_otc",
+    "GBPAUD_otc",
+    "GBPCAD_otc",
+    "GBPCHF_otc",
+    "GBPNZD_otc",
+    "NZDCAD_otc",
+    "NZDCHF_otc",
+    "NZDJPY_otc",
+]
 
 
 class SignalScheduler:
@@ -42,6 +95,8 @@ class SignalScheduler:
     - ручной запрос сигнала;
     - анализ конкретной пары;
     - анализ любой доступной пары;
+    - обычные пары;
+    - OTC-пары;
     - фильтр QUALITY;
     - фильтр PROBABILITY;
     - выбор лучшего сигнала;
@@ -63,12 +118,20 @@ class SignalScheduler:
         self.scan_lock = asyncio.Lock()
 
         print("[SCHEDULER] Инициализирован")
+
         print(
-            f"[SCHEDULER] MIN_QUALITY = {MIN_QUALITY}"
+            f"[SCHEDULER] MIN_QUALITY = "
+            f"{MIN_QUALITY}"
         )
+
         print(
             f"[SCHEDULER] MIN_PROBABILITY = "
             f"{MIN_PROBABILITY}%"
+        )
+
+        print(
+            f"[SCHEDULER] OTC = "
+            f"{'ON' if ENABLE_OTC else 'OFF'}"
         )
 
     # ============================================================
@@ -131,6 +194,132 @@ class SignalScheduler:
         )
 
     # ============================================================
+    # PAIR HELPERS
+    # ============================================================
+
+    @staticmethod
+    def is_otc_pair(
+        pair: str,
+    ) -> bool:
+        """
+        Определяет, является ли актив OTC.
+
+        Поддерживает варианты:
+
+        EURUSD_otc
+        EUR/USD_otc
+        EUR/USD OTC
+        EURUSD-OTC
+        EURUSD OTC
+        """
+
+        if not pair:
+            return False
+
+        normalized = (
+            str(pair)
+            .strip()
+            .upper()
+            .replace("-", "_")
+        )
+
+        return (
+            "_OTC" in normalized
+            or " OTC" in normalized
+            or normalized.endswith("OTC")
+        )
+
+    @staticmethod
+    def normalize_pair(
+        pair: str,
+    ) -> str:
+        """
+        Нормализует имя пары, но НЕ меняет OTC
+        в обычную пару.
+
+        Важно:
+        для market.py желательно передавать
+        исходное имя актива.
+        """
+
+        if not pair:
+            return ""
+
+        pair = str(
+            pair
+        ).strip()
+
+        return pair.upper()
+
+    @staticmethod
+    def display_pair(
+        pair: str,
+    ) -> str:
+        """
+        Красивое отображение пары в Telegram.
+
+        Примеры:
+
+        EURUSD      -> EUR/USD
+        EURUSD_otc  -> EUR/USD OTC
+        EUR/USD     -> EUR/USD
+        EUR/USD OTC -> EUR/USD OTC
+        """
+
+        if not pair:
+            return "UNKNOWN"
+
+        raw = str(
+            pair
+        ).strip().upper()
+
+        # --------------------------------------------------------
+        # OTC
+        # --------------------------------------------------------
+
+        is_otc = SignalScheduler.is_otc_pair(
+            raw
+        )
+
+        cleaned = (
+            raw
+            .replace("-OTC", "")
+            .replace("_OTC", "")
+            .replace(" OTC", "")
+            .replace("OTC", "")
+            .strip()
+        )
+
+        # --------------------------------------------------------
+        # Уже есть /
+        # --------------------------------------------------------
+
+        if "/" in cleaned:
+
+            result = cleaned
+
+        # --------------------------------------------------------
+        # EURUSD -> EUR/USD
+        # --------------------------------------------------------
+
+        elif len(cleaned) >= 6:
+
+            result = (
+                cleaned[:3]
+                + "/"
+                + cleaned[3:6]
+            )
+
+        else:
+
+            result = cleaned
+
+        if is_otc:
+            result += " OTC"
+
+        return result
+
+    # ============================================================
     # AVAILABLE PAIRS
     # ============================================================
 
@@ -138,18 +327,26 @@ class SignalScheduler:
         self,
     ) -> list[str]:
         """
-        Пытается получить динамический список пар
-        из market.py.
+        Получает список доступных пар.
 
-        Если market.py не предоставляет список,
-        используется PAIRS из config.py.
+        ВАЖНО:
 
-        OTC намеренно исключаются, поскольку обычные
-        рыночные котировки Twelve Data не являются
-        OTC-котировками Pocket Option.
+        OTC теперь НЕ исключаются.
+
+        Если market.py возвращает OTC,
+        они попадут в список.
+
+        Если market.py не возвращает список,
+        используются PAIRS + OTC_PAIRS.
+
+        Исходное имя OTC сохраняется,
+        чтобы market.py получил правильный символ.
         """
 
+        dynamic_pairs: list[str] = []
+
         try:
+
             method = getattr(
                 market_client,
                 "get_available_pairs",
@@ -165,36 +362,108 @@ class SignalScheduler:
 
                 if result:
 
-                    cleaned = []
-
                     for pair in result:
 
                         if not pair:
                             continue
 
-                        pair = str(
-                            pair
-                        ).strip().upper()
-
-                        # OTC не используем.
-                        if "OTC" in pair:
-                            continue
-
-                        # Нужен формат EUR/USD.
-                        if "/" not in pair:
-                            continue
-
-                        if pair not in cleaned:
-                            cleaned.append(pair)
-
-                    if cleaned:
-
-                        print(
-                            "[PAIRS] Динамически найдено: "
-                            f"{len(cleaned)}"
+                        normalized = (
+                            self.normalize_pair(
+                                pair
+                            )
                         )
 
-                        return cleaned
+                        if not normalized:
+                            continue
+
+                        is_otc = (
+                            self.is_otc_pair(
+                                normalized
+                            )
+                        )
+
+                        # ----------------------------------------
+                        # OTC
+                        # ----------------------------------------
+
+                        if is_otc:
+
+                            if not ENABLE_OTC:
+                                continue
+
+                            if normalized not in dynamic_pairs:
+
+                                dynamic_pairs.append(
+                                    normalized
+                                )
+
+                            continue
+
+                        # ----------------------------------------
+                        # ОБЫЧНЫЕ ПАРЫ
+                        # ----------------------------------------
+
+                        # Обычная forex-пара должна иметь
+                        # либо slash, либо 6 символов.
+                        if (
+                            "/" not in normalized
+                            and len(normalized) < 6
+                        ):
+                            continue
+
+                        if normalized not in dynamic_pairs:
+
+                            dynamic_pairs.append(
+                                normalized
+                            )
+
+                    if dynamic_pairs:
+
+                        otc_count = sum(
+                            1
+                            for pair in dynamic_pairs
+                            if self.is_otc_pair(pair)
+                        )
+
+                        regular_count = (
+                            len(dynamic_pairs)
+                            - otc_count
+                        )
+
+                        print(
+                            "[PAIRS] "
+                            f"Динамически найдено: "
+                            f"{len(dynamic_pairs)}"
+                        )
+
+                        print(
+                            "[PAIRS] Обычных: "
+                            f"{regular_count}"
+                        )
+
+                        print(
+                            "[PAIRS] OTC: "
+                            f"{otc_count}"
+                        )
+
+                        if otc_count > 0:
+
+                            print(
+                                "[PAIRS] OTC активы:"
+                            )
+
+                            for otc_pair in dynamic_pairs:
+
+                                if self.is_otc_pair(
+                                    otc_pair
+                                ):
+
+                                    print(
+                                        "  - "
+                                        f"{otc_pair}"
+                                    )
+
+                        return dynamic_pairs
 
         except Exception as exc:
 
@@ -203,30 +472,96 @@ class SignalScheduler:
                 f"получения: {exc}"
             )
 
-        # --------------------------------------------------------
+        # ========================================================
         # FALLBACK
-        # --------------------------------------------------------
+        # ========================================================
 
-        fallback = []
+        fallback: list[str] = []
+
+        # --------------------------------------------------------
+        # Обычные пары из config.py
+        # --------------------------------------------------------
 
         for pair in PAIRS:
 
-            pair = str(
-                pair
-            ).strip().upper()
+            normalized = (
+                self.normalize_pair(
+                    pair
+                )
+            )
 
-            if "/" not in pair:
+            if not normalized:
                 continue
 
-            if "OTC" in pair:
-                continue
+            if self.is_otc_pair(
+                normalized
+            ):
 
-            if pair not in fallback:
-                fallback.append(pair)
+                if not ENABLE_OTC:
+                    continue
+
+            else:
+
+                if (
+                    "/" not in normalized
+                    and len(normalized) < 6
+                ):
+                    continue
+
+            if normalized not in fallback:
+
+                fallback.append(
+                    normalized
+                )
+
+        # --------------------------------------------------------
+        # Добавляем OTC
+        # --------------------------------------------------------
+
+        if ENABLE_OTC:
+
+            for pair in OTC_PAIRS:
+
+                normalized = (
+                    self.normalize_pair(
+                        pair
+                    )
+                )
+
+                if (
+                    normalized
+                    and normalized not in fallback
+                ):
+
+                    fallback.append(
+                        normalized
+                    )
+
+        otc_count = sum(
+            1
+            for pair in fallback
+            if self.is_otc_pair(pair)
+        )
+
+        regular_count = (
+            len(fallback)
+            - otc_count
+        )
 
         print(
-            "[PAIRS] Использую PAIRS из config.py: "
-            f"{len(fallback)}"
+            "[PAIRS] Использую fallback:"
+        )
+
+        print(
+            f"[PAIRS] Всего: {len(fallback)}"
+        )
+
+        print(
+            f"[PAIRS] Обычных: {regular_count}"
+        )
+
+        print(
+            f"[PAIRS] OTC: {otc_count}"
         )
 
         return fallback
@@ -245,7 +580,14 @@ class SignalScheduler:
         Поддерживает разные названия методов market.py,
         чтобы scheduler оставался совместимым
         с разными версиями MarketClient.
+
+        OTC передаётся в market.py именно в том формате,
+        в котором он пришёл из списка доступных активов.
         """
+
+        pair = self.normalize_pair(
+            pair
+        )
 
         method_names = (
             "get_candles",
@@ -271,9 +613,13 @@ class SignalScheduler:
 
             try:
 
-                result = method(pair)
+                result = method(
+                    pair
+                )
 
-                if asyncio.iscoroutine(result):
+                if asyncio.iscoroutine(
+                    result
+                ):
                     result = await result
 
                 if result is not None:
@@ -291,14 +637,21 @@ class SignalScheduler:
                         symbol=pair
                     )
 
-                    if asyncio.iscoroutine(result):
+                    if asyncio.iscoroutine(
+                        result
+                    ):
                         result = await result
 
                     if result is not None:
                         return result
 
-                except Exception:
-                    pass
+                except Exception as exc:
+
+                    print(
+                        f"[MARKET] {pair}: "
+                        f"{method_name} "
+                        f"symbol= ошибка: {exc}"
+                    )
 
             except Exception as exc:
 
@@ -334,11 +687,25 @@ class SignalScheduler:
         PROBABILITY >= MIN_PROBABILITY
         """
 
-        pair = str(
+        pair = self.normalize_pair(
             pair
-        ).strip().upper()
+        )
+
+        display_name = self.display_pair(
+            pair
+        )
+
+        is_otc = self.is_otc_pair(
+            pair
+        )
 
         try:
+
+            print(
+                "[ANALYZE] "
+                f"{display_name}"
+                f"{' [OTC]' if is_otc else ''}"
+            )
 
             candles = await self.get_candles(
                 pair
@@ -347,23 +714,26 @@ class SignalScheduler:
             if candles is None:
 
                 print(
-                    f"[ANALYZE] {pair}: "
+                    f"[ANALYZE] {display_name}: "
                     "нет данных"
                 )
 
                 return None
 
             try:
+
                 candle_count = len(
                     candles
                 )
+
             except Exception:
+
                 candle_count = 0
 
             if candle_count < 50:
 
                 print(
-                    f"[ANALYZE] {pair}: "
+                    f"[ANALYZE] {display_name}: "
                     f"мало свечей: "
                     f"{candle_count}/50"
                 )
@@ -398,7 +768,9 @@ class SignalScheduler:
                         candles,
                     )
 
-                    if asyncio.iscoroutine(signal):
+                    if asyncio.iscoroutine(
+                        signal
+                    ):
                         signal = await signal
 
                     break
@@ -425,7 +797,7 @@ class SignalScheduler:
                 except Exception as exc:
 
                     print(
-                        f"[ENGINE] {pair}: "
+                        f"[ENGINE] {display_name}: "
                         f"{exc}"
                     )
 
@@ -434,7 +806,7 @@ class SignalScheduler:
             if signal is None:
 
                 print(
-                    f"[ANALYZE] {pair}: "
+                    f"[ANALYZE] {display_name}: "
                     "сигнал не сформирован"
                 )
 
@@ -481,7 +853,7 @@ class SignalScheduler:
                 probability = 0.0
 
             print(
-                f"[ANALYZE] {pair}: "
+                f"[ANALYZE] {display_name}: "
                 f"Q={quality:.1f} "
                 f"P={probability:.1f}%"
             )
@@ -495,7 +867,7 @@ class SignalScheduler:
             ):
 
                 print(
-                    f"[REJECT] {pair}: "
+                    f"[REJECT] {display_name}: "
                     f"quality {quality:.1f} < "
                     f"{MIN_QUALITY}"
                 )
@@ -511,7 +883,7 @@ class SignalScheduler:
             ):
 
                 print(
-                    f"[REJECT] {pair}: "
+                    f"[REJECT] {display_name}: "
                     f"probability "
                     f"{probability:.1f}% < "
                     f"{MIN_PROBABILITY}%"
@@ -544,7 +916,7 @@ class SignalScheduler:
             }:
 
                 print(
-                    f"[REJECT] {pair}: "
+                    f"[REJECT] {display_name}: "
                     f"неизвестное направление "
                     f"{direction}"
                 )
@@ -556,7 +928,7 @@ class SignalScheduler:
         except Exception as exc:
 
             print(
-                f"[ANALYZE] {pair}: "
+                f"[ANALYZE] {display_name}: "
                 f"ошибка {exc}"
             )
 
@@ -699,7 +1071,7 @@ class SignalScheduler:
 
         Если pair отсутствует:
             анализируются все доступные пары,
-            после чего выбирается лучшая.
+            включая OTC.
         """
 
         async with self.scan_lock:
@@ -710,12 +1082,13 @@ class SignalScheduler:
 
             if pair:
 
-                pair = str(
+                pair = self.normalize_pair(
                     pair
-                ).strip().upper()
+                )
 
                 print(
-                    f"[MANUAL] Проверяю {pair}"
+                    "[MANUAL] Проверяю "
+                    f"{self.display_pair(pair)}"
                 )
 
                 return await self.analyze_pair(
@@ -727,7 +1100,8 @@ class SignalScheduler:
             # ----------------------------------------------------
 
             print(
-                "[MANUAL] Проверяю все доступные пары"
+                "[MANUAL] Проверяю все "
+                "доступные пары, включая OTC"
             )
 
             pairs = await self.get_available_pairs()
@@ -764,7 +1138,7 @@ class SignalScheduler:
 
             print(
                 "[MANUAL] Лучший сигнал: "
-                f"{self.get_value(best, 'pair', '?')}"
+                f"{self.display_pair(self.get_value(best, 'pair', '?'))}"
             )
 
             return best
@@ -780,7 +1154,9 @@ class SignalScheduler:
         """
         Один полный автоматический проход.
 
-        Анализируются все доступные пары.
+        Анализируются все доступные пары,
+        включая OTC.
+
         Из них выбирается лучший сигнал.
 
         Если сильного сигнала нет —
@@ -824,9 +1200,30 @@ class SignalScheduler:
 
                 return None
 
+            otc_count = sum(
+                1
+                for pair in pairs
+                if self.is_otc_pair(pair)
+            )
+
+            regular_count = (
+                len(pairs)
+                - otc_count
+            )
+
             print(
-                f"[SCAN] Проверяю "
+                "[SCAN] Проверяю "
                 f"{len(pairs)} пар"
+            )
+
+            print(
+                "[SCAN] Обычных: "
+                f"{regular_count}"
+            )
+
+            print(
+                "[SCAN] OTC: "
+                f"{otc_count}"
             )
 
             signals = []
@@ -1078,8 +1475,7 @@ class SignalScheduler:
         """
         Отправляет сигнал всем одобренным пользователям.
 
-        Важно:
-        автоматически отправляются только пользователям,
+        Автоматически отправляются только пользователям,
         которых возвращает db.get_approved_users().
         """
 
@@ -1167,28 +1563,16 @@ class SignalScheduler:
     ) -> str:
         """
         Формат Telegram-сообщения сигнала.
-
-        Пример:
-
-        🔴 PUT ↓
-
-        💱 USD/JPY
-
-        ⏰ ВХОД: 00:00 МСК
-        🎯 ЭКСПИРАЦИЯ: 00:05 МСК
-
-        📊 QUALITY: 90/100
-        📈 ШАНС: 87%
-
-        ✅ EMA тренд вниз
-        ✅ Импульс вниз
-        ✅ MACD подтверждает PUT
         """
 
-        pair = self.get_value(
+        raw_pair = self.get_value(
             signal,
             "pair",
             "UNKNOWN",
+        )
+
+        pair = self.display_pair(
+            raw_pair
         )
 
         direction = self.get_value(
@@ -1257,6 +1641,22 @@ class SignalScheduler:
             datetime,
         ):
 
+            # Если datetime пришёл без timezone,
+            # считаем его московским.
+            if entry_time.tzinfo is None:
+
+                entry_time = entry_time.replace(
+                    tzinfo=MOSCOW_TZ
+                    if MOSCOW_TZ is not None
+                    else None
+                )
+
+            elif MOSCOW_TZ is not None:
+
+                entry_time = entry_time.astimezone(
+                    MOSCOW_TZ
+                )
+
             entry_text = (
                 entry_time.strftime(
                     "%H:%M"
@@ -1280,6 +1680,20 @@ class SignalScheduler:
             expiry_time,
             datetime,
         ):
+
+            if expiry_time.tzinfo is None:
+
+                expiry_time = expiry_time.replace(
+                    tzinfo=MOSCOW_TZ
+                    if MOSCOW_TZ is not None
+                    else None
+                )
+
+            elif MOSCOW_TZ is not None:
+
+                expiry_time = expiry_time.astimezone(
+                    MOSCOW_TZ
+                )
 
             expiry_text = (
                 expiry_time.strftime(
@@ -1348,9 +1762,9 @@ class SignalScheduler:
                 if not confirmation:
                     continue
 
-                # Если движок уже добавил emoji,
-                # не добавляем второй.
-                if confirmation.startswith("✅"):
+                if confirmation.startswith(
+                    "✅"
+                ):
 
                     confirmation_lines.append(
                         confirmation
@@ -1370,19 +1784,20 @@ class SignalScheduler:
 
             if confirmation:
 
-                # Поддержка старого формата,
-                # когда подтверждения могли приходить
-                # одной строкой через запятую.
                 if "," in confirmation:
 
-                    for item in confirmation.split(","):
+                    for item in confirmation.split(
+                        ","
+                    ):
 
                         item = item.strip()
 
                         if not item:
                             continue
 
-                        if item.startswith("✅"):
+                        if item.startswith(
+                            "✅"
+                        ):
 
                             confirmation_lines.append(
                                 item
@@ -1396,7 +1811,9 @@ class SignalScheduler:
 
                 else:
 
-                    if confirmation.startswith("✅"):
+                    if confirmation.startswith(
+                        "✅"
+                    ):
 
                         confirmation_lines.append(
                             confirmation
@@ -1456,8 +1873,11 @@ class SignalScheduler:
         00:15
         ...
 
+        Проверяются как обычные пары,
+        так и OTC.
+
         Если сильного сигнала нет,
-        ничего пользователям не отправляется.
+        пользователям ничего не отправляется.
         """
 
         if bot is not None:
