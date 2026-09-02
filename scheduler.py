@@ -1,274 +1,446 @@
 from __future__ import annotations
+
 import asyncio
 import traceback
 from datetime import datetime, timezone
 from typing import Optional
+
 from config import (
     AUTO_SCAN_SECONDS,
     MIN_PROBABILITY,
-    PAIRS,
     TIMEZONE,
 )
 from database import db
 from market import market_client
 from signal_engine import Signal, SignalEngine
+
+
 class SignalScheduler:
     """
-    Планировщик автоматического и ручного поиска сигналов.
-    Диагностика каждой пары выводится в Render logs.
+    Автоматический и ручной поиск сигналов.
+
+    Список пар получается динамически.
     """
+
     def __init__(self):
         self.engine = SignalEngine(
             min_probability=MIN_PROBABILITY,
         )
+
         self._running = False
         self._lock = asyncio.Lock()
+
+        self._available_pairs: list[str] = []
+
     # ============================================================
     # TIME
     # ============================================================
+
     @staticmethod
-    def _to_moscow(dt: datetime) -> datetime:
+    def _to_moscow(
+        dt: datetime,
+    ) -> datetime:
+
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(TIMEZONE)
-    # ============================================================
-    # MARKET ANALYSIS
-    # ============================================================
-    async def _analyze_pair(
-        self,
-        pair: str,
-    ) -> Optional[Signal]:
-        """
-        Получает свечи и анализирует конкретную пару.
-        """
-        print("")
-        print(f"🔍 Проверка пары: {pair}")
-        try:
-            candles = await market_client.get_candles(
-                pair
+            dt = dt.replace(
+                tzinfo=timezone.utc
             )
-        except Exception as exc:
-            print(
-                f"❌ {pair}: ошибка получения свечей:"
-            )
-            print(
-                f"   {type(exc).__name__}: {exc}"
-            )
-            return None
-        if candles is None:
-            print(
-                f"❌ {pair}: MarketClient вернул None"
-            )
-            return None
-        try:
-            candle_count = len(candles)
-        except Exception:
-            candle_count = "unknown"
-        print(
-            f"📥 {pair}: получено свечей = "
-            f"{candle_count}"
+
+        return dt.astimezone(
+            TIMEZONE
         )
+
+    # ============================================================
+    # DISCOVER PAIRS
+    # ============================================================
+
+    async def refresh_pairs(
+        self,
+    ) -> list[str]:
+
+        print("")
+        print("=" * 70)
+        print("🌐 REFRESHING AVAILABLE POCKET OPTION PAIRS")
+        print("=" * 70)
+
         try:
-            signal = self.engine.analyze(
-                pair=pair,
-                candles=candles,
+            pairs = await (
+                market_client.get_available_pairs()
             )
+
         except Exception as exc:
-            print("")
             print(
-                f"💥 {pair}: ошибка SignalEngine"
+                "❌ Ошибка получения списка пар:"
             )
             print(
                 f"   {type(exc).__name__}: {exc}"
             )
             traceback.print_exc()
+
+            return self._available_pairs.copy()
+
+        if pairs:
+            self._available_pairs = list(
+                dict.fromkeys(pairs)
+            )
+
+        print("")
+        print(
+            f"📋 AVAILABLE PAIRS: "
+            f"{len(self._available_pairs)}"
+        )
+
+        if self._available_pairs:
+            print(
+                "   "
+                + ", ".join(
+                    self._available_pairs
+                )
+            )
+
+        print("=" * 70)
+
+        return self._available_pairs.copy()
+
+    # ============================================================
+    # ANALYZE ONE
+    # ============================================================
+
+    async def _analyze_pair(
+        self,
+        pair: str,
+    ) -> Optional[Signal]:
+
+        print("")
+        print(
+            f"🔍 Проверка пары: {pair}"
+        )
+
+        try:
+            candles = await (
+                market_client.get_candles(
+                    pair
+                )
+            )
+
+        except Exception as exc:
+            print(
+                f"❌ {pair}: "
+                f"ошибка получения свечей"
+            )
+            print(
+                f"   {type(exc).__name__}: "
+                f"{exc}"
+            )
+
             return None
+
+        if candles is None:
+            print(
+                f"⚪ {pair}: "
+                "нет доступных свечей"
+            )
+
+            return None
+
+        print(
+            f"📥 {pair}: "
+            f"{len(candles)} candles"
+        )
+
+        try:
+            signal = self.engine.analyze(
+                pair=pair,
+                candles=candles,
+            )
+
+        except Exception as exc:
+            print(
+                f"💥 {pair}: "
+                "SignalEngine exception"
+            )
+
+            print(
+                f"   {type(exc).__name__}: "
+                f"{exc}"
+            )
+
+            traceback.print_exc()
+
+            return None
+
         if signal is None:
             print(
-                f"⚪ {pair}: сильного сигнала нет"
+                f"⚪ {pair}: "
+                "NO VALID SIGNAL"
             )
+
             return None
+
         print(
-            f"🟢 {pair}: сигнал найден — "
-            f"{signal.direction}"
+            f"🟢 {pair}: "
+            f"{signal.direction} | "
+            f"Q={signal.quality:.1f} | "
+            f"P={signal.probability:.1f}%"
         )
-        print(
-            f"   Quality: {signal.quality:.1f}"
-        )
-        print(
-            f"   Chance: {signal.probability:.1f}%"
-        )
+
         return signal
+
     # ============================================================
     # FIND BEST SIGNAL
     # ============================================================
+
     async def find_best_signal(
         self,
         pair: Optional[str] = None,
     ) -> Optional[Signal]:
-        """
-        Если pair задан:
-            анализируется только указанная пара.
-        Если pair=None:
-            анализируются все PAIRS и выбирается лучший сигнал.
-        """
+
         async with self._lock:
+
             # ----------------------------------------------------
             # SPECIFIC PAIR
             # ----------------------------------------------------
+
             if pair is not None:
-                pair = pair.strip()
+
+                pair = pair.strip().upper()
+
                 print("")
-                print("#" * 70)
+                print(
+                    "#" * 70
+                )
                 print(
                     f"🎯 MANUAL ANALYSIS: {pair}"
                 )
-                print("#" * 70)
-                signal = await self._analyze_pair(
-                    pair
-                )
-                print("")
                 print(
-                    f"🏁 Результат {pair}: "
-                    f"{'SIGNAL' if signal else 'NO SIGNAL'}"
+                    "#" * 70
                 )
+
+                signal = await (
+                    self._analyze_pair(
+                        pair
+                    )
+                )
+
+                if signal is None:
+                    print(
+                        f"⚪ {pair}: "
+                        "сильного сигнала нет."
+                    )
+
                 return signal
+
             # ----------------------------------------------------
-            # ALL PAIRS
+            # DYNAMIC PAIR DISCOVERY
             # ----------------------------------------------------
+
+            pairs = await (
+                self.refresh_pairs()
+            )
+
+            if not pairs:
+                print(
+                    "❌ Нет доступных пар."
+                )
+
+                return None
+
             print("")
-            print("#" * 70)
-            print("🔀 ANALYZING ALL PAIRS")
             print(
-                f"📋 Pairs: {', '.join(PAIRS)}"
+                "#" * 70
+            )
+            print(
+                "🔀 ANALYZING ALL AVAILABLE PAIRS"
+            )
+            print(
+                f"📋 Количество: {len(pairs)}"
             )
             print(
                 f"📈 Minimum chance: "
                 f"{MIN_PROBABILITY}%"
             )
             print(
-                f"📊 Minimum quality: "
-                f"{self.engine.min_quality}"
+                "#" * 70
             )
-            print("#" * 70)
-            if not PAIRS:
-                print(
-                    "❌ PAIRS пустой"
-                )
-                return None
-            tasks = [
-                self._analyze_pair(pair)
-                for pair in PAIRS
-            ]
+
+            # ----------------------------------------------------
+            # CONCURRENT ANALYSIS
+            # ----------------------------------------------------
+
+            semaphore = asyncio.Semaphore(
+                5
+            )
+
+            async def analyze_limited(
+                current_pair: str,
+            ):
+                async with semaphore:
+                    return await (
+                        self._analyze_pair(
+                            current_pair
+                        )
+                    )
+
             results = await asyncio.gather(
-                *tasks,
+                *[
+                    analyze_limited(
+                        current_pair
+                    )
+                    for current_pair in pairs
+                ],
                 return_exceptions=True,
             )
+
             valid_signals: list[Signal] = []
+
             print("")
-            print("-" * 70)
-            print("📋 ANALYSIS SUMMARY")
-            print("-" * 70)
-            for pair, result in zip(
-                PAIRS,
+            print(
+                "-" * 70
+            )
+            print(
+                "📋 FINAL ANALYSIS SUMMARY"
+            )
+            print(
+                "-" * 70
+            )
+
+            for current_pair, result in zip(
+                pairs,
                 results,
             ):
+
                 if isinstance(
                     result,
                     Exception,
                 ):
                     print(
-                        f"❌ {pair}: "
-                        f"exception "
+                        f"💥 {current_pair}: "
                         f"{type(result).__name__}: "
                         f"{result}"
                     )
+
                     continue
+
                 if result is None:
                     print(
-                        f"⚪ {pair}: "
-                        f"NO VALID SIGNAL"
+                        f"⚪ {current_pair}: "
+                        "NO SIGNAL"
                     )
+
                     continue
-                valid_signals.append(result)
+
+                valid_signals.append(
+                    result
+                )
+
                 print(
-                    f"🟢 {pair}: "
+                    f"🟢 {current_pair}: "
                     f"{result.direction} | "
                     f"Q={result.quality:.1f} | "
                     f"P={result.probability:.1f}%"
                 )
-            print("-" * 70)
+
+            print(
+                "-" * 70
+            )
+
             # ----------------------------------------------------
-            # NO SIGNALS
+            # NOTHING
             # ----------------------------------------------------
+
             if not valid_signals:
+
                 print(
-                    "⚪ ALL PAIRS: "
-                    "NO VALID SIGNAL"
+                    "⚪ NO VALID SIGNALS"
                 )
+
                 print(
-                    f"📈 Требовался шанс >= "
+                    f"📈 Минимальный "
+                    f"расчётный шанс: "
                     f"{MIN_PROBABILITY}%"
                 )
-                print("#" * 70)
+
+                print(
+                    "-" * 70
+                )
+
                 return None
+
             # ----------------------------------------------------
-            # BEST SIGNAL
+            # BEST
             # ----------------------------------------------------
+
             best_signal = max(
                 valid_signals,
                 key=lambda signal: (
                     signal.probability,
                     signal.quality,
-                    len(signal.confirmations),
+                    len(
+                        signal.confirmations
+                    ),
                 ),
             )
+
             print("")
             print(
-                "🏆 BEST SIGNAL"
+                "🏆 BEST AVAILABLE SIGNAL"
             )
+
             print(
-                f"   Pair: "
-                f"{best_signal.pair}"
+                f"💱 {best_signal.pair}"
             )
+
             print(
-                f"   Direction: "
-                f"{best_signal.direction}"
+                f"🧭 {best_signal.direction}"
             )
+
             print(
-                f"   Quality: "
+                f"📊 Quality: "
                 f"{best_signal.quality:.1f}/100"
             )
+
             print(
-                f"   Chance: "
+                f"📈 Chance: "
                 f"{best_signal.probability:.1f}%"
             )
+
             print(
-                f"   Confirmations: "
+                f"✅ Confirmations: "
                 f"{len(best_signal.confirmations)}"
             )
-            print("#" * 70)
+
+            print(
+                "#" * 70
+            )
+
             return best_signal
+
     # ============================================================
-    # FORMAT SIGNAL
+    # FORMAT
     # ============================================================
+
     def format_signal(
         self,
         signal: Signal,
     ) -> str:
-        """
-        Форматирует сигнал для Telegram.
-        """
+
         if signal.direction == "CALL":
-            direction_text = "🟢 CALL ↑"
+            direction_text = (
+                "🟢 CALL ↑"
+            )
         else:
-            direction_text = "🔴 PUT ↓"
-        entry_moscow = self._to_moscow(
+            direction_text = (
+                "🔴 PUT ↓"
+            )
+
+        entry = self._to_moscow(
             signal.entry_time
         )
-        expiry_moscow = self._to_moscow(
+
+        expiry = self._to_moscow(
             signal.expiry_time
         )
+
         lines = [
             direction_text,
             "",
@@ -276,11 +448,11 @@ class SignalScheduler:
             "",
             (
                 "⏰ ВХОД: "
-                f"{entry_moscow.strftime('%H:%M')} МСК"
+                f"{entry.strftime('%H:%M')} МСК"
             ),
             (
                 "🎯 ЭКСПИРАЦИЯ: "
-                f"{expiry_moscow.strftime('%H:%M')} МСК"
+                f"{expiry.strftime('%H:%M')} МСК"
             ),
             "",
             (
@@ -292,29 +464,38 @@ class SignalScheduler:
                 f"{signal.probability:.0f}%"
             ),
         ]
+
         if signal.confirmations:
+
             lines.extend(
                 [
                     "",
                     "✅ ПОДТВЕРЖДЕНИЯ:",
                 ]
             )
-            for confirmation in signal.confirmations:
+
+            for confirmation in (
+                signal.confirmations
+            ):
                 lines.append(
                     f"• {confirmation}"
                 )
+
         return "\n".join(lines)
+
     # ============================================================
-    # SAVE SIGNAL
+    # SAVE
     # ============================================================
+
     def save_signal(
         self,
         signal: Signal,
     ) -> Optional[int]:
-        """
-        Сохраняет сигнал в БД без создания дубликата.
-        """
-        entry_time = signal.entry_time.isoformat()
+
+        entry_time = (
+            signal.entry_time.isoformat()
+        )
+
         if db.signal_exists(
             pair=signal.pair,
             direction=signal.direction,
@@ -323,215 +504,285 @@ class SignalScheduler:
             print(
                 f"⚠️ Дубликат сигнала: "
                 f"{signal.pair} "
-                f"{signal.direction} "
-                f"{entry_time}"
+                f"{signal.direction}"
             )
+
             return None
-        confirmations = "\n".join(
-            signal.confirmations
-        )
-        reasons = "\n".join(
-            signal.reasons
-        )
+
         signal_id = db.save_signal(
             pair=signal.pair,
             direction=signal.direction,
             quality=signal.quality,
             entry_time=entry_time,
-            expiry_time=signal.expiry_time.isoformat(),
-            analysis_time=signal.analysis_time.isoformat(),
-            confirmations=confirmations,
-            reasons=reasons,
+            expiry_time=(
+                signal.expiry_time.isoformat()
+            ),
+            analysis_time=(
+                signal.analysis_time.isoformat()
+            ),
+            confirmations="\n".join(
+                signal.confirmations
+            ),
+            reasons="\n".join(
+                signal.reasons
+            ),
         )
+
         print(
             f"💾 Signal saved: "
-            f"id={signal_id} "
-            f"{signal.pair} "
-            f"{signal.direction}"
+            f"id={signal_id}"
         )
+
         return signal_id
+
     # ============================================================
-    # SEND TO USERS
+    # SEND
     # ============================================================
+
     async def send_signal_to_users(
         self,
         bot,
         signal: Signal,
     ) -> int:
-        """
-        Отправляет сигнал всем одобренным пользователям.
-        Возвращает количество успешных отправок.
-        """
+
         users = db.get_approved_users()
+
         if not users:
             print(
-                "ℹ️ Нет APPROVED пользователей."
+                "ℹ️ APPROVED пользователей нет."
             )
+
             return 0
+
         message = self.format_signal(
             signal
         )
-        sent_count = 0
+
+        sent = 0
+
         for user in users:
-            user_id = user.get("user_id")
+
+            user_id = user.get(
+                "user_id"
+            )
+
             if not user_id:
                 continue
+
             try:
                 await bot.send_message(
                     chat_id=int(user_id),
                     text=message,
                 )
-                sent_count += 1
+
+                sent += 1
+
             except Exception as exc:
                 print(
-                    f"❌ Не удалось отправить "
-                    f"сигнал пользователю "
+                    f"❌ Ошибка отправки "
                     f"{user_id}: "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
                 )
+
         print(
-            f"📨 Signal sent: "
-            f"{sent_count}/{len(users)}"
+            f"📨 Sent: "
+            f"{sent}/{len(users)}"
         )
-        return sent_count
+
+        return sent
+
     # ============================================================
     # AUTO SCAN
     # ============================================================
+
     async def scan_once(
         self,
         bot=None,
     ) -> Optional[Signal]:
-        """
-        Один автоматический цикл анализа всех пар.
-        """
+
         print("")
-        print("=" * 70)
-        print("🤖 AUTO SCAN STARTED")
-        print("=" * 70)
-        signal = await self.find_best_signal()
+        print(
+            "=" * 70
+        )
+        print(
+            "🤖 AUTO SCAN"
+        )
+        print(
+            "=" * 70
+        )
+
+        signal = await (
+            self.find_best_signal()
+        )
+
         if signal is None:
+
             print(
-                "⚪ AUTO SCAN: "
-                "сильного сигнала сейчас нет."
+                "⚪ Автоматический сигнал "
+                "не найден."
             )
-            print("=" * 70)
+
+            print(
+                "=" * 70
+            )
+
             return None
+
         self.save_signal(
             signal
         )
+
         if bot is not None:
-            await self.send_signal_to_users(
-                bot,
-                signal,
+            await (
+                self.send_signal_to_users(
+                    bot,
+                    signal,
+                )
             )
+
         print(
-            "✅ AUTO SCAN FINISHED"
+            "✅ AUTO SIGNAL READY"
         )
-        print("=" * 70)
+
+        print(
+            "=" * 70
+        )
+
         return signal
+
     # ============================================================
-    # MANUAL SIGNAL
+    # MANUAL
     # ============================================================
+
     async def get_manual_signal(
         self,
         pair: Optional[str] = None,
     ) -> Optional[Signal]:
-        """
-        Ручной запрос сигнала.
-        pair=None -> анализ всех пар.
-        """
+
         print("")
-        print("🎯 MANUAL SIGNAL REQUEST")
-        signal = await self.find_best_signal(
-            pair=pair,
+        print(
+            "🎯 MANUAL SIGNAL REQUEST"
         )
+
+        signal = await (
+            self.find_best_signal(
+                pair=pair
+            )
+        )
+
         if signal is not None:
             self.save_signal(
                 signal
             )
+
         return signal
+
     # ============================================================
-    # RUN LOOP
+    # LOOP
     # ============================================================
+
     async def run(
         self,
         bot=None,
     ) -> None:
-        """
-        Бесконечный цикл автоматического анализа.
-        """
+
         if self._running:
             print(
-                "⚠️ SignalScheduler уже запущен."
+                "⚠️ Scheduler уже работает."
             )
+
             return
+
         self._running = True
+
         print("")
-        print("=" * 70)
-        print("🚀 SIGNAL SCHEDULER STARTED")
-        print("=" * 70)
         print(
-            f"⏱ Интервал: "
-            f"{AUTO_SCAN_SECONDS} секунд"
+            "=" * 70
         )
         print(
-            f"📋 Пары: "
-            f"{', '.join(PAIRS)}"
+            "🚀 SIGNAL SCHEDULER STARTED"
         )
         print(
-            f"📊 Minimum Quality: "
+            f"📈 Minimum probability: "
+            f"{self.engine.min_probability}%"
+        )
+        print(
+            f"📊 Minimum quality: "
             f"{self.engine.min_quality}"
         )
         print(
-            f"📈 Minimum Probability: "
-            f"{self.engine.min_probability}%"
+            "=" * 70
         )
-        print("=" * 70)
+
         try:
+
             while True:
-                started_at = (
-                    datetime.now(timezone.utc)
+
+                started = (
+                    datetime.now(
+                        timezone.utc
+                    )
                 )
+
                 try:
+
                     await self.scan_once(
                         bot=bot
                     )
+
                 except asyncio.CancelledError:
                     raise
+
                 except Exception as exc:
-                    print("")
+
                     print(
                         "💥 AUTO SCAN ERROR"
                     )
+
                     print(
                         f"{type(exc).__name__}: "
                         f"{exc}"
                     )
+
                     traceback.print_exc()
+
                 elapsed = (
-                    datetime.now(timezone.utc)
-                    - started_at
+                    datetime.now(
+                        timezone.utc
+                    ) - started
                 ).total_seconds()
+
                 sleep_seconds = max(
                     1,
-                    AUTO_SCAN_SECONDS - elapsed,
+                    AUTO_SCAN_SECONDS
+                    - elapsed,
                 )
-                print("")
+
                 print(
-                    f"💤 Следующее сканирование "
-                    f"через {sleep_seconds:.1f} сек."
+                    f"💤 Следующее "
+                    f"сканирование через "
+                    f"{sleep_seconds:.1f} сек."
                 )
+
                 await asyncio.sleep(
                     sleep_seconds
                 )
+
         except asyncio.CancelledError:
+
             print(
-                "🛑 Signal Scheduler остановлен."
+                "🛑 Scheduler stopped."
             )
+
             raise
+
         finally:
             self._running = False
+
+
 # ================================================================
 # GLOBAL INSTANCE
 # ================================================================
+
 scheduler_instance = SignalScheduler()
