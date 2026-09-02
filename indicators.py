@@ -2,222 +2,147 @@ import numpy as np
 import pandas as pd
 
 
-def calculate_indicators(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy()
 
-    df = dataframe.copy()
+    close = data["close"]
+    high = data["high"]
+    low = data["low"]
 
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-
-    # ========================================================
-    # EMA
-    # ========================================================
-
-    df["ema_fast"] = close.ewm(
+    data["ema_9"] = close.ewm(
         span=9,
         adjust=False,
     ).mean()
 
-    df["ema_slow"] = close.ewm(
+    data["ema_21"] = close.ewm(
         span=21,
         adjust=False,
     ).mean()
 
-    df["ema_trend"] = close.ewm(
+    data["ema_50"] = close.ewm(
         span=50,
         adjust=False,
     ).mean()
 
-
-    # ========================================================
-    # RSI
-    # ========================================================
-
     delta = close.diff()
 
-    gain = delta.clip(
-        lower=0
-    )
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    loss = -delta.clip(
-        upper=0
-    )
-
-    average_gain = gain.ewm(
+    avg_gain = gain.ewm(
         alpha=1 / 14,
         adjust=False,
+        min_periods=14,
     ).mean()
 
-    average_loss = loss.ewm(
+    avg_loss = loss.ewm(
         alpha=1 / 14,
         adjust=False,
+        min_periods=14,
     ).mean()
 
-    rs = average_gain / average_loss.replace(
-        0,
-        np.nan,
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    data["rsi"] = 100 - (
+        100 / (1 + rs)
     )
 
-    df["rsi"] = (
-        100
-        - (
-            100
-            / (1 + rs)
-        )
-    )
-
-
-    # ========================================================
-    # MACD
-    # ========================================================
-
-    ema12 = close.ewm(
+    ema_12 = close.ewm(
         span=12,
         adjust=False,
     ).mean()
 
-    ema26 = close.ewm(
+    ema_26 = close.ewm(
         span=26,
         adjust=False,
     ).mean()
 
-    df["macd"] = ema12 - ema26
+    data["macd"] = ema_12 - ema_26
 
-    df["macd_signal"] = df["macd"].ewm(
+    data["macd_signal"] = data["macd"].ewm(
         span=9,
         adjust=False,
     ).mean()
 
-    df["macd_hist"] = (
-        df["macd"]
-        - df["macd_signal"]
+    data["macd_hist"] = (
+        data["macd"] -
+        data["macd_signal"]
     )
 
-
-    # ========================================================
-    # BOLLINGER BANDS
-    # ========================================================
-
-    middle = close.rolling(
-        window=20
+    data["bb_middle"] = close.rolling(
+        20
     ).mean()
 
-    std = close.rolling(
-        window=20
-    ).std()
+    bb_std = close.rolling(20).std()
 
-    df["bb_middle"] = middle
-    df["bb_upper"] = middle + 2 * std
-    df["bb_lower"] = middle - 2 * std
+    data["bb_upper"] = (
+        data["bb_middle"] +
+        2 * bb_std
+    )
 
+    data["bb_lower"] = (
+        data["bb_middle"] -
+        2 * bb_std
+    )
 
-    # ========================================================
-    # STOCHASTIC
-    # ========================================================
-
-    lowest_low = low.rolling(
-        window=14
-    ).min()
-
-    highest_high = high.rolling(
-        window=14
-    ).max()
+    lowest_low = low.rolling(14).min()
+    highest_high = high.rolling(14).max()
 
     denominator = (
-        highest_high
-        - lowest_low
-    ).replace(
-        0,
-        np.nan,
-    )
+        highest_high - lowest_low
+    ).replace(0, np.nan)
 
-    df["stoch_k"] = (
-        (
-            close
-            - lowest_low
-        )
-        / denominator
-        * 100
-    )
+    data["stoch_k"] = (
+        (close - lowest_low) /
+        denominator
+    ) * 100
 
-    df["stoch_d"] = df[
-        "stoch_k"
-    ].rolling(
-        window=3
+    data["stoch_d"] = data["stoch_k"].rolling(
+        3
     ).mean()
-
-
-    # ========================================================
-    # ATR
-    # ========================================================
 
     previous_close = close.shift(1)
 
     tr1 = high - low
-
-    tr2 = (
-        high
-        - previous_close
-    ).abs()
-
-    tr3 = (
-        low
-        - previous_close
-    ).abs()
+    tr2 = (high - previous_close).abs()
+    tr3 = (low - previous_close).abs()
 
     true_range = pd.concat(
-        [
-            tr1,
-            tr2,
-            tr3,
-        ],
+        [tr1, tr2, tr3],
         axis=1,
-    ).max(
-        axis=1
-    )
+    ).max(axis=1)
 
-    df["atr"] = true_range.rolling(
-        window=14
+    data["atr"] = true_range.rolling(
+        14
     ).mean()
 
+    data["candle_body"] = (
+        close - data["open"]
+    ).abs()
 
-    # ========================================================
-    # CANDLE
-    # ========================================================
-
-    df["body"] = (
-        df["close"]
-        - df["open"]
+    data["candle_range"] = (
+        high - low
     )
 
-    df["range"] = (
-        df["high"]
-        - df["low"]
+    data["body_ratio"] = (
+        data["candle_body"] /
+        data["candle_range"].replace(0, np.nan)
     )
 
-    df["body_ratio"] = (
-        df["body"].abs()
-        / df["range"].replace(
-            0,
-            np.nan,
-        )
-    )
-
-
-    # ========================================================
-    # SUPPORT / RESISTANCE
-    # ========================================================
-
-    df["support"] = low.rolling(
-        window=20
+    data["support"] = low.rolling(
+        20
     ).min()
 
-    df["resistance"] = high.rolling(
-        window=20
+    data["resistance"] = high.rolling(
+        20
     ).max()
 
+    data["ema_9_slope"] = (
+        data["ema_9"] -
+        data["ema_9"].shift(3)
+    )
 
-    return df
+    return data.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
