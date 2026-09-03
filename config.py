@@ -219,17 +219,7 @@ MARKET_CANDLE_LIMIT: Final[int] = get_int_env(
 # SIGNAL SETTINGS
 # =========================================================
 
-# Основной порог качества сигнала.
-#
-# Было:
-#     85%
-#
-# Теперь:
-#     75%
-#
-# Это НЕ означает гарантированный winrate 75%.
-# Это минимальный score алгоритма для допуска сигнала.
-
+# Минимальный Quality Score.
 SIGNAL_MINIMUM_QUALITY: Final[float] = (
     get_float_env(
         "SIGNAL_MINIMUM_QUALITY",
@@ -237,13 +227,7 @@ SIGNAL_MINIMUM_QUALITY: Final[float] = (
     )
 )
 
-
-# Исторический probability-фильтр.
-#
-# Если исторической статистики недостаточно,
-# сигнал не блокируется, потому что
-# SIGNAL_REQUIRE_HISTORICAL_PROBABILITY = False.
-
+# Минимальная историческая вероятность.
 SIGNAL_MINIMUM_PROBABILITY: Final[float] = (
     get_float_env(
         "SIGNAL_MINIMUM_PROBABILITY",
@@ -251,6 +235,8 @@ SIGNAL_MINIMUM_PROBABILITY: Final[float] = (
     )
 )
 
+# Не блокируем сигнал только из-за отсутствия
+# накопленной исторической статистики.
 SIGNAL_REQUIRE_HISTORICAL_PROBABILITY: Final[bool] = (
     get_bool_env(
         "SIGNAL_REQUIRE_HISTORICAL_PROBABILITY",
@@ -258,35 +244,20 @@ SIGNAL_REQUIRE_HISTORICAL_PROBABILITY: Final[bool] = (
     )
 )
 
-
-# =========================================================
-# SIGNAL TIME
-# =========================================================
-
-# Предупреждение перед завершением сигнала.
-
+# Предупреждение перед закрытием.
 SIGNAL_WARNING_MINUTES: Final[int] = get_int_env(
     "SIGNAL_WARNING_MINUTES",
     2,
 )
 
-
-# Время действия сигнала по умолчанию.
-#
-# Пользовательский диапазон:
-#     1-20 минут
-#
-# Если конкретный режим времени не передан,
-# используется 5 минут.
-
+# Основное время экспирации.
 SIGNAL_EXPIRY_MINUTES: Final[int] = get_int_env(
     "SIGNAL_EXPIRY_MINUTES",
     5,
 )
 
-
-# Разрешённый диапазон времени сигнала.
-
+# Разрешённый диапазон экспирации:
+# от 1 до 20 минут.
 SIGNAL_MIN_EXPIRY_MINUTES: Final[int] = get_int_env(
     "SIGNAL_MIN_EXPIRY_MINUTES",
     1,
@@ -302,42 +273,24 @@ SIGNAL_MAX_EXPIRY_MINUTES: Final[int] = get_int_env(
 # SCANNER
 # =========================================================
 
-# Интервал автоматического сканирования.
-#
-# Было:
-#     300 секунд
-#
-# Теперь:
-#     60 секунд
-#
-# Бот будет чаще искать новый сигнал.
-
+# Автоматический анализ каждую минуту.
 SIGNAL_SCAN_INTERVAL: Final[int] = get_int_env(
     "SIGNAL_SCAN_INTERVAL",
     60,
 )
-
 
 SIGNAL_CANDLE_LIMIT: Final[int] = get_int_env(
     "SIGNAL_CANDLE_LIMIT",
     MARKET_CANDLE_LIMIT,
 )
 
-
-# Количество пар за один цикл.
-#
-# Было 2.
-#
-# Теперь 4, чтобы быстрее проходить список
-# обычных валютных пар без чрезмерного
-# увеличения нагрузки на API.
-
+# Сколько Forex-пар анализировать за цикл.
 SIGNAL_PAIRS_PER_CYCLE: Final[int] = get_int_env(
     "SIGNAL_PAIRS_PER_CYCLE",
     4,
 )
 
-
+# Защита от повторной отправки одного сигнала.
 SIGNAL_COOLDOWN: Final[int] = get_int_env(
     "SIGNAL_COOLDOWN",
     300,
@@ -368,12 +321,6 @@ SIGNAL_RESULT_INTERVAL: Final[int] = get_int_env(
 # TIMEFRAMES
 # =========================================================
 
-# Это таймфреймы анализа свечей.
-#
-# Они НЕ являются временем экспирации.
-# Время экспирации задаётся отдельно
-# через SIGNAL_EXPIRY_MINUTES.
-
 TIMEFRAMES: Final[tuple[str, ...]] = (
     "1m",
     "5m",
@@ -384,8 +331,6 @@ TIMEFRAMES: Final[tuple[str, ...]] = (
 # =========================================================
 # MARKET PAIRS
 # =========================================================
-
-# Обычные Forex-пары.
 
 DEFAULT_PAIRS: Final[list[str]] = [
     "EUR/USD",
@@ -445,6 +390,47 @@ LOG_LEVEL: Final[str] = (
 
 
 # =========================================================
+# IMPORTANT:
+# signal_scanner.py сейчас читает значения напрямую
+# через os.getenv().
+#
+# Поэтому устанавливаем безопасные значения по умолчанию
+# в окружение, чтобы старый scanner тоже получил новые
+# настройки, даже если переменные Render не заданы.
+# =========================================================
+
+os.environ.setdefault(
+    "SIGNAL_MINIMUM_QUALITY",
+    str(SIGNAL_MINIMUM_QUALITY),
+)
+
+os.environ.setdefault(
+    "SIGNAL_SCAN_INTERVAL",
+    str(SIGNAL_SCAN_INTERVAL),
+)
+
+os.environ.setdefault(
+    "SIGNAL_CANDLE_LIMIT",
+    str(SIGNAL_CANDLE_LIMIT),
+)
+
+os.environ.setdefault(
+    "SIGNAL_PAIRS_PER_CYCLE",
+    str(SIGNAL_PAIRS_PER_CYCLE),
+)
+
+os.environ.setdefault(
+    "SIGNAL_COOLDOWN",
+    str(SIGNAL_COOLDOWN),
+)
+
+os.environ.setdefault(
+    "SIGNAL_TIMEFRAMES",
+    ",".join(TIMEFRAMES),
+)
+
+
+# =========================================================
 # VALIDATION
 # =========================================================
 
@@ -500,24 +486,24 @@ def validate_config() -> None:
         )
 
     if not (
-        1
-        <= SIGNAL_MIN_EXPIRY_MINUTES
-        <= SIGNAL_MAX_EXPIRY_MINUTES
-        <= 20
-    ):
-        raise RuntimeError(
-            "Signal expiry range must be between 1 and 20 minutes."
-        )
-
-    if not (
         SIGNAL_MIN_EXPIRY_MINUTES
         <= SIGNAL_EXPIRY_MINUTES
         <= SIGNAL_MAX_EXPIRY_MINUTES
     ):
         raise RuntimeError(
-            "SIGNAL_EXPIRY_MINUTES must be between "
+            "SIGNAL_EXPIRY_MINUTES must be within "
             "SIGNAL_MIN_EXPIRY_MINUTES and "
             "SIGNAL_MAX_EXPIRY_MINUTES."
+        )
+
+    if SIGNAL_MIN_EXPIRY_MINUTES < 1:
+        raise RuntimeError(
+            "SIGNAL_MIN_EXPIRY_MINUTES must be >= 1."
+        )
+
+    if SIGNAL_MAX_EXPIRY_MINUTES > 20:
+        raise RuntimeError(
+            "SIGNAL_MAX_EXPIRY_MINUTES must be <= 20."
         )
 
     if SIGNAL_SCAN_INTERVAL <= 0:
