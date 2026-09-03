@@ -40,14 +40,23 @@ OTC_PAIRS = [
 
 
 # ============================================================
+# EXPIRY SETTINGS
+# ============================================================
+
+MIN_EXPIRY_MINUTES = 1
+MAX_EXPIRY_MINUTES = 20
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
 def format_pair(pair: str) -> str:
     """
     Преобразует:
-        EURUSD       -> EUR/USD
-        EURUSD_otc   -> EUR/USD OTC
+
+        EURUSD      -> EUR/USD
+        EURUSD_otc  -> EUR/USD OTC
     """
 
     value = str(pair).strip()
@@ -56,9 +65,7 @@ def format_pair(pair: str) -> str:
         base = value[:-4].upper()
 
         if len(base) == 6:
-            return (
-                f"{base[:3]}/{base[3:]} OTC"
-            )
+            return f"{base[:3]}/{base[3:]} OTC"
 
         return f"{base} OTC"
 
@@ -117,9 +124,8 @@ def pending_keyboard() -> InlineKeyboardMarkup:
 
 def signal_type_keyboard() -> InlineKeyboardMarkup:
     """
-    Первый экран после кнопки «Получить сигнал».
+    Выбор типа рынка:
 
-    Пользователь выбирает:
     - обычные пары;
     - OTC;
     - все пары.
@@ -166,7 +172,6 @@ def regular_pair_selection_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     for pair in PAIRS:
-
         builder.row(
             InlineKeyboardButton(
                 text=f"💱 {format_pair(pair)}",
@@ -206,7 +211,6 @@ def otc_pair_selection_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     for pair in OTC_PAIRS:
-
         builder.row(
             InlineKeyboardButton(
                 text=f"🟣 {format_pair(pair)}",
@@ -246,7 +250,6 @@ def all_pair_selection_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
 
     for pair in PAIRS:
-
         builder.row(
             InlineKeyboardButton(
                 text=f"💱 {format_pair(pair)}",
@@ -255,7 +258,6 @@ def all_pair_selection_keyboard() -> InlineKeyboardMarkup:
         )
 
     for pair in OTC_PAIRS:
-
         builder.row(
             InlineKeyboardButton(
                 text=f"🟣 {format_pair(pair)}",
@@ -288,19 +290,71 @@ def all_pair_selection_keyboard() -> InlineKeyboardMarkup:
 
 
 # ============================================================
+# EXPIRY / TRADE DURATION KEYBOARD
+# ============================================================
+
+def expiry_selection_keyboard() -> InlineKeyboardMarkup:
+    """
+    Выбор времени сделки от 1 до 20 минут.
+
+    callback:
+        expiry:1
+        expiry:2
+        ...
+        expiry:20
+        expiry:any
+    """
+
+    builder = InlineKeyboardBuilder()
+
+    for start in range(
+        MIN_EXPIRY_MINUTES,
+        MAX_EXPIRY_MINUTES + 1,
+        4,
+    ):
+        row = []
+
+        for minutes in range(start, min(start + 4, MAX_EXPIRY_MINUTES + 1)):
+            row.append(
+                InlineKeyboardButton(
+                    text=f"{minutes} мин",
+                    callback_data=f"expiry:{minutes}",
+                )
+            )
+
+        builder.row(*row)
+
+    builder.row(
+        InlineKeyboardButton(
+            text="⚡ Любое время",
+            callback_data="expiry:any",
+        )
+    )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="⬅️ Назад к выбору пары",
+            callback_data="expiry:back",
+        )
+    )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data="expiry:cancel",
+        )
+    )
+
+    return builder.as_markup()
+
+
+# ============================================================
 # OLD COMPATIBILITY KEYBOARD
 # ============================================================
 
 def pair_selection_keyboard() -> InlineKeyboardMarkup:
     """
-    Оставляем старую функцию для совместимости
-    с остальным проектом.
-
-    Сейчас основной сценарий использует:
-        signal_type_keyboard()
-        regular_pair_selection_keyboard()
-        otc_pair_selection_keyboard()
-        all_pair_selection_keyboard()
+    Старая функция оставлена для совместимости.
     """
 
     return signal_type_keyboard()
