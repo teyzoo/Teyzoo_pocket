@@ -5,12 +5,15 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
 from config import MIN_PROBABILITY, MIN_QUALITY, TIMEZONE
 from indicators import calculate_indicators
 
+
+# =========================================================
+# SIGNAL
+# =========================================================
 
 @dataclass
 class Signal:
@@ -24,6 +27,22 @@ class Signal:
     confirmations: list[str]
     reasons: list[str]
 
+    @property
+    def expiry_minutes(self) -> int:
+        """Длительность сделки в минутах."""
+        seconds = (
+            self.expiry_time - self.entry_time
+        ).total_seconds()
+
+        return max(
+            1,
+            int(round(seconds / 60)),
+        )
+
+
+# =========================================================
+# SIGNAL ENGINE
+# =========================================================
 
 class SignalEngine:
     """
@@ -35,10 +54,24 @@ class SignalEngine:
     Выход:
         Signal либо None.
 
+    Поддерживает:
+        expiry_minutes = 1..20
+
+    Старый вызов:
+
+        engine.analyze(pair, candles)
+
+    продолжает работать и использует:
+        expiry_minutes=5
+
     ВАЖНО:
-        Движок не создаёт искусственный сигнал.
-        Если качество недостаточное — сигнал отклоняется.
+        Расчётная probability — внутренняя оценка модели,
+        а НЕ гарантированная вероятность выигрыша.
     """
+
+    # ---------------------------------------------------------
+    # REQUIRED INDICATORS
+    # ---------------------------------------------------------
 
     REQUIRED_INDICATORS = [
         "close",
@@ -63,11 +96,20 @@ class SignalEngine:
 
     MIN_CANDLES = 80
 
+    MIN_EXPIRY_MINUTES = 1
+    MAX_EXPIRY_MINUTES = 20
+    DEFAULT_EXPIRY_MINUTES = 5
+
+    # =========================================================
+    # CONSTRUCTOR
+    # =========================================================
+
     def __init__(
         self,
         min_quality: Optional[float] = None,
         min_probability: Optional[float] = None,
     ) -> None:
+
         self.min_quality = (
             float(MIN_QUALITY)
             if min_quality is None
@@ -83,11 +125,15 @@ class SignalEngine:
         print(
             "[ENGINE] Initialized | "
             f"min_quality={self.min_quality:.1f} | "
-            f"min_probability={self.min_probability:.1f}%"
+            f"min_probability="
+            f"{self.min_probability:.1f}% | "
+            f"expiry="
+            f"{self.MIN_EXPIRY_MINUTES}-"
+            f"{self.MAX_EXPIRY_MINUTES}m"
         )
 
     # =========================================================
-    # TIME
+    # TIMEZONE
     # =========================================================
 
     @staticmethod
@@ -98,22 +144,85 @@ class SignalEngine:
 
             from zoneinfo import ZoneInfo
 
-            return ZoneInfo(str(TIMEZONE))
+            return ZoneInfo(
+                str(TIMEZONE)
+            )
 
         except Exception:
             from zoneinfo import ZoneInfo
 
-            return ZoneInfo("Europe/Moscow")
+            return ZoneInfo(
+                "Europe/Moscow"
+            )
 
     def _now(self) -> datetime:
-        return datetime.now(self._timezone())
+        return datetime.now(
+            self._timezone()
+        )
+
+    # =========================================================
+    # EXPIRY NORMALIZATION
+    # =========================================================
+
+    def normalize_expiry_minutes(
+        self,
+        expiry_minutes: Optional[int] = None,
+    ) -> int:
+        """
+        Нормализует длительность сделки.
+
+        Допустимый диапазон:
+            1..20 минут
+
+        None:
+            5 минут.
+        """
+
+        if expiry_minutes is None:
+            return self.DEFAULT_EXPIRY_MINUTES
+
+        try:
+            value = int(
+                expiry_minutes
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            print(
+                "[ENGINE] Invalid expiry_minutes="
+                f"{expiry_minutes!r}; "
+                f"using default "
+                f"{self.DEFAULT_EXPIRY_MINUTES}m"
+            )
+
+            return self.DEFAULT_EXPIRY_MINUTES
+
+        value = max(
+            self.MIN_EXPIRY_MINUTES,
+            min(
+                self.MAX_EXPIRY_MINUTES,
+                value,
+            ),
+        )
+
+        return value
+
+    # =========================================================
+    # ENTRY TIME
+    # =========================================================
 
     def _next_5_minute(
         self,
         dt: Optional[datetime] = None,
     ) -> datetime:
         """
-        Возвращает ближайшую следующую 5-минутную отметку.
+        Возвращает ближайшую следующую
+        5-минутную отметку.
+
+        Это сохраняет совместимость с текущей
+        системой анализа 5m свечей.
         """
 
         if dt is None:
@@ -133,7 +242,8 @@ class SignalEngine:
         ) * 5
 
         if minute >= 60:
-            result = (
+
+            return (
                 dt.replace(
                     minute=0,
                     second=0,
@@ -141,25 +251,71 @@ class SignalEngine:
                 )
                 + timedelta(hours=1)
             )
-        else:
-            result = dt.replace(
-                minute=minute,
-                second=0,
-                microsecond=0,
-            )
 
-        return result
+        return dt.replace(
+            minute=minute,
+            second=0,
+            microsecond=0,
+        )
+
+    # =========================================================
+    # CUSTOM ENTRY
+    # =========================================================
+
+    def _get_entry_time(
+        self,
+        analysis_time: datetime,
+    ) -> datetime:
+        """
+        Вход остаётся привязанным к следующей
+        5-минутной свечной отметке.
+
+        Это важно, поскольку текущий market layer
+        использует 5m данные.
+        """
+
+        return self._next_5_minute(
+            analysis_time
+        )
+
+    # =========================================================
+    # EXPIRY TIME
+    # =========================================================
+
+    def _get_expiry_time(
+        self,
+        entry_time: datetime,
+        expiry_minutes: int,
+    ) -> datetime:
+
+        expiry_minutes = (
+            self.normalize_expiry_minutes(
+                expiry_minutes
+            )
+        )
+
+        return (
+            entry_time
+            + timedelta(
+                minutes=expiry_minutes
+            )
+        )
 
     # =========================================================
     # HELPERS
     # =========================================================
 
     @staticmethod
-    def _safe_float(value) -> Optional[float]:
+    def _safe_float(
+        value,
+    ) -> Optional[float]:
+
         try:
             result = float(value)
 
-            if not math.isfinite(result):
+            if not math.isfinite(
+                result
+            ):
                 return None
 
             return result
@@ -175,10 +331,13 @@ class SignalEngine:
         df: pd.DataFrame,
         columns: list[str],
     ) -> pd.DataFrame:
+
         result = df.copy()
 
         for column in columns:
+
             if column in result.columns:
+
                 result[column] = pd.to_numeric(
                     result[column],
                     errors="coerce",
@@ -197,12 +356,19 @@ class SignalEngine:
         """
         Нормализует старые и новые названия индикаторов.
 
-        Поддерживаются оба варианта:
+        Поддерживаются:
 
-            ema_9          -> ema_fast
-            ema_21         -> ema_slow
-            macd_histogram -> macd_hist
-            ema9_slope     -> ema_fast_slope
+            ema_9
+                -> ema_fast
+
+            ema_21
+                -> ema_slow
+
+            macd_histogram
+                -> macd_hist
+
+            ema9_slope
+                -> ema_fast_slope
         """
 
         df = df.copy()
@@ -215,16 +381,20 @@ class SignalEngine:
             "ema_fast" not in df.columns
             and "ema_9" in df.columns
         ):
-            df["ema_fast"] = df["ema_9"]
+            df["ema_fast"] = df[
+                "ema_9"
+            ]
 
         if (
             "ema_slow" not in df.columns
             and "ema_21" in df.columns
         ):
-            df["ema_slow"] = df["ema_21"]
+            df["ema_slow"] = df[
+                "ema_21"
+            ]
 
         # -----------------------------------------------------
-        # MACD histogram
+        # MACD HISTOGRAM
         # -----------------------------------------------------
 
         if (
@@ -236,7 +406,7 @@ class SignalEngine:
             ]
 
         # -----------------------------------------------------
-        # EMA slope
+        # EMA SLOPE
         # -----------------------------------------------------
 
         if (
@@ -248,60 +418,84 @@ class SignalEngine:
             ]
 
         # -----------------------------------------------------
-        # Если indicators.py вообще не создал EMA,
-        # рассчитываем их здесь.
+        # EMA FALLBACK
         # -----------------------------------------------------
 
         if "close" in df.columns:
+
             close = pd.to_numeric(
                 df["close"],
                 errors="coerce",
             )
 
-            if "ema_fast" not in df.columns:
-                df["ema_fast"] = close.ewm(
-                    span=9,
-                    adjust=False,
-                ).mean()
+            if (
+                "ema_fast"
+                not in df.columns
+            ):
+                df["ema_fast"] = (
+                    close.ewm(
+                        span=9,
+                        adjust=False,
+                    ).mean()
+                )
 
-            if "ema_slow" not in df.columns:
-                df["ema_slow"] = close.ewm(
-                    span=21,
-                    adjust=False,
-                ).mean()
+            if (
+                "ema_slow"
+                not in df.columns
+            ):
+                df["ema_slow"] = (
+                    close.ewm(
+                        span=21,
+                        adjust=False,
+                    ).mean()
+                )
 
-            if "ema_50" not in df.columns:
-                df["ema_50"] = close.ewm(
-                    span=50,
-                    adjust=False,
-                ).mean()
+            if (
+                "ema_50"
+                not in df.columns
+            ):
+                df["ema_50"] = (
+                    close.ewm(
+                        span=50,
+                        adjust=False,
+                    ).mean()
+                )
 
         # -----------------------------------------------------
-        # MACD fallback
+        # MACD FALLBACK
         # -----------------------------------------------------
 
         if "close" in df.columns:
+
             close = pd.to_numeric(
                 df["close"],
                 errors="coerce",
             )
 
             if "macd" not in df.columns:
-                ema_12 = close.ewm(
-                    span=12,
-                    adjust=False,
-                ).mean()
 
-                ema_26 = close.ewm(
-                    span=26,
-                    adjust=False,
-                ).mean()
+                ema_12 = (
+                    close.ewm(
+                        span=12,
+                        adjust=False,
+                    ).mean()
+                )
+
+                ema_26 = (
+                    close.ewm(
+                        span=26,
+                        adjust=False,
+                    ).mean()
+                )
 
                 df["macd"] = (
                     ema_12 - ema_26
                 )
 
-            if "macd_signal" not in df.columns:
+            if (
+                "macd_signal"
+                not in df.columns
+            ):
                 df["macd_signal"] = (
                     df["macd"].ewm(
                         span=9,
@@ -309,19 +503,23 @@ class SignalEngine:
                     ).mean()
                 )
 
-            if "macd_hist" not in df.columns:
+            if (
+                "macd_hist"
+                not in df.columns
+            ):
                 df["macd_hist"] = (
                     df["macd"]
                     - df["macd_signal"]
                 )
 
         # -----------------------------------------------------
-        # EMA slope fallback
+        # EMA SLOPE FALLBACK
         # -----------------------------------------------------
 
         if (
             "ema_fast" in df.columns
-            and "ema_fast_slope" not in df.columns
+            and "ema_fast_slope"
+            not in df.columns
         ):
             df["ema_fast_slope"] = (
                 df["ema_fast"]
@@ -341,9 +539,9 @@ class SignalEngine:
         confirmations: int,
     ) -> float:
         """
-        Расчёт внутренней оценки вероятности.
+        Внутренняя оценка вероятности.
 
-        Это НЕ гарантия выигрыша.
+        НЕ является гарантией результата.
         """
 
         probability = (
@@ -393,55 +591,83 @@ class SignalEngine:
         self,
         pair: str,
         candles: pd.DataFrame,
+        expiry_minutes: Optional[int] = None,
     ) -> Optional[Signal]:
 
         print("=" * 70)
-        print(f"🔎 ANALYSIS: {pair}")
+        print(
+            f"🔎 ANALYSIS: {pair}"
+        )
         print("=" * 70)
 
         # -----------------------------------------------------
-        # Проверка DataFrame
+        # EXPIRY
+        # -----------------------------------------------------
+
+        expiry_minutes = (
+            self.normalize_expiry_minutes(
+                expiry_minutes
+            )
+        )
+
+        print(
+            f"⏱️ Expiry requested: "
+            f"{expiry_minutes}m"
+        )
+
+        # -----------------------------------------------------
+        # DATAFRAME
         # -----------------------------------------------------
 
         if candles is None:
+
             print(
-                f"❌ REJECTED: {pair} | candles=None"
+                f"❌ REJECTED: {pair} | "
+                "candles=None"
             )
+
             return None
 
         if not isinstance(
             candles,
             pd.DataFrame,
         ):
+
             print(
                 f"❌ REJECTED: {pair} | "
-                f"invalid candles type: "
+                "invalid candles type: "
                 f"{type(candles).__name__}"
             )
+
             return None
 
         print(
-            f"📥 Candles received: {len(candles)}"
+            f"📥 Candles received: "
+            f"{len(candles)}"
         )
 
         if candles.empty:
+
             print(
                 f"❌ REJECTED: {pair} | "
                 "candles empty"
             )
+
             return None
 
         if len(candles) < self.MIN_CANDLES:
+
             print(
                 f"❌ REJECTED: {pair} | "
                 f"недостаточно свечей: "
                 f"{len(candles)} < "
                 f"{self.MIN_CANDLES}"
             )
+
             return None
 
         # -----------------------------------------------------
-        # Проверка OHLC
+        # OHLC
         # -----------------------------------------------------
 
         required_ohlc = [
@@ -458,45 +684,58 @@ class SignalEngine:
         ]
 
         if missing_ohlc:
+
             print(
                 f"❌ REJECTED: {pair} | "
-                f"Отсутствуют OHLC: "
+                "Отсутствуют OHLC: "
                 f"{', '.join(missing_ohlc)}"
             )
+
             return None
 
         # -----------------------------------------------------
-        # Расчёт индикаторов
+        # INDICATORS
         # -----------------------------------------------------
 
         try:
+
             df = calculate_indicators(
                 candles.copy()
             )
 
         except Exception as exc:
+
             print(
-                f"❌ INDICATOR ERROR: {pair} | "
-                f"{type(exc).__name__}: {exc}"
+                f"❌ INDICATOR ERROR: "
+                f"{pair} | "
+                f"{type(exc).__name__}: "
+                f"{exc}"
             )
+
             return None
 
         if df is None:
+
             print(
                 f"❌ REJECTED: {pair} | "
-                "calculate_indicators returned None"
+                "calculate_indicators "
+                "returned None"
             )
+
             return None
 
         if not isinstance(
             df,
             pd.DataFrame,
         ):
+
             print(
                 f"❌ REJECTED: {pair} | "
-                "calculate_indicators returned "
+                "calculate_indicators "
+                "returned "
                 f"{type(df).__name__}"
             )
+
             return None
 
         print(
@@ -505,12 +744,12 @@ class SignalEngine:
         )
 
         print(
-            f"📋 Indicator columns: "
+            "📋 Indicator columns: "
             f"{', '.join(map(str, df.columns))}"
         )
 
         # -----------------------------------------------------
-        # Нормализация индикаторов
+        # NORMALIZE
         # -----------------------------------------------------
 
         df = self._normalize_indicators(
@@ -518,12 +757,12 @@ class SignalEngine:
         )
 
         print(
-            f"📋 Normalized columns: "
+            "📋 Normalized columns: "
             f"{', '.join(map(str, df.columns))}"
         )
 
         # -----------------------------------------------------
-        # Проверка обязательных индикаторов
+        # REQUIRED INDICATORS
         # -----------------------------------------------------
 
         missing = [
@@ -533,15 +772,17 @@ class SignalEngine:
         ]
 
         if missing:
+
             print(
                 f"❌ REJECTED: {pair} | "
                 "Отсутствуют индикаторы: "
                 f"{', '.join(missing)}"
             )
+
             return None
 
         # -----------------------------------------------------
-        # Числовая нормализация
+        # NUMERIC
         # -----------------------------------------------------
 
         df = self._ensure_numeric(
@@ -550,48 +791,55 @@ class SignalEngine:
         )
 
         # -----------------------------------------------------
-        # Удаляем формирующуюся последнюю свечу
+        # REMOVE FORMING CANDLE
         # -----------------------------------------------------
 
         if len(df) > 1:
+
             df = df.iloc[:-1].copy()
 
         if len(df) < 70:
+
             print(
                 f"❌ REJECTED: {pair} | "
-                f"после подготовки осталось "
+                "после подготовки осталось "
                 f"{len(df)} свечей"
             )
+
             return None
 
         # -----------------------------------------------------
-        # Последняя закрытая свеча
+        # LAST CLOSED CANDLE
         # -----------------------------------------------------
 
         row = df.iloc[-1]
 
         # -----------------------------------------------------
-        # Проверяем значения
+        # VALID VALUES
         # -----------------------------------------------------
 
         invalid_values: list[str] = []
 
         for column in self.REQUIRED_INDICATORS:
+
             value = self._safe_float(
                 row.get(column)
             )
 
             if value is None:
+
                 invalid_values.append(
                     column
                 )
 
         if invalid_values:
+
             print(
                 f"❌ REJECTED: {pair} | "
                 "Некорректные/NaN значения: "
                 f"{', '.join(invalid_values)}"
             )
+
             return None
 
         # =====================================================
@@ -680,16 +928,18 @@ class SignalEngine:
         call_reasons: list[str] = []
         put_reasons: list[str] = []
 
-        # -----------------------------------------------------
+        # =====================================================
         # 1. EMA TREND — 20
-        # -----------------------------------------------------
+        # =====================================================
 
         if (
             close > ema_fast
             and ema_fast > ema_slow
             and ema_slow > ema_50
         ):
+
             call_score += 20
+
             call_reasons.append(
                 "EMA bullish trend"
             )
@@ -699,48 +949,60 @@ class SignalEngine:
             and ema_fast < ema_slow
             and ema_slow < ema_50
         ):
+
             put_score += 20
+
             put_reasons.append(
                 "EMA bearish trend"
             )
 
         elif close > ema_fast:
+
             call_score += 10
+
             call_reasons.append(
                 "Цена выше EMA fast"
             )
 
         elif close < ema_fast:
+
             put_score += 10
+
             put_reasons.append(
                 "Цена ниже EMA fast"
             )
 
-        # -----------------------------------------------------
+        # =====================================================
         # 2. EMA SLOPE — 10
-        # -----------------------------------------------------
+        # =====================================================
 
         if ema_fast_slope > 0:
+
             call_score += 10
+
             call_reasons.append(
                 "EMA fast растёт"
             )
 
         elif ema_fast_slope < 0:
+
             put_score += 10
+
             put_reasons.append(
                 "EMA fast снижается"
             )
 
-        # -----------------------------------------------------
+        # =====================================================
         # 3. MACD — 15
-        # -----------------------------------------------------
+        # =====================================================
 
         if (
             macd > macd_signal
             and macd_hist > 0
         ):
+
             call_score += 15
+
             call_reasons.append(
                 "MACD bullish"
             )
@@ -749,97 +1011,128 @@ class SignalEngine:
             macd < macd_signal
             and macd_hist < 0
         ):
+
             put_score += 15
+
             put_reasons.append(
                 "MACD bearish"
             )
 
         elif macd_hist > 0:
+
             call_score += 7
+
             call_reasons.append(
                 "MACD histogram positive"
             )
 
         elif macd_hist < 0:
+
             put_score += 7
+
             put_reasons.append(
                 "MACD histogram negative"
             )
 
-        # -----------------------------------------------------
+        # =====================================================
         # 4. RSI — 10
-        # -----------------------------------------------------
+        # =====================================================
 
         if 50 <= rsi <= 68:
+
             call_score += 10
+
             call_reasons.append(
                 "RSI подтверждает CALL"
             )
 
         elif 32 <= rsi < 50:
+
             put_score += 10
+
             put_reasons.append(
                 "RSI подтверждает PUT"
             )
 
         elif rsi < 30:
+
             call_score += 6
+
             call_reasons.append(
                 "RSI oversold"
             )
 
         elif rsi > 70:
+
             put_score += 6
+
             put_reasons.append(
                 "RSI overbought"
             )
 
-        # -----------------------------------------------------
-        # 5. Bollinger Bands — 10
-        # -----------------------------------------------------
+        # =====================================================
+        # 5. BOLLINGER BANDS — 10
+        # =====================================================
 
         bb_range = (
-            bb_upper - bb_lower
+            bb_upper
+            - bb_lower
         )
 
         if bb_range > 0:
+
             bb_position = (
-                close - bb_lower
+                close
+                - bb_lower
             ) / bb_range
 
             if bb_position <= 0.30:
+
                 call_score += 10
+
                 call_reasons.append(
-                    "Цена у нижней Bollinger Band"
+                    "Цена у нижней "
+                    "Bollinger Band"
                 )
 
             elif bb_position >= 0.70:
+
                 put_score += 10
+
                 put_reasons.append(
-                    "Цена у верхней Bollinger Band"
+                    "Цена у верхней "
+                    "Bollinger Band"
                 )
 
             elif bb_position < 0.50:
+
                 call_score += 4
+
                 call_reasons.append(
-                    "Цена ниже середины Bollinger"
+                    "Цена ниже середины "
+                    "Bollinger"
                 )
 
             else:
+
                 put_score += 4
+
                 put_reasons.append(
-                    "Цена выше середины Bollinger"
+                    "Цена выше середины "
+                    "Bollinger"
                 )
 
-        # -----------------------------------------------------
-        # 6. Stochastic — 10
-        # -----------------------------------------------------
+        # =====================================================
+        # 6. STOCHASTIC — 10
+        # =====================================================
 
         if (
             stoch_k > stoch_d
             and stoch_k < 80
         ):
+
             call_score += 10
+
             call_reasons.append(
                 "Stochastic bullish"
             )
@@ -848,26 +1141,32 @@ class SignalEngine:
             stoch_k < stoch_d
             and stoch_k > 20
         ):
+
             put_score += 10
+
             put_reasons.append(
                 "Stochastic bearish"
             )
 
         elif stoch_k < 20:
+
             call_score += 6
+
             call_reasons.append(
                 "Stochastic oversold"
             )
 
         elif stoch_k > 80:
+
             put_score += 6
+
             put_reasons.append(
                 "Stochastic overbought"
             )
 
-        # -----------------------------------------------------
-        # 7. Candle — 10
-        # -----------------------------------------------------
+        # =====================================================
+        # 7. CANDLE — 10
+        # =====================================================
 
         candle_open = self._safe_float(
             row.get("open")
@@ -887,12 +1186,14 @@ class SignalEngine:
             and candle_high is not None
             and candle_low is not None
         ):
+
             candle_range = (
                 candle_high
                 - candle_low
             )
 
             if candle_range > 0:
+
                 upper_wick = (
                     candle_high
                     - max(
@@ -913,7 +1214,9 @@ class SignalEngine:
                     close > candle_open
                     and body_ratio >= 0.55
                 ):
+
                     call_score += 10
+
                     call_reasons.append(
                         "Сильная бычья свеча"
                     )
@@ -922,65 +1225,82 @@ class SignalEngine:
                     close < candle_open
                     and body_ratio >= 0.55
                 ):
+
                     put_score += 10
+
                     put_reasons.append(
                         "Сильная медвежья свеча"
                     )
 
                 elif (
-                    lower_wick > candle_range * 0.45
+                    lower_wick
+                    > candle_range * 0.45
                     and close > candle_open
                 ):
+
                     call_score += 6
+
                     call_reasons.append(
                         "Бычий rejection"
                     )
 
                 elif (
-                    upper_wick > candle_range * 0.45
+                    upper_wick
+                    > candle_range * 0.45
                     and close < candle_open
                 ):
+
                     put_score += 6
+
                     put_reasons.append(
                         "Медвежий rejection"
                     )
 
-        # -----------------------------------------------------
-        # 8. Support / Resistance — 10
-        # -----------------------------------------------------
+        # =====================================================
+        # 8. SUPPORT / RESISTANCE — 10
+        # =====================================================
 
         sr_range = (
-            resistance - support
+            resistance
+            - support
         )
 
         if sr_range > 0:
+
             support_distance = (
-                close - support
+                close
+                - support
             ) / sr_range
 
             resistance_distance = (
-                resistance - close
+                resistance
+                - close
             ) / sr_range
 
             if support_distance <= 0.20:
+
                 call_score += 10
+
                 call_reasons.append(
                     "Цена рядом с поддержкой"
                 )
 
             elif resistance_distance <= 0.20:
+
                 put_score += 10
+
                 put_reasons.append(
                     "Цена рядом с сопротивлением"
                 )
 
-        # -----------------------------------------------------
-        # 9. Volatility — 5
-        # -----------------------------------------------------
+        # =====================================================
+        # 9. VOLATILITY — 5
+        # =====================================================
 
         if volatility is not None:
+
             if volatility > 0:
-                # Умеренная волатильность лучше полной тишины.
+
                 call_score += 2.5
                 put_score += 2.5
 
@@ -997,26 +1317,42 @@ class SignalEngine:
         # =====================================================
 
         call_score = float(
-            min(100.0, max(0.0, call_score))
+            min(
+                100.0,
+                max(
+                    0.0,
+                    call_score,
+                ),
+            )
         )
 
         put_score = float(
-            min(100.0, max(0.0, put_score))
+            min(
+                100.0,
+                max(
+                    0.0,
+                    put_score,
+                ),
+            )
         )
 
         if call_score >= put_score:
+
             direction = "CALL"
             quality = call_score
             losing_score = put_score
             reasons = call_reasons
+
         else:
+
             direction = "PUT"
             quality = put_score
             losing_score = call_score
             reasons = put_reasons
 
         score_difference = (
-            quality - losing_score
+            quality
+            - losing_score
         )
 
         confirmations = len(
@@ -1037,11 +1373,13 @@ class SignalEngine:
         # =====================================================
 
         if score_difference < 12:
+
             print(
                 f"❌ REJECTED: {pair} | "
-                f"Разница сигналов слишком мала: "
+                "Разница сигналов слишком мала: "
                 f"{score_difference:.1f} < 12"
             )
+
             return None
 
         # =====================================================
@@ -1049,11 +1387,13 @@ class SignalEngine:
         # =====================================================
 
         if quality < self.min_quality:
+
             print(
                 f"❌ REJECTED: {pair} | "
                 f"Quality {quality:.1f} < "
                 f"{self.min_quality:.1f}"
             )
+
             return None
 
         # =====================================================
@@ -1070,15 +1410,23 @@ class SignalEngine:
 
         print(
             f"🎯 {pair} | "
-            f"probability={probability:.1f}%"
+            f"probability="
+            f"{probability:.1f}%"
         )
 
+        # =====================================================
+        # PROBABILITY FILTER
+        # =====================================================
+
         if probability < self.min_probability:
+
             print(
                 f"❌ REJECTED: {pair} | "
-                f"Probability {probability:.1f}% < "
+                f"Probability "
+                f"{probability:.1f}% < "
                 f"{self.min_probability:.1f}%"
             )
+
             return None
 
         # =====================================================
@@ -1087,37 +1435,47 @@ class SignalEngine:
 
         analysis_time = self._now()
 
-        entry_time = self._next_5_minute(
-            analysis_time
+        entry_time = (
+            self._get_entry_time(
+                analysis_time
+            )
         )
 
         expiry_time = (
-            entry_time
-            + timedelta(minutes=5)
+            self._get_expiry_time(
+                entry_time,
+                expiry_minutes,
+            )
         )
 
         # =====================================================
         # FINAL SIGNAL
         # =====================================================
 
-        print(
-            "=" * 70
-        )
+        print("=" * 70)
 
         print(
             f"✅ SIGNAL FOUND: {pair}"
         )
 
         print(
-            f"📊 Direction: {direction}"
+            f"📊 Direction: "
+            f"{direction}"
         )
 
         print(
-            f"⭐ Quality: {quality:.1f}"
+            f"⭐ Quality: "
+            f"{quality:.1f}"
         )
 
         print(
-            f"🎯 Probability: {probability:.1f}%"
+            f"🎯 Probability: "
+            f"{probability:.1f}%"
+        )
+
+        print(
+            f"⏱️ Duration: "
+            f"{expiry_minutes}m"
         )
 
         print(
@@ -1135,9 +1493,7 @@ class SignalEngine:
             f"{confirmations}"
         )
 
-        print(
-            "=" * 70
-        )
+        print("=" * 70)
 
         return Signal(
             pair=pair,
@@ -1147,6 +1503,185 @@ class SignalEngine:
             entry_time=entry_time,
             expiry_time=expiry_time,
             analysis_time=analysis_time,
-            confirmations=list(reasons),
-            reasons=list(reasons),
+            confirmations=list(
+                reasons
+            ),
+            reasons=list(
+                reasons
+            ),
         )
+
+    # =========================================================
+    # ANALYZE WITH ANY EXPIRY
+    # =========================================================
+
+    def analyze_with_expiry(
+        self,
+        pair: str,
+        candles: pd.DataFrame,
+        expiry_minutes: int,
+    ) -> Optional[Signal]:
+        """
+        Явный метод для нового интерфейса.
+
+        Пример:
+
+            engine.analyze_with_expiry(
+                "EUR/USD",
+                candles,
+                10,
+            )
+
+        Аналогичен:
+
+            engine.analyze(
+                "EUR/USD",
+                candles,
+                expiry_minutes=10,
+            )
+        """
+
+        return self.analyze(
+            pair=pair,
+            candles=candles,
+            expiry_minutes=expiry_minutes,
+        )
+
+    # =========================================================
+    # ANALYZE ALL EXPIRIES
+    # =========================================================
+
+    def analyze_all_expiries(
+        self,
+        pair: str,
+        candles: pd.DataFrame,
+    ) -> dict[int, Optional[Signal]]:
+        """
+        Анализирует текущий рынок для всех длительностей
+        от 1 до 20 минут.
+
+        ВАЖНО:
+
+        Индикаторы рассчитываются один раз.
+        Для каждой длительности создаётся независимый
+        Signal с соответствующим expiry_time.
+
+        Если направление рынка одинаковое, это не означает,
+        что все 20 сигналов гарантированно одинаково успешны.
+        """
+
+        result: dict[
+            int,
+            Optional[Signal],
+        ] = {}
+
+        for minutes in range(
+            self.MIN_EXPIRY_MINUTES,
+            self.MAX_EXPIRY_MINUTES + 1,
+        ):
+
+            signal = self.analyze(
+                pair=pair,
+                candles=candles,
+                expiry_minutes=minutes,
+            )
+
+            result[minutes] = signal
+
+        return result
+
+    # =========================================================
+    # BEST EXPIRY
+    # =========================================================
+
+    @staticmethod
+    def _expiry_score(
+        signal: Optional[Signal],
+    ) -> float:
+
+        if signal is None:
+            return -1.0
+
+        return (
+            float(signal.probability)
+            * 0.65
+            +
+            float(signal.quality)
+            * 0.35
+        )
+
+    def choose_best_expiry(
+        self,
+        pair: str,
+        candles: pd.DataFrame,
+        preferred_minutes: Optional[int] = None,
+    ) -> Optional[Signal]:
+        """
+        Выбирает лучший вариант длительности.
+
+        Если preferred_minutes указан —
+        сначала проверяется именно он.
+
+        Если preferred_minutes=None —
+        проверяются 1..20 минут.
+
+        Если ни один вариант не проходит фильтры —
+        возвращается None.
+        """
+
+        if preferred_minutes is not None:
+
+            preferred_minutes = (
+                self.normalize_expiry_minutes(
+                    preferred_minutes
+                )
+            )
+
+            return self.analyze(
+                pair=pair,
+                candles=candles,
+                expiry_minutes=preferred_minutes,
+            )
+
+        best_signal: Optional[
+            Signal
+        ] = None
+
+        best_score = -1.0
+
+        for minutes in range(
+            self.MIN_EXPIRY_MINUTES,
+            self.MAX_EXPIRY_MINUTES + 1,
+        ):
+
+            signal = self.analyze(
+                pair=pair,
+                candles=candles,
+                expiry_minutes=minutes,
+            )
+
+            score = (
+                self._expiry_score(
+                    signal
+                )
+            )
+
+            if (
+                signal is not None
+                and score > best_score
+            ):
+
+                best_signal = signal
+                best_score = score
+
+        return best_signal
+
+
+# =========================================================
+# BACKWARD COMPATIBILITY
+# =========================================================
+
+__all__ = [
+    "Signal",
+    "SignalEngine",
+]
