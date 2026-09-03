@@ -1,29 +1,16 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
-from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from config import MIN_PROBABILITY, MIN_QUALITY, TIMEZONE
 from indicators import calculate_indicators
 
-
-# ============================================================
-# TIMEZONE
-# ============================================================
-
-try:
-    MOSCOW_TZ = ZoneInfo(TIMEZONE)
-except Exception:
-    MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-
-
-# ============================================================
-# SIGNAL DATACLASS
-# ============================================================
 
 @dataclass
 class Signal:
@@ -38,233 +25,369 @@ class Signal:
     reasons: list[str]
 
 
-# ============================================================
-# SIGNAL ENGINE
-# ============================================================
-
 class SignalEngine:
     """
-    Анализатор торговых сигналов.
+    Основной движок анализа торговых сигналов.
+
+    Вход:
+        OHLCV свечи.
+
+    Выход:
+        Signal либо None.
 
     ВАЖНО:
-    probability здесь является РАСЧЁТНОЙ ОЦЕНКОЙ
-    силы сигнала, а не гарантированной вероятностью
-    выигрыша.
-
-    Реальный WINRATE необходимо калибровать
-    по фактической истории WIN/LOSS.
+        Движок не создаёт искусственный сигнал.
+        Если качество недостаточное — сигнал отклоняется.
     """
 
-    # --------------------------------------------------------
-    # INIT
-    # --------------------------------------------------------
+    REQUIRED_INDICATORS = [
+        "close",
+        "ema_fast",
+        "ema_slow",
+        "ema_50",
+        "rsi",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "bb_upper",
+        "bb_lower",
+        "stoch_k",
+        "stoch_d",
+        "atr",
+        "body_ratio",
+        "support",
+        "resistance",
+        "ema_fast_slope",
+        "volatility",
+    ]
+
+    MIN_CANDLES = 80
 
     def __init__(
         self,
         min_quality: Optional[float] = None,
         min_probability: Optional[float] = None,
-    ):
+    ) -> None:
         self.min_quality = (
-            float(min_quality)
-            if min_quality is not None
-            else float(MIN_QUALITY)
+            float(MIN_QUALITY)
+            if min_quality is None
+            else float(min_quality)
         )
 
         self.min_probability = (
-            float(min_probability)
-            if min_probability is not None
-            else float(MIN_PROBABILITY)
+            float(MIN_PROBABILITY)
+            if min_probability is None
+            else float(min_probability)
         )
 
-    # --------------------------------------------------------
+        print(
+            "[ENGINE] Initialized | "
+            f"min_quality={self.min_quality:.1f} | "
+            f"min_probability={self.min_probability:.1f}%"
+        )
+
+    # =========================================================
     # TIME
-    # --------------------------------------------------------
+    # =========================================================
 
     @staticmethod
-    def _now_moscow() -> datetime:
-        return datetime.now(MOSCOW_TZ)
+    def _timezone():
+        try:
+            if hasattr(TIMEZONE, "utcoffset"):
+                return TIMEZONE
 
-    @staticmethod
+            from zoneinfo import ZoneInfo
+
+            return ZoneInfo(str(TIMEZONE))
+
+        except Exception:
+            from zoneinfo import ZoneInfo
+
+            return ZoneInfo("Europe/Moscow")
+
+    def _now(self) -> datetime:
+        return datetime.now(self._timezone())
+
     def _next_5_minute(
-        current_time: Optional[datetime] = None,
+        self,
+        dt: Optional[datetime] = None,
     ) -> datetime:
         """
-        Возвращает ближайшую следующую пятиминутную отметку
-        именно в часовом поясе Москвы.
-
-        Например:
-
-        14:01 -> 14:05
-        14:04 -> 14:05
-        14:05 -> 14:10
-        14:59 -> 15:00
+        Возвращает ближайшую следующую 5-минутную отметку.
         """
 
-        if current_time is None:
-            current_time = SignalEngine._now_moscow()
+        if dt is None:
+            dt = self._now()
 
-        if current_time.tzinfo is None:
-            current_time = current_time.replace(
-                tzinfo=timezone.utc
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=self._timezone()
             )
 
-        current_time = current_time.astimezone(MOSCOW_TZ)
+        dt = dt.astimezone(
+            self._timezone()
+        )
 
-        next_minute = (
-            (current_time.minute // 5) + 1
+        minute = (
+            (dt.minute // 5) + 1
         ) * 5
 
-        if next_minute >= 60:
-            return (
-                current_time + timedelta(hours=1)
-            ).replace(
-                minute=0,
+        if minute >= 60:
+            result = (
+                dt.replace(
+                    minute=0,
+                    second=0,
+                    microsecond=0,
+                )
+                + timedelta(hours=1)
+            )
+        else:
+            result = dt.replace(
+                minute=minute,
                 second=0,
                 microsecond=0,
             )
 
-        return current_time.replace(
-            minute=next_minute,
-            second=0,
-            microsecond=0,
-        )
+        return result
 
-    # --------------------------------------------------------
+    # =========================================================
     # HELPERS
-    # --------------------------------------------------------
-
-    @staticmethod
-    def _clamp(
-        value: float,
-        minimum: float,
-        maximum: float,
-    ) -> float:
-        return max(
-            minimum,
-            min(maximum, value),
-        )
+    # =========================================================
 
     @staticmethod
     def _safe_float(value) -> Optional[float]:
         try:
             result = float(value)
 
-            if pd.isna(result):
+            if not math.isfinite(result):
                 return None
 
             return result
 
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             return None
 
     @staticmethod
-    def _last_row(df: pd.DataFrame):
-        if df is None or df.empty:
-            return None
+    def _ensure_numeric(
+        df: pd.DataFrame,
+        columns: list[str],
+    ) -> pd.DataFrame:
+        result = df.copy()
 
-        return df.iloc[-1]
+        for column in columns:
+            if column in result.columns:
+                result[column] = pd.to_numeric(
+                    result[column],
+                    errors="coerce",
+                )
 
-    @staticmethod
-    def _append_unique(
-        items: list[str],
-        value: str,
-    ) -> None:
-        if value and value not in items:
-            items.append(value)
+        return result
 
-    # --------------------------------------------------------
+    # =========================================================
+    # INDICATOR NORMALIZATION
+    # =========================================================
+
+    def _normalize_indicators(
+        self,
+        df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Нормализует старые и новые названия индикаторов.
+
+        Поддерживаются оба варианта:
+
+            ema_9          -> ema_fast
+            ema_21         -> ema_slow
+            macd_histogram -> macd_hist
+            ema9_slope     -> ema_fast_slope
+        """
+
+        df = df.copy()
+
+        # -----------------------------------------------------
+        # EMA
+        # -----------------------------------------------------
+
+        if (
+            "ema_fast" not in df.columns
+            and "ema_9" in df.columns
+        ):
+            df["ema_fast"] = df["ema_9"]
+
+        if (
+            "ema_slow" not in df.columns
+            and "ema_21" in df.columns
+        ):
+            df["ema_slow"] = df["ema_21"]
+
+        # -----------------------------------------------------
+        # MACD histogram
+        # -----------------------------------------------------
+
+        if (
+            "macd_hist" not in df.columns
+            and "macd_histogram" in df.columns
+        ):
+            df["macd_hist"] = df[
+                "macd_histogram"
+            ]
+
+        # -----------------------------------------------------
+        # EMA slope
+        # -----------------------------------------------------
+
+        if (
+            "ema_fast_slope" not in df.columns
+            and "ema9_slope" in df.columns
+        ):
+            df["ema_fast_slope"] = df[
+                "ema9_slope"
+            ]
+
+        # -----------------------------------------------------
+        # Если indicators.py вообще не создал EMA,
+        # рассчитываем их здесь.
+        # -----------------------------------------------------
+
+        if "close" in df.columns:
+            close = pd.to_numeric(
+                df["close"],
+                errors="coerce",
+            )
+
+            if "ema_fast" not in df.columns:
+                df["ema_fast"] = close.ewm(
+                    span=9,
+                    adjust=False,
+                ).mean()
+
+            if "ema_slow" not in df.columns:
+                df["ema_slow"] = close.ewm(
+                    span=21,
+                    adjust=False,
+                ).mean()
+
+            if "ema_50" not in df.columns:
+                df["ema_50"] = close.ewm(
+                    span=50,
+                    adjust=False,
+                ).mean()
+
+        # -----------------------------------------------------
+        # MACD fallback
+        # -----------------------------------------------------
+
+        if "close" in df.columns:
+            close = pd.to_numeric(
+                df["close"],
+                errors="coerce",
+            )
+
+            if "macd" not in df.columns:
+                ema_12 = close.ewm(
+                    span=12,
+                    adjust=False,
+                ).mean()
+
+                ema_26 = close.ewm(
+                    span=26,
+                    adjust=False,
+                ).mean()
+
+                df["macd"] = (
+                    ema_12 - ema_26
+                )
+
+            if "macd_signal" not in df.columns:
+                df["macd_signal"] = (
+                    df["macd"].ewm(
+                        span=9,
+                        adjust=False,
+                    ).mean()
+                )
+
+            if "macd_hist" not in df.columns:
+                df["macd_hist"] = (
+                    df["macd"]
+                    - df["macd_signal"]
+                )
+
+        # -----------------------------------------------------
+        # EMA slope fallback
+        # -----------------------------------------------------
+
+        if (
+            "ema_fast" in df.columns
+            and "ema_fast_slope" not in df.columns
+        ):
+            df["ema_fast_slope"] = (
+                df["ema_fast"]
+                - df["ema_fast"].shift(3)
+            )
+
+        return df
+
+    # =========================================================
     # PROBABILITY
-    # --------------------------------------------------------
+    # =========================================================
 
     def _calculate_probability(
         self,
         quality: float,
         score_difference: float,
-        confirmations_count: int,
+        confirmations: int,
     ) -> float:
         """
-        Расчётная confidence-оценка.
+        Расчёт внутренней оценки вероятности.
 
-        Это НЕ реальная статистическая вероятность.
-
-        Чем выше:
-        - качество;
-        - разница CALL/PUT;
-        - количество подтверждений;
-
-        тем выше confidence.
+        Это НЕ гарантия выигрыша.
         """
 
-        # Базовая оценка от качества.
-        #
-        # 85 quality -> около 75%
-        # 90 quality -> около 78%
-        # 95 quality -> около 82%
-        # 100 quality -> около 85%
-        probability = 50.0 + (
-            quality * 0.35
+        probability = (
+            50.0
+            + quality * 0.35
         )
 
-        # Дополнительная уверенность,
-        # когда одно направление сильно доминирует.
         if score_difference >= 35:
             probability += 5.0
+
         elif score_difference >= 30:
             probability += 4.0
+
         elif score_difference >= 25:
             probability += 3.0
+
         elif score_difference >= 20:
             probability += 2.0
+
         elif score_difference >= 15:
             probability += 1.0
 
-        # Количество независимых подтверждений.
-        if confirmations_count >= 7:
+        if confirmations >= 7:
             probability += 3.0
-        elif confirmations_count >= 6:
+
+        elif confirmations >= 6:
             probability += 2.0
-        elif confirmations_count >= 5:
+
+        elif confirmations >= 5:
             probability += 1.0
 
-        return round(
-            self._clamp(
-                probability,
+        return float(
+            max(
                 50.0,
-                95.0,
-            ),
-            1,
+                min(
+                    95.0,
+                    probability,
+                ),
+            )
         )
 
-    # --------------------------------------------------------
-    # INDICATOR VALIDATION
-    # --------------------------------------------------------
-
-    @staticmethod
-    def _required_columns() -> list[str]:
-        return [
-            "close",
-            "ema_fast",
-            "ema_slow",
-            "ema_50",
-            "rsi",
-            "macd",
-            "macd_signal",
-            "macd_hist",
-            "bb_upper",
-            "bb_lower",
-            "stoch_k",
-            "stoch_d",
-            "atr",
-            "body_ratio",
-            "support",
-            "resistance",
-            "ema_fast_slope",
-            "volatility",
-        ]
-
-    # --------------------------------------------------------
-    # MAIN ANALYSIS
-    # --------------------------------------------------------
+    # =========================================================
+    # ANALYZE
+    # =========================================================
 
     def analyze(
         self,
@@ -272,26 +395,17 @@ class SignalEngine:
         candles: pd.DataFrame,
     ) -> Optional[Signal]:
 
-        pair = str(pair).strip()
-
-        analysis_time = self._now_moscow()
-
-        print("")
         print("=" * 70)
         print(f"🔎 ANALYSIS: {pair}")
         print("=" * 70)
 
-        # ----------------------------------------------------
-        # CANDLES
-        # ----------------------------------------------------
+        # -----------------------------------------------------
+        # Проверка DataFrame
+        # -----------------------------------------------------
 
         if candles is None:
             print(
-                f"❌ {pair}: candles=None"
-            )
-            print(
-                f"❌ REJECTED: {pair} | "
-                f"Причина: нет данных"
+                f"❌ REJECTED: {pair} | candles=None"
             )
             return None
 
@@ -300,22 +414,9 @@ class SignalEngine:
             pd.DataFrame,
         ):
             print(
-                f"❌ {pair}: неправильный тип данных: "
+                f"❌ REJECTED: {pair} | "
+                f"invalid candles type: "
                 f"{type(candles).__name__}"
-            )
-            print(
-                f"❌ REJECTED: {pair} | "
-                f"Причина: неправильный DataFrame"
-            )
-            return None
-
-        if candles.empty:
-            print(
-                f"❌ {pair}: DataFrame пустой"
-            )
-            print(
-                f"❌ REJECTED: {pair} | "
-                f"Причина: нет свечей"
             )
             return None
 
@@ -323,19 +424,50 @@ class SignalEngine:
             f"📥 Candles received: {len(candles)}"
         )
 
-        # Нам нужно достаточно истории
-        # для расчёта индикаторов.
-        if len(candles) < 80:
+        if candles.empty:
             print(
                 f"❌ REJECTED: {pair} | "
-                f"Недостаточно свечей: "
-                f"{len(candles)}/80"
+                "candles empty"
             )
             return None
 
-        # ----------------------------------------------------
-        # INDICATORS
-        # ----------------------------------------------------
+        if len(candles) < self.MIN_CANDLES:
+            print(
+                f"❌ REJECTED: {pair} | "
+                f"недостаточно свечей: "
+                f"{len(candles)} < "
+                f"{self.MIN_CANDLES}"
+            )
+            return None
+
+        # -----------------------------------------------------
+        # Проверка OHLC
+        # -----------------------------------------------------
+
+        required_ohlc = [
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+
+        missing_ohlc = [
+            column
+            for column in required_ohlc
+            if column not in candles.columns
+        ]
+
+        if missing_ohlc:
+            print(
+                f"❌ REJECTED: {pair} | "
+                f"Отсутствуют OHLC: "
+                f"{', '.join(missing_ohlc)}"
+            )
+            return None
+
+        # -----------------------------------------------------
+        # Расчёт индикаторов
+        # -----------------------------------------------------
 
         try:
             df = calculate_indicators(
@@ -344,253 +476,213 @@ class SignalEngine:
 
         except Exception as exc:
             print(
-                f"❌ {pair}: ошибка "
-                f"calculate_indicators: "
+                f"❌ INDICATOR ERROR: {pair} | "
                 f"{type(exc).__name__}: {exc}"
             )
-
-            print(
-                f"❌ REJECTED: {pair} | "
-                f"Ошибка расчёта индикаторов"
-            )
-
             return None
 
-        if df is None or df.empty:
+        if df is None:
             print(
                 f"❌ REJECTED: {pair} | "
-                f"Индикаторы вернули пустой DataFrame"
+                "calculate_indicators returned None"
             )
             return None
 
-        # Если последняя свеча формирующаяся,
-        # не используем её.
-        if len(df) > 1:
-            df = df.iloc[:-1].copy()
-
-        if len(df) < 70:
+        if not isinstance(
+            df,
+            pd.DataFrame,
+        ):
             print(
                 f"❌ REJECTED: {pair} | "
-                f"Недостаточно готовых свечей "
-                f"после фильтрации: "
-                f"{len(df)}/70"
+                "calculate_indicators returned "
+                f"{type(df).__name__}"
             )
             return None
 
-        # ----------------------------------------------------
-        # REQUIRED COLUMNS
-        # ----------------------------------------------------
-
-        required_columns = (
-            self._required_columns()
+        print(
+            f"📊 Indicators result: "
+            f"{len(df)} rows"
         )
+
+        print(
+            f"📋 Indicator columns: "
+            f"{', '.join(map(str, df.columns))}"
+        )
+
+        # -----------------------------------------------------
+        # Нормализация индикаторов
+        # -----------------------------------------------------
+
+        df = self._normalize_indicators(
+            df
+        )
+
+        print(
+            f"📋 Normalized columns: "
+            f"{', '.join(map(str, df.columns))}"
+        )
+
+        # -----------------------------------------------------
+        # Проверка обязательных индикаторов
+        # -----------------------------------------------------
 
         missing = [
             column
-            for column in required_columns
+            for column in self.REQUIRED_INDICATORS
             if column not in df.columns
         ]
 
         if missing:
             print(
                 f"❌ REJECTED: {pair} | "
-                f"Отсутствуют индикаторы: "
+                "Отсутствуют индикаторы: "
                 f"{', '.join(missing)}"
             )
             return None
 
-        # ----------------------------------------------------
-        # LAST ROW
-        # ----------------------------------------------------
+        # -----------------------------------------------------
+        # Числовая нормализация
+        # -----------------------------------------------------
 
-        row = self._last_row(df)
+        df = self._ensure_numeric(
+            df,
+            self.REQUIRED_INDICATORS,
+        )
 
-        if row is None:
+        # -----------------------------------------------------
+        # Удаляем формирующуюся последнюю свечу
+        # -----------------------------------------------------
+
+        if len(df) > 1:
+            df = df.iloc[:-1].copy()
+
+        if len(df) < 70:
             print(
                 f"❌ REJECTED: {pair} | "
-                f"Последняя свеча отсутствует"
+                f"после подготовки осталось "
+                f"{len(df)} свечей"
             )
             return None
 
-        # ----------------------------------------------------
-        # VALUES
-        # ----------------------------------------------------
+        # -----------------------------------------------------
+        # Последняя закрытая свеча
+        # -----------------------------------------------------
 
-        close = self._safe_float(
-            row.get("close")
-        )
+        row = df.iloc[-1]
 
-        ema_fast = self._safe_float(
-            row.get("ema_fast")
-        )
+        # -----------------------------------------------------
+        # Проверяем значения
+        # -----------------------------------------------------
 
-        ema_slow = self._safe_float(
-            row.get("ema_slow")
-        )
+        invalid_values: list[str] = []
 
-        ema_50 = self._safe_float(
-            row.get("ema_50")
-        )
+        for column in self.REQUIRED_INDICATORS:
+            value = self._safe_float(
+                row.get(column)
+            )
 
-        rsi = self._safe_float(
-            row.get("rsi")
-        )
-
-        macd = self._safe_float(
-            row.get("macd")
-        )
-
-        macd_signal = self._safe_float(
-            row.get("macd_signal")
-        )
-
-        macd_hist = self._safe_float(
-            row.get("macd_hist")
-        )
-
-        bb_upper = self._safe_float(
-            row.get("bb_upper")
-        )
-
-        bb_lower = self._safe_float(
-            row.get("bb_lower")
-        )
-
-        stoch_k = self._safe_float(
-            row.get("stoch_k")
-        )
-
-        stoch_d = self._safe_float(
-            row.get("stoch_d")
-        )
-
-        atr = self._safe_float(
-            row.get("atr")
-        )
-
-        body_ratio = self._safe_float(
-            row.get("body_ratio")
-        )
-
-        support = self._safe_float(
-            row.get("support")
-        )
-
-        resistance = self._safe_float(
-            row.get("resistance")
-        )
-
-        ema_fast_slope = self._safe_float(
-            row.get("ema_fast_slope")
-        )
-
-        volatility = self._safe_float(
-            row.get("volatility")
-        )
-
-        values = {
-            "close": close,
-            "ema_fast": ema_fast,
-            "ema_slow": ema_slow,
-            "ema_50": ema_50,
-            "rsi": rsi,
-            "macd": macd,
-            "macd_signal": macd_signal,
-            "macd_hist": macd_hist,
-            "bb_upper": bb_upper,
-            "bb_lower": bb_lower,
-            "stoch_k": stoch_k,
-            "stoch_d": stoch_d,
-            "atr": atr,
-            "body_ratio": body_ratio,
-            "support": support,
-            "resistance": resistance,
-            "ema_fast_slope": ema_fast_slope,
-            "volatility": volatility,
-        }
-
-        invalid_values = [
-            name
-            for name, value in values.items()
-            if value is None
-        ]
+            if value is None:
+                invalid_values.append(
+                    column
+                )
 
         if invalid_values:
             print(
                 f"❌ REJECTED: {pair} | "
-                f"Некорректные значения: "
+                "Некорректные/NaN значения: "
                 f"{', '.join(invalid_values)}"
             )
             return None
 
-        # ----------------------------------------------------
-        # DEBUG VALUES
-        # ----------------------------------------------------
+        # =====================================================
+        # VALUES
+        # =====================================================
 
-        print(
-            f"💰 CLOSE: {close}"
+        close = self._safe_float(
+            row["close"]
         )
 
-        print(
-            f"📈 EMA FAST: {ema_fast:.8f}"
+        ema_fast = self._safe_float(
+            row["ema_fast"]
         )
 
-        print(
-            f"📈 EMA SLOW: {ema_slow:.8f}"
+        ema_slow = self._safe_float(
+            row["ema_slow"]
         )
 
-        print(
-            f"📈 EMA 50: {ema_50:.8f}"
+        ema_50 = self._safe_float(
+            row["ema_50"]
         )
 
-        print(
-            f"📊 RSI: {rsi:.2f}"
+        rsi = self._safe_float(
+            row["rsi"]
         )
 
-        print(
-            f"📊 MACD: {macd:.8f}"
+        macd = self._safe_float(
+            row["macd"]
         )
 
-        print(
-            f"📊 MACD SIGNAL: {macd_signal:.8f}"
+        macd_signal = self._safe_float(
+            row["macd_signal"]
         )
 
-        print(
-            f"📊 MACD HIST: {macd_hist:.8f}"
+        macd_hist = self._safe_float(
+            row["macd_hist"]
         )
 
-        print(
-            f"📊 STOCH K: {stoch_k:.2f}"
+        bb_upper = self._safe_float(
+            row["bb_upper"]
         )
 
-        print(
-            f"📊 STOCH D: {stoch_d:.2f}"
+        bb_lower = self._safe_float(
+            row["bb_lower"]
         )
 
-        print(
-            f"📊 BODY RATIO: {body_ratio:.2f}"
+        stoch_k = self._safe_float(
+            row["stoch_k"]
         )
 
-        print(
-            f"📊 VOLATILITY: {volatility:.6f}"
+        stoch_d = self._safe_float(
+            row["stoch_d"]
         )
 
-        # ----------------------------------------------------
-        # SCORES
-        # ----------------------------------------------------
+        atr = self._safe_float(
+            row["atr"]
+        )
+
+        body_ratio = self._safe_float(
+            row["body_ratio"]
+        )
+
+        support = self._safe_float(
+            row["support"]
+        )
+
+        resistance = self._safe_float(
+            row["resistance"]
+        )
+
+        ema_fast_slope = self._safe_float(
+            row["ema_fast_slope"]
+        )
+
+        volatility = self._safe_float(
+            row["volatility"]
+        )
+
+        # =====================================================
+        # SCORE
+        # =====================================================
 
         call_score = 0.0
         put_score = 0.0
 
-        call_confirmations: list[str] = []
-        put_confirmations: list[str] = []
-
         call_reasons: list[str] = []
         put_reasons: list[str] = []
 
-        # ====================================================
-        # 1. EMA TREND — 20 POINTS
-        # ====================================================
+        # -----------------------------------------------------
+        # 1. EMA TREND — 20
+        # -----------------------------------------------------
 
         if (
             close > ema_fast
@@ -598,15 +690,8 @@ class SignalEngine:
             and ema_slow > ema_50
         ):
             call_score += 20
-
-            self._append_unique(
-                call_confirmations,
-                "EMA тренд вверх",
-            )
-
-            self._append_unique(
-                call_reasons,
-                "Цена выше EMA и EMA выстроены вверх",
+            call_reasons.append(
+                "EMA bullish trend"
             )
 
         elif (
@@ -615,113 +700,49 @@ class SignalEngine:
             and ema_slow < ema_50
         ):
             put_score += 20
-
-            self._append_unique(
-                put_confirmations,
-                "EMA тренд вниз",
-            )
-
-            self._append_unique(
-                put_reasons,
-                "Цена ниже EMA и EMA выстроены вниз",
-            )
-
-        elif (
-            close > ema_fast
-            and ema_fast >= ema_slow
-        ):
-            call_score += 13
-
-            self._append_unique(
-                call_confirmations,
-                "EMA тренд вверх",
-            )
-
-            self._append_unique(
-                call_reasons,
-                "Краткосрочный EMA-тренд вверх",
-            )
-
-        elif (
-            close < ema_fast
-            and ema_fast <= ema_slow
-        ):
-            put_score += 13
-
-            self._append_unique(
-                put_confirmations,
-                "EMA тренд вниз",
-            )
-
-            self._append_unique(
-                put_reasons,
-                "Краткосрочный EMA-тренд вниз",
+            put_reasons.append(
+                "EMA bearish trend"
             )
 
         elif close > ema_fast:
-            call_score += 8
-
-            self._append_unique(
-                call_confirmations,
-                "Цена выше EMA",
+            call_score += 10
+            call_reasons.append(
+                "Цена выше EMA fast"
             )
 
         elif close < ema_fast:
-            put_score += 8
-
-            self._append_unique(
-                put_confirmations,
-                "Цена ниже EMA",
+            put_score += 10
+            put_reasons.append(
+                "Цена ниже EMA fast"
             )
 
-        # ====================================================
-        # 2. EMA SLOPE / MOMENTUM — 10 POINTS
-        # ====================================================
+        # -----------------------------------------------------
+        # 2. EMA SLOPE — 10
+        # -----------------------------------------------------
 
         if ema_fast_slope > 0:
             call_score += 10
-
-            self._append_unique(
-                call_confirmations,
-                "Импульс вверх",
-            )
-
-            self._append_unique(
-                call_reasons,
-                "EMA fast направлена вверх",
+            call_reasons.append(
+                "EMA fast растёт"
             )
 
         elif ema_fast_slope < 0:
             put_score += 10
-
-            self._append_unique(
-                put_confirmations,
-                "Импульс вниз",
+            put_reasons.append(
+                "EMA fast снижается"
             )
 
-            self._append_unique(
-                put_reasons,
-                "EMA fast направлена вниз",
-            )
-
-        # ====================================================
-        # 3. MACD — 15 POINTS
-        # ====================================================
+        # -----------------------------------------------------
+        # 3. MACD — 15
+        # -----------------------------------------------------
 
         if (
             macd > macd_signal
             and macd_hist > 0
         ):
             call_score += 15
-
-            self._append_unique(
-                call_confirmations,
-                "MACD подтверждает CALL",
-            )
-
-            self._append_unique(
-                call_reasons,
-                "MACD и histogram выше нуля",
+            call_reasons.append(
+                "MACD bullish"
             )
 
         elif (
@@ -729,181 +750,98 @@ class SignalEngine:
             and macd_hist < 0
         ):
             put_score += 15
-
-            self._append_unique(
-                put_confirmations,
-                "MACD подтверждает PUT",
+            put_reasons.append(
+                "MACD bearish"
             )
 
-            self._append_unique(
-                put_reasons,
-                "MACD и histogram ниже нуля",
+        elif macd_hist > 0:
+            call_score += 7
+            call_reasons.append(
+                "MACD histogram positive"
             )
 
-        elif macd > macd_signal:
-            call_score += 8
-
-            self._append_unique(
-                call_confirmations,
-                "MACD подтверждает CALL",
+        elif macd_hist < 0:
+            put_score += 7
+            put_reasons.append(
+                "MACD histogram negative"
             )
 
-        elif macd < macd_signal:
-            put_score += 8
+        # -----------------------------------------------------
+        # 4. RSI — 10
+        # -----------------------------------------------------
 
-            self._append_unique(
-                put_confirmations,
-                "MACD подтверждает PUT",
-            )
-
-        # ====================================================
-        # 4. RSI — 10 POINTS
-        # ====================================================
-
-        # CALL:
-        # нормальная бычья зона.
-        if 52 <= rsi <= 68:
+        if 50 <= rsi <= 68:
             call_score += 10
-
-            self._append_unique(
-                call_confirmations,
-                "RSI подтверждает рост",
+            call_reasons.append(
+                "RSI подтверждает CALL"
             )
 
-            self._append_unique(
-                call_reasons,
-                "RSI находится в бычьей зоне",
-            )
-
-        elif 50 < rsi < 52:
-            call_score += 5
-
-            self._append_unique(
-                call_confirmations,
-                "RSI поддерживает CALL",
-            )
-
-        # PUT:
-        # нормальная медвежья зона.
-        elif 32 <= rsi <= 48:
+        elif 32 <= rsi < 50:
             put_score += 10
-
-            self._append_unique(
-                put_confirmations,
-                "RSI подтверждает падение",
+            put_reasons.append(
+                "RSI подтверждает PUT"
             )
 
-            self._append_unique(
-                put_reasons,
-                "RSI находится в медвежьей зоне",
-            )
-
-        elif 48 < rsi < 50:
-            put_score += 5
-
-            self._append_unique(
-                put_confirmations,
-                "RSI поддерживает PUT",
-            )
-
-        # Экстремальные зоны сами по себе
-        # не заставляют нас открывать сделку.
         elif rsi < 30:
-            self._append_unique(
-                call_reasons,
-                "RSI в зоне сильной перепроданности",
+            call_score += 6
+            call_reasons.append(
+                "RSI oversold"
             )
 
         elif rsi > 70:
-            self._append_unique(
-                put_reasons,
-                "RSI в зоне сильной перекупленности",
+            put_score += 6
+            put_reasons.append(
+                "RSI overbought"
             )
 
-        # ====================================================
-        # 5. BOLLINGER BANDS — 10 POINTS
-        # ====================================================
-
-        bb_middle = (
-            bb_upper + bb_lower
-        ) / 2.0
+        # -----------------------------------------------------
+        # 5. Bollinger Bands — 10
+        # -----------------------------------------------------
 
         bb_range = (
             bb_upper - bb_lower
         )
 
-        # Защита от деления на ноль.
-        if bb_range <= 0:
-            bb_position = 0.5
-        else:
+        if bb_range > 0:
             bb_position = (
                 close - bb_lower
             ) / bb_range
 
-        # CALL:
-        # цена в нижней половине BB.
-        if close <= bb_lower:
-            call_score += 10
+            if bb_position <= 0.30:
+                call_score += 10
+                call_reasons.append(
+                    "Цена у нижней Bollinger Band"
+                )
 
-            self._append_unique(
-                call_confirmations,
-                "Цена возле нижней BB",
-            )
+            elif bb_position >= 0.70:
+                put_score += 10
+                put_reasons.append(
+                    "Цена у верхней Bollinger Band"
+                )
 
-            self._append_unique(
-                call_reasons,
-                "Цена находится возле нижней полосы Bollinger",
-            )
+            elif bb_position < 0.50:
+                call_score += 4
+                call_reasons.append(
+                    "Цена ниже середины Bollinger"
+                )
 
-        elif close < bb_middle:
-            call_score += 5
+            else:
+                put_score += 4
+                put_reasons.append(
+                    "Цена выше середины Bollinger"
+                )
 
-            self._append_unique(
-                call_confirmations,
-                "Цена ниже средней BB",
-            )
-
-        # PUT:
-        # цена в верхней половине BB.
-        elif close >= bb_upper:
-            put_score += 10
-
-            self._append_unique(
-                put_confirmations,
-                "Цена возле верхней BB",
-            )
-
-            self._append_unique(
-                put_reasons,
-                "Цена находится возле верхней полосы Bollinger",
-            )
-
-        elif close > bb_middle:
-            put_score += 5
-
-            self._append_unique(
-                put_confirmations,
-                "Цена выше средней BB",
-            )
-
-        # ====================================================
-        # 6. STOCHASTIC — 10 POINTS
-        # ====================================================
+        # -----------------------------------------------------
+        # 6. Stochastic — 10
+        # -----------------------------------------------------
 
         if (
             stoch_k > stoch_d
             and stoch_k < 80
         ):
             call_score += 10
-
-            self._append_unique(
-                call_confirmations,
-                "Stochastic вверх",
-            )
-
-            self._append_unique(
-                call_reasons,
-                "Stochastic поддерживает рост",
+            call_reasons.append(
+                "Stochastic bullish"
             )
 
         elif (
@@ -911,380 +849,243 @@ class SignalEngine:
             and stoch_k > 20
         ):
             put_score += 10
-
-            self._append_unique(
-                put_confirmations,
-                "Stochastic вниз",
-            )
-
-            self._append_unique(
-                put_reasons,
-                "Stochastic поддерживает падение",
+            put_reasons.append(
+                "Stochastic bearish"
             )
 
         elif stoch_k < 20:
-            call_score += 5
-
-            self._append_unique(
-                call_confirmations,
-                "Stochastic разворачивается вверх",
+            call_score += 6
+            call_reasons.append(
+                "Stochastic oversold"
             )
 
         elif stoch_k > 80:
-            put_score += 5
-
-            self._append_unique(
-                put_confirmations,
-                "Stochastic разворачивается вниз",
+            put_score += 6
+            put_reasons.append(
+                "Stochastic overbought"
             )
 
-        # ====================================================
-        # 7. CANDLE — 10 POINTS
-        # ====================================================
+        # -----------------------------------------------------
+        # 7. Candle — 10
+        # -----------------------------------------------------
 
-        # Ограничиваем body_ratio,
-        # чтобы странные данные не ломали score.
-        safe_body_ratio = self._clamp(
-            body_ratio,
-            0.0,
-            1.0,
-        )
-
-        # Определяем направление последней
-        # готовой свечи через OHLC, если возможно.
         candle_open = self._safe_float(
             row.get("open")
         )
 
-        candle_close = self._safe_float(
-            row.get("close")
+        candle_high = self._safe_float(
+            row.get("high")
+        )
+
+        candle_low = self._safe_float(
+            row.get("low")
         )
 
         if (
             candle_open is not None
-            and candle_close is not None
+            and close is not None
+            and candle_high is not None
+            and candle_low is not None
         ):
+            candle_range = (
+                candle_high
+                - candle_low
+            )
 
-            if (
-                candle_close > candle_open
-                and safe_body_ratio >= 0.55
-            ):
-                call_score += 10
-
-                self._append_unique(
-                    call_confirmations,
-                    "Сильная бычья свеча",
+            if candle_range > 0:
+                upper_wick = (
+                    candle_high
+                    - max(
+                        candle_open,
+                        close,
+                    )
                 )
 
-                self._append_unique(
-                    call_reasons,
-                    "Последняя свеча имеет сильное бычье тело",
+                lower_wick = (
+                    min(
+                        candle_open,
+                        close,
+                    )
+                    - candle_low
                 )
 
-            elif (
-                candle_close < candle_open
-                and safe_body_ratio >= 0.55
-            ):
-                put_score += 10
+                if (
+                    close > candle_open
+                    and body_ratio >= 0.55
+                ):
+                    call_score += 10
+                    call_reasons.append(
+                        "Сильная бычья свеча"
+                    )
 
-                self._append_unique(
-                    put_confirmations,
-                    "Сильная медвежья свеча",
-                )
+                elif (
+                    close < candle_open
+                    and body_ratio >= 0.55
+                ):
+                    put_score += 10
+                    put_reasons.append(
+                        "Сильная медвежья свеча"
+                    )
 
-                self._append_unique(
-                    put_reasons,
-                    "Последняя свеча имеет сильное медвежье тело",
-                )
+                elif (
+                    lower_wick > candle_range * 0.45
+                    and close > candle_open
+                ):
+                    call_score += 6
+                    call_reasons.append(
+                        "Бычий rejection"
+                    )
 
-            elif (
-                candle_close > candle_open
-                and safe_body_ratio >= 0.30
-            ):
-                call_score += 5
+                elif (
+                    upper_wick > candle_range * 0.45
+                    and close < candle_open
+                ):
+                    put_score += 6
+                    put_reasons.append(
+                        "Медвежий rejection"
+                    )
 
-                self._append_unique(
-                    call_confirmations,
-                    "Бычья свеча",
-                )
-
-            elif (
-                candle_close < candle_open
-                and safe_body_ratio >= 0.30
-            ):
-                put_score += 5
-
-                self._append_unique(
-                    put_confirmations,
-                    "Медвежья свеча",
-                )
-
-        # ====================================================
-        # 8. SUPPORT / RESISTANCE — 10 POINTS
-        # ====================================================
+        # -----------------------------------------------------
+        # 8. Support / Resistance — 10
+        # -----------------------------------------------------
 
         sr_range = (
             resistance - support
         )
 
         if sr_range > 0:
-            position = (
+            support_distance = (
                 close - support
             ) / sr_range
 
-            position = self._clamp(
-                position,
-                0.0,
-                1.0,
-            )
+            resistance_distance = (
+                resistance - close
+            ) / sr_range
 
-            # Цена ближе к поддержке.
-            if position <= 0.25:
+            if support_distance <= 0.20:
                 call_score += 10
-
-                self._append_unique(
-                    call_confirmations,
-                    "Цена возле поддержки",
+                call_reasons.append(
+                    "Цена рядом с поддержкой"
                 )
 
-                self._append_unique(
-                    call_reasons,
-                    "Цена находится в нижней части локального диапазона",
-                )
-
-            elif position <= 0.40:
-                call_score += 5
-
-                self._append_unique(
-                    call_confirmations,
-                    "Цена ближе к поддержке",
-                )
-
-            # Цена ближе к сопротивлению.
-            elif position >= 0.75:
+            elif resistance_distance <= 0.20:
                 put_score += 10
-
-                self._append_unique(
-                    put_confirmations,
-                    "Цена возле сопротивления",
+                put_reasons.append(
+                    "Цена рядом с сопротивлением"
                 )
 
-                self._append_unique(
-                    put_reasons,
-                    "Цена находится в верхней части локального диапазона",
+        # -----------------------------------------------------
+        # 9. Volatility — 5
+        # -----------------------------------------------------
+
+        if volatility is not None:
+            if volatility > 0:
+                # Умеренная волатильность лучше полной тишины.
+                call_score += 2.5
+                put_score += 2.5
+
+                call_reasons.append(
+                    "Есть рыночная волатильность"
                 )
 
-            elif position >= 0.60:
-                put_score += 5
-
-                self._append_unique(
-                    put_confirmations,
-                    "Цена ближе к сопротивлению",
+                put_reasons.append(
+                    "Есть рыночная волатильность"
                 )
 
-        # ====================================================
-        # 9. VOLATILITY — 5 POINTS
-        # ====================================================
+        # =====================================================
+        # FINAL SCORE
+        # =====================================================
 
-        volatility_score = 0.0
-
-        if atr > 0 and volatility > 0:
-
-            # Слишком маленькая волатильность:
-            # рынок может быть практически мёртвым.
-            if volatility < 0.0005:
-                volatility_score = 0.0
-
-            # Нормальная волатильность.
-            elif volatility < 0.03:
-                volatility_score = 5.0
-
-            # Высокая, но ещё допустимая.
-            elif volatility < 0.08:
-                volatility_score = 4.0
-
-            # Очень высокая волатильность.
-            else:
-                volatility_score = 2.0
-
-        if volatility_score > 0:
-
-            # Волатильность является качеством рынка,
-            # поэтому добавляем её к обоим направлениям.
-            call_score += volatility_score
-            put_score += volatility_score
-
-            self._append_unique(
-                call_confirmations,
-                "Нормальная волатильность",
-            )
-
-            self._append_unique(
-                put_confirmations,
-                "Нормальная волатильность",
-            )
-
-        # ====================================================
-        # CLAMP
-        # ====================================================
-
-        call_score = self._clamp(
-            call_score,
-            0.0,
-            100.0,
+        call_score = float(
+            min(100.0, max(0.0, call_score))
         )
 
-        put_score = self._clamp(
-            put_score,
-            0.0,
-            100.0,
+        put_score = float(
+            min(100.0, max(0.0, put_score))
         )
 
-        # ====================================================
-        # PRINT SCORE
-        # ====================================================
-
-        print("")
-        print(
-            f"🟢 CALL SCORE: {call_score:.1f}"
-        )
-
-        print(
-            f"🔴 PUT SCORE: {put_score:.1f}"
-        )
-
-        score_difference = abs(
-            call_score - put_score
-        )
-
-        print(
-            f"📏 SCORE DIFFERENCE: "
-            f"{score_difference:.1f}"
-        )
-
-        print(
-            f"🟢 CALL CONFIRMATIONS: "
-            f"{len(call_confirmations)}"
-        )
-
-        print(
-            f"🔴 PUT CONFIRMATIONS: "
-            f"{len(put_confirmations)}"
-        )
-
-        # ====================================================
-        # DETERMINE DIRECTION
-        # ====================================================
-
-        if call_score > put_score:
+        if call_score >= put_score:
             direction = "CALL"
             quality = call_score
-            confirmations = call_confirmations
+            losing_score = put_score
             reasons = call_reasons
-
-        elif put_score > call_score:
+        else:
             direction = "PUT"
             quality = put_score
-            confirmations = put_confirmations
+            losing_score = call_score
             reasons = put_reasons
 
-        else:
-            print(
-                f"❌ REJECTED: {pair} | "
-                f"CALL и PUT имеют одинаковый score"
-            )
-            return None
-
-        # ====================================================
-        # DIFFERENCE FILTER
-        # ====================================================
-
-        # Старое значение 20 было слишком жёстким.
-        #
-        # Теперь направление должно хотя бы заметно
-        # превосходить противоположное.
-        MIN_SCORE_DIFFERENCE = 12.0
-
-        if score_difference < MIN_SCORE_DIFFERENCE:
-
-            print(
-                f"❌ REJECTED: {pair} | "
-                f"Слишком маленькое преимущество "
-                f"направления: "
-                f"{score_difference:.1f}/"
-                f"{MIN_SCORE_DIFFERENCE:.1f}"
-            )
-
-            return None
-
-        # ====================================================
-        # QUALITY
-        # ====================================================
-
-        print(
-            f"🏆 QUALITY: {quality:.1f}/100"
+        score_difference = (
+            quality - losing_score
         )
 
-        if quality < self.min_quality:
+        confirmations = len(
+            reasons
+        )
 
+        print(
+            f"📈 {pair} | "
+            f"CALL={call_score:.1f} | "
+            f"PUT={put_score:.1f} | "
+            f"BEST={direction} | "
+            f"QUALITY={quality:.1f} | "
+            f"DIFF={score_difference:.1f}"
+        )
+
+        # =====================================================
+        # SCORE DIFFERENCE FILTER
+        # =====================================================
+
+        if score_difference < 12:
+            print(
+                f"❌ REJECTED: {pair} | "
+                f"Разница сигналов слишком мала: "
+                f"{score_difference:.1f} < 12"
+            )
+            return None
+
+        # =====================================================
+        # QUALITY FILTER
+        # =====================================================
+
+        if quality < self.min_quality:
             print(
                 f"❌ REJECTED: {pair} | "
                 f"Quality {quality:.1f} < "
                 f"{self.min_quality:.1f}"
             )
-
             return None
 
-        # ====================================================
-        # CONFIRMATION BONUS
-        # ====================================================
-
-        # Не учитываем общую волатильность
-        # как направление.
-        directional_confirmations = [
-            item
-            for item in confirmations
-            if "волатильность" not in item.lower()
-        ]
-
-        confirmations_count = len(
-            directional_confirmations
-        )
-
-        # ====================================================
-        # PROBABILITY / CONFIDENCE
-        # ====================================================
+        # =====================================================
+        # PROBABILITY
+        # =====================================================
 
         probability = (
             self._calculate_probability(
                 quality=quality,
                 score_difference=score_difference,
-                confirmations_count=confirmations_count,
+                confirmations=confirmations,
             )
         )
 
         print(
-            f"📈 ESTIMATED CONFIDENCE: "
-            f"{probability:.1f}%"
+            f"🎯 {pair} | "
+            f"probability={probability:.1f}%"
         )
 
-        # ====================================================
-        # PROBABILITY FILTER
-        # ====================================================
-
         if probability < self.min_probability:
-
             print(
                 f"❌ REJECTED: {pair} | "
-                f"Confidence {probability:.1f}% < "
+                f"Probability {probability:.1f}% < "
                 f"{self.min_probability:.1f}%"
             )
-
             return None
 
-        # ====================================================
-        # ENTRY / EXPIRY
-        # ====================================================
+        # =====================================================
+        # TIME
+        # =====================================================
+
+        analysis_time = self._now()
 
         entry_time = self._next_5_minute(
             analysis_time
@@ -1295,131 +1096,57 @@ class SignalEngine:
             + timedelta(minutes=5)
         )
 
-        # ====================================================
-        # FINAL REASONS
-        # ====================================================
+        # =====================================================
+        # FINAL SIGNAL
+        # =====================================================
 
-        if not reasons:
-            reasons = [
-                "Достаточное количество подтверждений"
-            ]
-
-        # Ограничиваем количество причин,
-        # чтобы Telegram-сообщение не было огромным.
-        reasons = reasons[:8]
-
-        confirmations = (
-            confirmations[:8]
-        )
-
-        # ====================================================
-        # FINAL LOG
-        # ====================================================
-
-        print("")
         print(
-            "✅ SIGNAL ACCEPTED"
+            "=" * 70
         )
 
         print(
-            f"💱 PAIR: {pair}"
+            f"✅ SIGNAL FOUND: {pair}"
         )
 
         print(
-            f"📌 DIRECTION: {direction}"
+            f"📊 Direction: {direction}"
         )
 
         print(
-            f"🏆 QUALITY: {quality:.1f}/100"
+            f"⭐ Quality: {quality:.1f}"
         )
 
         print(
-            f"📈 CONFIDENCE: {probability:.1f}%"
+            f"🎯 Probability: {probability:.1f}%"
         )
 
         print(
-            f"⏰ ENTRY: "
-            f"{entry_time.strftime('%H:%M')} МСК"
+            f"⏰ Entry: "
+            f"{entry_time.strftime('%H:%M:%S')}"
         )
 
         print(
-            f"🎯 EXPIRY: "
-            f"{expiry_time.strftime('%H:%M')} МСК"
+            f"⏰ Expiry: "
+            f"{expiry_time.strftime('%H:%M:%S')}"
         )
 
         print(
-            f"✅ CONFIRMATIONS: "
-            f"{len(confirmations)}"
+            f"🔍 Confirmations: "
+            f"{confirmations}"
         )
 
-        print("=" * 70)
-        print("")
-
-        # ====================================================
-        # RETURN
-        # ====================================================
+        print(
+            "=" * 70
+        )
 
         return Signal(
             pair=pair,
             direction=direction,
-            quality=round(
-                quality,
-                1,
-            ),
-            probability=round(
-                probability,
-                1,
-            ),
+            quality=quality,
+            probability=probability,
             entry_time=entry_time,
             expiry_time=expiry_time,
             analysis_time=analysis_time,
-            confirmations=confirmations,
-            reasons=reasons,
+            confirmations=list(reasons),
+            reasons=list(reasons),
         )
-
-
-# ============================================================
-# OPTIONAL DIRECT TEST
-# ============================================================
-
-if __name__ == "__main__":
-    print(
-        "SignalEngine loaded successfully."
-    )
-
-    print(
-        f"TIMEZONE: {MOSCOW_TZ}"
-    )
-
-    print(
-        f"MIN_QUALITY: {MIN_QUALITY}"
-    )
-
-    print(
-        f"MIN_PROBABILITY: {MIN_PROBABILITY}%"
-    )
-
-    now = datetime.now(
-        MOSCOW_TZ
-    )
-
-    next_entry = (
-        SignalEngine._next_5_minute(
-            now
-        )
-    )
-
-    print(
-        f"Current Moscow time: "
-        f"{now.strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-
-    print(
-        f"Next entry: "
-        f"{next_entry.strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-
-    print(
-        f"Expiry: "
-        f"{(next_entry + timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:%S')}"
-    )
