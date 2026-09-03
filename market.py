@@ -22,21 +22,19 @@ class MarketClient:
     """
     Клиент получения рыночных данных.
 
+    Основной режим анализа:
+        1-minute candles.
+
+    Это позволяет движку работать с экспирациями
+    от 1 до 20 минут значительно корректнее, чем
+    при использовании только 5-minute свечей.
+
     Обычные Forex-пары:
         Twelve Data.
 
-    Интервал из config.py может быть:
-        1min
-        5min
-        15min
-        30min
-        1h
-        60
-        300
-        и т.д.
-
-    Важно:
-        строка "5min" никогда не передаётся в int().
+    OTC:
+        публичные исторические OTC-свечи не подменяются
+        обычным Forex.
     """
 
     TWELVE_DATA_URL = (
@@ -46,7 +44,9 @@ class MarketClient:
     REQUEST_TIMEOUT = 15
 
     MIN_CANDLES = 80
-    DEFAULT_LIMIT = 120
+    DEFAULT_LIMIT = 200
+
+    ANALYSIS_INTERVAL = "1min"
 
     def __init__(self) -> None:
         self.session: aiohttp.ClientSession | None = None
@@ -56,11 +56,24 @@ class MarketClient:
 
         self._request_lock = asyncio.Lock()
 
+        # Кэш свечей.
+        # Нужен, чтобы при проверке 1..20 минут
+        # не делать 20 одинаковых HTTP-запросов.
+        self._candle_cache: dict[
+            tuple[str, str, int],
+            tuple[float, pd.DataFrame],
+        ] = {}
+
+        self.CANDLE_CACHE_SECONDS = 20
+
     # ============================================================
     # SESSION
     # ============================================================
 
-    async def _get_session(self) -> aiohttp.ClientSession:
+    async def _get_session(
+        self,
+    ) -> aiohttp.ClientSession:
+
         if (
             self.session is None
             or self.session.closed
@@ -75,7 +88,7 @@ class MarketClient:
                 timeout=timeout,
                 headers={
                     "User-Agent": (
-                        "Teyzoo-Pocket-Signal-Bot/1.0"
+                        "Teyzoo-Pocket-Signal-Bot/2.0"
                     ),
                     "Accept": "application/json",
                 },
@@ -84,6 +97,7 @@ class MarketClient:
         return self.session
 
     async def close(self) -> None:
+
         if (
             self.session is not None
             and not self.session.closed
@@ -100,18 +114,9 @@ class MarketClient:
     def interval_to_twelve_data(
         interval: Any,
     ) -> str:
-        """
-        Преобразование интервала в формат Twelve Data.
-
-        Примеры:
-
-            "5min" -> "5min"
-            "5m"   -> "5min"
-            300    -> "5min"
-            "300"  -> "5min"
-        """
 
         if isinstance(interval, str):
+
             value = interval.strip().lower()
 
             aliases = {
@@ -156,21 +161,25 @@ class MarketClient:
                 return aliases[value]
 
             if value.endswith("min"):
+
                 number = value[:-3]
 
                 if number.isdigit():
                     return f"{int(number)}min"
 
             if value.endswith("m"):
+
                 number = value[:-1]
 
                 if number.isdigit():
                     return f"{int(number)}min"
 
             if value.endswith("h"):
+
                 number = value[:-1]
 
                 if number.isdigit():
+
                     hours = int(number)
 
                     if hours == 1:
@@ -179,6 +188,7 @@ class MarketClient:
                     return f"{hours}h"
 
             if value.isdigit():
+
                 seconds = int(value)
 
                 seconds_map = {
@@ -199,6 +209,7 @@ class MarketClient:
             return value
 
         if isinstance(interval, (int, float)):
+
             value = int(interval)
 
             seconds_map = {
@@ -227,7 +238,7 @@ class MarketClient:
 
             return f"{value}min"
 
-        return "5min"
+        return "1min"
 
     @staticmethod
     def interval_to_seconds(
@@ -235,6 +246,7 @@ class MarketClient:
     ) -> int:
 
         if isinstance(interval, (int, float)):
+
             value = int(interval)
 
             if value <= 45:
@@ -243,6 +255,7 @@ class MarketClient:
             return value
 
         if isinstance(interval, str):
+
             value = interval.strip().lower()
 
             aliases = {
@@ -286,24 +299,28 @@ class MarketClient:
                 return aliases[value]
 
             if value.endswith("min"):
+
                 number = value[:-3]
 
                 if number.isdigit():
                     return int(number) * 60
 
             if value.endswith("m"):
+
                 number = value[:-1]
 
                 if number.isdigit():
                     return int(number) * 60
 
             if value.endswith("h"):
+
                 number = value[:-1]
 
                 if number.isdigit():
                     return int(number) * 3600
 
             if value.isdigit():
+
                 number = int(value)
 
                 if number <= 45:
@@ -311,7 +328,7 @@ class MarketClient:
 
                 return number
 
-        return 300
+        return 60
 
     # ============================================================
     # PAIRS
@@ -367,37 +384,15 @@ class MarketClient:
 
         value = str(pair).strip().upper()
 
-        value = value.replace(
-            "_OTC",
-            "",
-        )
-
-        value = value.replace(
-            "/OTC",
-            "",
-        )
-
-        value = value.replace(
-            " OTC",
-            "",
-        )
-
-        value = value.replace(
-            "-",
-            "",
-        )
-
-        value = value.replace(
-            "_",
-            "",
-        )
-
-        value = value.replace(
-            "/",
-            "",
-        )
+        value = value.replace("_OTC", "")
+        value = value.replace("/OTC", "")
+        value = value.replace(" OTC", "")
+        value = value.replace("-", "")
+        value = value.replace("_", "")
+        value = value.replace("/", "")
 
         if len(value) == 6:
+
             return (
                 f"{value[:3]}/"
                 f"{value[3:]}"
@@ -416,42 +411,22 @@ class MarketClient:
             value
         )
 
-        value = value.replace(
-            "_OTC",
-            "",
-        )
-
-        value = value.replace(
-            "/OTC",
-            "",
-        )
-
-        value = value.replace(
-            " OTC",
-            "",
-        )
-
-        value = value.replace(
-            "/",
-            "",
-        )
-
-        value = value.replace(
-            "-",
-            "",
-        )
-
-        value = value.replace(
-            "_",
-            "",
-        )
+        value = value.replace("_OTC", "")
+        value = value.replace("/OTC", "")
+        value = value.replace(" OTC", "")
+        value = value.replace("/", "")
+        value = value.replace("-", "")
+        value = value.replace("_", "")
 
         if len(value) == 6:
+
             result = (
                 f"{value[:3]}/"
                 f"{value[3:]}"
             )
+
         else:
+
             result = value
 
         if otc:
@@ -470,6 +445,7 @@ class MarketClient:
 
         try:
             return float(value)
+
         except (
             TypeError,
             ValueError,
@@ -477,7 +453,7 @@ class MarketClient:
             return 0.0
 
     # ============================================================
-    # TWELVE DATA
+    # REQUEST TWELVE DATA
     # ============================================================
 
     async def _request_twelve_data(
@@ -488,6 +464,7 @@ class MarketClient:
     ) -> dict[str, Any] | None:
 
         if not TWELVE_DATA_API_KEY:
+
             print(
                 "[MARKET] "
                 "TWELVE_DATA_API_KEY не задан"
@@ -519,7 +496,9 @@ class MarketClient:
         session = await self._get_session()
 
         try:
+
             async with self._request_lock:
+
                 async with session.get(
                     self.TWELVE_DATA_URL,
                     params=params,
@@ -528,6 +507,7 @@ class MarketClient:
                     text = await response.text()
 
                     if response.status != 200:
+
                         print(
                             f"[MARKET] "
                             f"{self.display_pair(pair)}: "
@@ -538,10 +518,13 @@ class MarketClient:
                         return None
 
                     try:
+
                         data = await response.json(
                             content_type=None
                         )
+
                     except Exception as exc:
+
                         print(
                             f"[MARKET] "
                             f"{self.display_pair(pair)}: "
@@ -559,6 +542,7 @@ class MarketClient:
                     return data
 
         except asyncio.TimeoutError:
+
             print(
                 f"[MARKET] "
                 f"{self.display_pair(pair)}: "
@@ -568,6 +552,7 @@ class MarketClient:
             return None
 
         except aiohttp.ClientError as exc:
+
             print(
                 f"[MARKET] "
                 f"{self.display_pair(pair)}: "
@@ -577,6 +562,7 @@ class MarketClient:
             return None
 
         except Exception as exc:
+
             print(
                 f"[MARKET] "
                 f"{self.display_pair(pair)}: "
@@ -584,6 +570,10 @@ class MarketClient:
             )
 
             return None
+
+    # ============================================================
+    # GET TWELVE DATA CANDLES
+    # ============================================================
 
     async def _get_twelve_data_candles(
         self,
@@ -593,6 +583,7 @@ class MarketClient:
     ) -> pd.DataFrame | None:
 
         if not TWELVE_DATA_API_KEY:
+
             print(
                 "[MARKET] "
                 "TWELVE_DATA_API_KEY не задан"
@@ -601,7 +592,9 @@ class MarketClient:
             return None
 
         if interval is None:
-            interval = CANDLE_INTERVAL
+
+            # Для signal engine используем 1m.
+            interval = self.ANALYSIS_INTERVAL
 
         normalized_interval = (
             self.interval_to_twelve_data(
@@ -610,26 +603,52 @@ class MarketClient:
         )
 
         try:
+
             requested_limit = int(
                 limit
                 if limit is not None
-                else CANDLE_LIMIT
+                else self.DEFAULT_LIMIT
             )
+
         except (
             TypeError,
             ValueError,
         ):
+
             requested_limit = self.DEFAULT_LIMIT
 
         requested_limit = max(
             requested_limit,
-            self.MIN_CANDLES + 20,
+            self.MIN_CANDLES + 30,
         )
 
         requested_limit = min(
             requested_limit,
             5000,
         )
+
+        cache_key = (
+            self.clean_pair(pair),
+            normalized_interval,
+            requested_limit,
+        )
+
+        now = time.time()
+
+        cached = self._candle_cache.get(
+            cache_key
+        )
+
+        if cached is not None:
+
+            cached_time, cached_df = cached
+
+            if (
+                now - cached_time
+                < self.CANDLE_CACHE_SECONDS
+            ):
+
+                return cached_df.copy()
 
         data = await self._request_twelve_data(
             pair=pair,
@@ -641,6 +660,7 @@ class MarketClient:
             return None
 
         if data.get("status") == "error":
+
             print(
                 f"[MARKET] "
                 f"{self.display_pair(pair)}: "
@@ -650,14 +670,13 @@ class MarketClient:
 
             return None
 
-        values = data.get(
-            "values"
-        )
+        values = data.get("values")
 
         if not isinstance(
             values,
             list,
         ):
+
             print(
                 f"[MARKET] "
                 f"{self.display_pair(pair)}: "
@@ -667,6 +686,7 @@ class MarketClient:
             return None
 
         if not values:
+
             print(
                 f"[MARKET] "
                 f"{self.display_pair(pair)}: "
@@ -675,7 +695,9 @@ class MarketClient:
 
             return None
 
-        rows: list[dict[str, Any]] = []
+        rows: list[
+            dict[str, Any]
+        ] = []
 
         for item in values:
 
@@ -686,6 +708,7 @@ class MarketClient:
                 continue
 
             try:
+
                 datetime_value = item[
                     "datetime"
                 ]
@@ -729,6 +752,7 @@ class MarketClient:
             )
 
         if not rows:
+
             print(
                 f"[MARKET] "
                 f"{self.display_pair(pair)}: "
@@ -737,9 +761,7 @@ class MarketClient:
 
             return None
 
-        df = pd.DataFrame(
-            rows
-        )
+        df = pd.DataFrame(rows)
 
         df["datetime"] = pd.to_datetime(
             df["datetime"],
@@ -754,6 +776,7 @@ class MarketClient:
             "close",
             "volume",
         ):
+
             df[column] = pd.to_numeric(
                 df[column],
                 errors="coerce",
@@ -788,6 +811,7 @@ class MarketClient:
         )
 
         if len(df) < self.MIN_CANDLES:
+
             print(
                 f"[MARKET] "
                 f"{self.display_pair(pair)}: "
@@ -798,10 +822,18 @@ class MarketClient:
 
             return None
 
+        self._candle_cache[
+            cache_key
+        ] = (
+            now,
+            df.copy(),
+        )
+
         print(
             f"[MARKET] "
             f"{self.display_pair(pair)}: "
-            f"получено {len(df)} свечей"
+            f"получено {len(df)} свечей | "
+            f"interval={normalized_interval}"
         )
 
         return df
@@ -814,6 +846,7 @@ class MarketClient:
         self,
         pair: str,
         limit: int | None = None,
+        interval: Any = None,
     ) -> pd.DataFrame | None:
 
         if not pair:
@@ -821,32 +854,38 @@ class MarketClient:
 
         pair = str(pair).strip()
 
-        if self.is_otc_pair(
-            pair
-        ):
+        if self.is_otc_pair(pair):
+
             return await self.get_otc_candles(
                 pair,
                 limit=limit,
             )
 
+        # Для анализа по умолчанию 1m.
+        if interval is None:
+            interval = self.ANALYSIS_INTERVAL
+
         return await self._get_twelve_data_candles(
             pair=pair,
             limit=limit,
+            interval=interval,
         )
 
     # ============================================================
-    # COMPATIBILITY METHODS
+    # COMPATIBILITY
     # ============================================================
 
     async def fetch_candles(
         self,
         pair: str,
         limit: int | None = None,
+        interval: Any = None,
     ) -> pd.DataFrame | None:
 
         return await self.get_candles(
             pair,
             limit=limit,
+            interval=interval,
         )
 
     async def get_history(
@@ -856,22 +895,20 @@ class MarketClient:
         limit: int | None = None,
     ) -> pd.DataFrame | None:
 
-        if self.is_otc_pair(
-            pair
-        ):
+        if self.is_otc_pair(pair):
+
             return await self.get_otc_candles(
                 pair,
                 limit=limit,
             )
 
+        if interval is None:
+            interval = self.ANALYSIS_INTERVAL
+
         return await self._get_twelve_data_candles(
             pair=pair,
             limit=limit,
-            interval=(
-                interval
-                if interval is not None
-                else CANDLE_INTERVAL
-            ),
+            interval=interval,
         )
 
     async def get_data(
@@ -896,13 +933,6 @@ class MarketClient:
         pair: str,
         limit: int | None = None,
     ) -> pd.DataFrame | None:
-
-        """
-        OTC не заменяем обычным Forex.
-
-        Если полноценной публичной исторической
-        серии для OTC нет, возвращаем None.
-        """
 
         print(
             f"[OTC] "
@@ -934,6 +964,7 @@ class MarketClient:
                 < ASSET_DISCOVERY_CACHE_SECONDS
             )
         ):
+
             return list(
                 self._asset_cache
             )
@@ -944,11 +975,13 @@ class MarketClient:
         session = await self._get_session()
 
         try:
+
             async with session.get(
                 POCKET_OPTION_ASSETS_URL
             ) as response:
 
                 if response.status != 200:
+
                     print(
                         "[PAIRS] discovery HTTP "
                         f"{response.status}"
@@ -961,6 +994,7 @@ class MarketClient:
                 )
 
         except Exception as exc:
+
             print(
                 "[PAIRS] discovery error: "
                 f"{exc}"
@@ -972,6 +1006,7 @@ class MarketClient:
             data,
             dict,
         ):
+
             candidates = (
                 data.get("assets")
                 or data.get("pairs")
@@ -984,9 +1019,11 @@ class MarketClient:
             data,
             list,
         ):
+
             candidates = data
 
         else:
+
             candidates = []
 
         result: list[str] = []
@@ -999,12 +1036,14 @@ class MarketClient:
                 item,
                 str,
             ):
+
                 symbol = item
 
             elif isinstance(
                 item,
                 dict,
             ):
+
                 symbol = (
                     item.get("symbol")
                     or item.get("name")
@@ -1081,13 +1120,6 @@ class MarketClient:
         self,
     ) -> list[str]:
 
-        """
-        Используем PAIRS из config.py.
-
-        Не делаем отдельный запрос свечей
-        для каждой пары только ради списка.
-        """
-
         regular_pairs = (
             self._normalize_pair_list(
                 list(FALLBACK_PAIRS)
@@ -1099,6 +1131,7 @@ class MarketClient:
         )
 
         try:
+
             from keyboards import OTC_PAIRS
 
             otc_pairs = (
@@ -1122,6 +1155,7 @@ class MarketClient:
             )
 
         except Exception:
+
             print(
                 "[PAIRS] Обычных: "
                 f"{len(regular_pairs)}"
@@ -1146,9 +1180,11 @@ class MarketClient:
             return False
 
         try:
+
             candles = await self.get_candles(
                 FALLBACK_PAIRS[0],
-                limit=10,
+                limit=100,
+                interval="1min",
             )
 
             return (
@@ -1157,18 +1193,12 @@ class MarketClient:
             )
 
         except Exception:
+
             return False
 
 
 # ================================================================
 # GLOBAL CLIENT
 # ================================================================
-#
-# main.py делает:
-#
-#     from market import market_client
-#
-# Поэтому этот объект ОБЯЗАТЕЛЬНО должен существовать.
-#
 
 market_client = MarketClient()
