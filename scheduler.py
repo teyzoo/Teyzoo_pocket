@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Optional, Any
 
 from aiogram import Bot
 
@@ -18,46 +18,53 @@ from database import db
 from market import market_client
 from signal_engine import Signal, SignalEngine
 
+
 class SignalScheduler:
     """
-    Планировщик и менеджер сигналов.
+    Планировщик и менеджер торговых сигналов.
 
-    Основные задачи:
+    Возможности:
 
     1. Автоматический анализ.
     2. Ручное получение сигнала.
-    3. Выбор лучшей пары.
-    4. Защита от превышения лимита Twelve Data.
-    5. Сохранение найденных сигналов.
-    6. Отправка сигналов пользователям.
+    3. Выбор конкретной пары.
+    4. Режим "любая пара".
+    5. Выбор времени сделки 1-20 минут.
+    6. Режим "любое время".
+    7. Защита Twelve Data от лишних запросов.
+    8. Сохранение сигналов в БД.
+    9. Рассылка сигналов пользователям.
+    10. Совместимость со старым API.
 
     ВАЖНО:
 
-    Бесплатный Twelve Data имеет ограничение по API credits.
-    Поэтому нельзя бездумно запрашивать все 26 пар одновременно.
+    Текущий market.py использует 5m свечи.
+    Поэтому частота анализа остаётся привязанной к
+    5-минутным свечным данным.
 
-    По умолчанию один полный проход использует максимум
-    MAX_PAIRS_PER_SCAN пар.
+    Длительность сделки может быть от 1 до 20 минут.
     """
 
     # =========================================================
     # API LIMIT
     # =========================================================
 
-    # Для бесплатного лимита 8 кредитов/минуту оставляем запас.
-    #
-    # 6 запросов за проход позволяют оставить место
-    # для других запросов API и ручного запуска.
     MAX_PAIRS_PER_SCAN = 6
 
-    # Минимальная пауза между API-запросами.
-    #
-    # Это не отменяет кредитный лимит, но предотвращает
-    # мгновенный шквал запросов.
     REQUEST_DELAY_SECONDS = 2.0
 
-    # После получения 429 не продолжаем долбить API.
     RATE_LIMIT_COOLDOWN_SECONDS = 65
+
+    # =========================================================
+    # EXPIRY
+    # =========================================================
+
+    MIN_EXPIRY_MINUTES = 1
+    MAX_EXPIRY_MINUTES = 20
+    DEFAULT_EXPIRY_MINUTES = 5
+
+    # Специальное значение для "Любое время"
+    ANY_EXPIRY = "any"
 
     # =========================================================
     # CONSTRUCTOR
@@ -83,31 +90,58 @@ class SignalScheduler:
             datetime
         ] = None
 
+        self._last_request_at: Optional[
+            datetime
+        ] = None
+
         self._last_scan_at: Optional[
             datetime
         ] = None
 
         self._last_signals: dict[
             str,
-            Signal
+            Signal,
         ] = {}
+
+        # -----------------------------------------------------
+        # Настройки автоматического режима
+        # -----------------------------------------------------
+
+        self.auto_expiry_minutes: Optional[
+            int
+        ] = self.DEFAULT_EXPIRY_MINUTES
+
+        self.auto_any_expiry = False
+
+        self.auto_pair: Optional[
+            str
+        ] = None
 
         print(
             "[SCHEDULER] Initialized | "
             f"pairs={len(PAIRS)} | "
-            f"max_pairs_per_scan={self.MAX_PAIRS_PER_SCAN} | "
-            f"min_quality={float(MIN_QUALITY):.1f} | "
-            f"min_probability={float(MIN_PROBABILITY):.1f}% | "
-            "interval=5m"
+            f"max_pairs_per_scan="
+            f"{self.MAX_PAIRS_PER_SCAN} | "
+            f"min_quality="
+            f"{float(MIN_QUALITY):.1f} | "
+            f"min_probability="
+            f"{float(MIN_PROBABILITY):.1f}% | "
+            f"expiry="
+            f"{self.MIN_EXPIRY_MINUTES}-"
+            f"{self.MAX_EXPIRY_MINUTES}m"
         )
 
     # =========================================================
-    # TIME
+    # TIMEZONE
     # =========================================================
 
     def _tz(self):
         try:
-            if hasattr(TIMEZONE, "utcoffset"):
+
+            if hasattr(
+                TIMEZONE,
+                "utcoffset",
+            ):
                 return TIMEZONE
 
             from zoneinfo import ZoneInfo
@@ -117,6 +151,7 @@ class SignalScheduler:
             )
 
         except Exception:
+
             from zoneinfo import ZoneInfo
 
             return ZoneInfo(
@@ -124,9 +159,14 @@ class SignalScheduler:
             )
 
     def _now(self) -> datetime:
+
         return datetime.now(
             self._tz()
         )
+
+    # =========================================================
+    # NEXT 5 MINUTE
+    # =========================================================
 
     def _next_5_minute(
         self,
@@ -137,6 +177,7 @@ class SignalScheduler:
             dt = self._now()
 
         if dt.tzinfo is None:
+
             dt = dt.replace(
                 tzinfo=self._tz()
             )
@@ -146,10 +187,12 @@ class SignalScheduler:
         )
 
         next_minute = (
-            ((dt.minute // 5) + 1) * 5
+            ((dt.minute // 5) + 1)
+            * 5
         )
 
         if next_minute >= 60:
+
             return (
                 dt.replace(
                     minute=0,
@@ -166,123 +209,329 @@ class SignalScheduler:
         )
 
     # =========================================================
-    # PAIRS
+    # EXPIRY NORMALIZATION
     # =========================================================
 
-    def get_available_pairs(self) -> list[str]:
+    def normalize_expiry(
+        self,
+        expiry_minutes: Any = None,
+    ) -> Optional[int]:
         """
-        Возвращает список доступных пар.
+        None / "any" / "любое время"
+            -> None
 
-        Сначала используем PAIRS из config.py.
-        Если список пуст — пробуем market_client.
+        1..20
+            -> соответствующее число.
+
+        Неверное значение
+            -> 5.
         """
+
+        if expiry_minutes is None:
+
+            return self.DEFAULT_EXPIRY_MINUTES
+
+        if isinstance(
+            expiry_minutes,
+            str,
+        ):
+
+            value = (
+                expiry_minutes
+                .strip()
+                .lower()
+            )
+
+            if value in {
+                "any",
+                "all",
+                "auto",
+                "any_time",
+                "любое",
+                "любое время",
+                "любое_время",
+            }:
+
+                return None
+
+            try:
+
+                expiry_minutes = int(
+                    value
+                )
+
+            except ValueError:
+
+                return (
+                    self.DEFAULT_EXPIRY_MINUTES
+                )
+
+        try:
+
+            value = int(
+                expiry_minutes
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            return (
+                self.DEFAULT_EXPIRY_MINUTES
+            )
+
+        return max(
+            self.MIN_EXPIRY_MINUTES,
+            min(
+                self.MAX_EXPIRY_MINUTES,
+                value,
+            ),
+        )
+
+    # =========================================================
+    # CONFIGURE AUTOMATIC MODE
+    # =========================================================
+
+    def set_auto_expiry(
+        self,
+        expiry_minutes: Any,
+    ) -> None:
+        """
+        Настройка времени автоматических сигналов.
+
+        Примеры:
+
+            set_auto_expiry(1)
+            set_auto_expiry(5)
+            set_auto_expiry(20)
+            set_auto_expiry("any")
+        """
+
+        normalized = (
+            self.normalize_expiry(
+                expiry_minutes
+            )
+        )
+
+        if normalized is None:
+
+            self.auto_any_expiry = True
+
+            self.auto_expiry_minutes = None
+
+            print(
+                "[SCHEDULER] "
+                "Auto expiry = ANY "
+                "(1-20m)"
+            )
+
+            return
+
+        self.auto_any_expiry = False
+
+        self.auto_expiry_minutes = (
+            normalized
+        )
+
+        print(
+            "[SCHEDULER] "
+            f"Auto expiry = "
+            f"{normalized}m"
+        )
+
+    def set_auto_pair(
+        self,
+        pair: Optional[str],
+    ) -> None:
+        """
+        Настройка пары для автоматического режима.
+
+        None:
+            любая пара.
+        """
+
+        if pair is None:
+
+            self.auto_pair = None
+
+            print(
+                "[SCHEDULER] "
+                "Auto pair = ANY"
+            )
+
+            return
+
+        value = str(
+            pair
+        ).strip()
+
+        if not value:
+
+            self.auto_pair = None
+
+            return
+
+        if value.lower() in {
+            "any",
+            "all",
+            "любая",
+            "любая пара",
+        }:
+
+            self.auto_pair = None
+
+            print(
+                "[SCHEDULER] "
+                "Auto pair = ANY"
+            )
+
+            return
+
+        self.auto_pair = value
+
+        print(
+            "[SCHEDULER] "
+            f"Auto pair = {value}"
+        )
+
+    # =========================================================
+    # GET AVAILABLE PAIRS
+    # =========================================================
+
+    def get_available_pairs(
+        self,
+    ) -> list[str]:
 
         result: list[str] = []
 
         try:
-            for pair in PAIRS:
-                pair = str(pair).strip()
 
-                if pair and pair not in result:
-                    result.append(pair)
+            for pair in PAIRS:
+
+                pair = str(
+                    pair
+                ).strip()
+
+                if (
+                    pair
+                    and pair not in result
+                ):
+
+                    result.append(
+                        pair
+                    )
 
         except Exception as exc:
+
             print(
-                "[SCHEDULER] Ошибка чтения PAIRS: "
+                "[SCHEDULER] "
+                f"Ошибка чтения PAIRS: "
                 f"{exc}"
             )
 
         if result:
+
             return result
 
         # -----------------------------------------------------
-        # Fallback
+        # FALLBACK
         # -----------------------------------------------------
 
         try:
+
             method = getattr(
                 market_client,
                 "get_available_pairs",
                 None,
             )
 
-            if method is not None:
-                pairs = method()
+            if method is None:
 
-                if inspect.isawaitable(pairs):
-                    # Этот метод синхронно здесь вызвать нельзя.
-                    # Поэтому просто не используем результат.
-                    return []
+                return []
 
-                if pairs:
-                    for pair in pairs:
-                        pair = str(pair).strip()
+            pairs = method()
 
-                        if (
+            if inspect.isawaitable(
+                pairs
+            ):
+
+                return []
+
+            if pairs:
+
+                for pair in pairs:
+
+                    pair = str(
+                        pair
+                    ).strip()
+
+                    if (
+                        pair
+                        and pair not in result
+                    ):
+
+                        result.append(
                             pair
-                            and pair not in result
-                        ):
-                            result.append(pair)
+                        )
 
         except Exception as exc:
+
             print(
                 "[SCHEDULER] "
-                f"Ошибка fallback pair list: {exc}"
+                f"Ошибка fallback pair list: "
+                f"{exc}"
             )
 
         return result
 
     # =========================================================
-    # PAIR SELECTION
+    # SELECT PAIRS
     # =========================================================
 
     def _select_pairs_for_scan(
         self,
         requested_pair: Optional[str] = None,
     ) -> list[str]:
-        """
-        Выбирает пары для конкретного анализа.
 
-        Если пользователь запросил конкретную пару —
-        анализируем только её.
-
-        Если пользователь запросил "любую пару" —
-        берём максимум MAX_PAIRS_PER_SCAN.
-        """
-
-        pairs = self.get_available_pairs()
+        pairs = (
+            self.get_available_pairs()
+        )
 
         if requested_pair:
+
             requested_pair = (
-                str(requested_pair)
-                .strip()
+                str(
+                    requested_pair
+                ).strip()
             )
 
-            if (
-                requested_pair.lower()
-                in {
-                    "any",
-                    "all",
-                    "любая",
-                    "любая пара",
-                }
-            ):
+            if requested_pair.lower() in {
+                "any",
+                "all",
+                "любая",
+                "любая пара",
+            }:
+
                 requested_pair = None
 
+        # -----------------------------------------------------
+        # Specific pair
+        # -----------------------------------------------------
+
         if requested_pair:
-            # Не блокируем ручной запрос конкретной пары,
-            # даже если она не находится в PAIRS.
-            return [requested_pair]
+
+            return [
+                requested_pair
+            ]
+
+        # -----------------------------------------------------
+        # Any pair
+        # -----------------------------------------------------
 
         if not pairs:
-            return []
 
-        # -----------------------------------------------------
-        # Важно:
-        #
-        # Здесь не отправляем запросы для всех 26 пар.
-        # Это защищает Twelve Data от 429.
-        # -----------------------------------------------------
+            return []
 
         return pairs[
             :self.MAX_PAIRS_PER_SCAN
@@ -292,31 +541,80 @@ class SignalScheduler:
     # RATE LIMIT
     # =========================================================
 
-    def _rate_limit_active(self) -> bool:
-        if self._rate_limited_until is None:
+    def _rate_limit_active(
+        self,
+    ) -> bool:
+
+        if (
+            self._rate_limited_until
+            is None
+        ):
+
             return False
 
         now = self._now()
 
-        if now >= self._rate_limited_until:
+        if (
+            now
+            >= self._rate_limited_until
+        ):
+
             self._rate_limited_until = None
+
             return False
 
         return True
 
-    def _activate_rate_limit(self) -> None:
+    def _activate_rate_limit(
+        self,
+    ) -> None:
+
         self._rate_limited_until = (
             self._now()
             + timedelta(
-                seconds=self.RATE_LIMIT_COOLDOWN_SECONDS
+                seconds=(
+                    self.RATE_LIMIT_COOLDOWN_SECONDS
+                )
             )
         )
 
         print(
-            "[SCHEDULER] Twelve Data rate limit "
-            "detected. Анализ временно остановлен "
-            f"на {self.RATE_LIMIT_COOLDOWN_SECONDS}s."
+            "[SCHEDULER] "
+            "Twelve Data rate limit "
+            "detected. Анализ остановлен "
+            f"на "
+            f"{self.RATE_LIMIT_COOLDOWN_SECONDS}s."
         )
+
+    # =========================================================
+    # REQUEST DELAY
+    # =========================================================
+
+    async def _wait_request_delay(
+        self,
+    ) -> None:
+
+        if (
+            self._last_request_at
+            is None
+        ):
+
+            return
+
+        elapsed = (
+            self._now()
+            - self._last_request_at
+        ).total_seconds()
+
+        if (
+            elapsed
+            < self.REQUEST_DELAY_SECONDS
+        ):
+
+            await asyncio.sleep(
+                self.REQUEST_DELAY_SECONDS
+                - elapsed
+            )
 
     # =========================================================
     # MARKET DATA
@@ -326,11 +624,15 @@ class SignalScheduler:
         self,
         pair: str,
     ):
-        """
-        Получение свечей через market_client.
-        """
 
         try:
+
+            await self._wait_request_delay()
+
+            self._last_request_at = (
+                self._now()
+            )
+
             method = getattr(
                 market_client,
                 "get_candles",
@@ -338,32 +640,46 @@ class SignalScheduler:
             )
 
             if method is None:
+
                 print(
                     f"[MARKET] {pair}: "
                     "get_candles отсутствует"
                 )
+
                 return None
 
-            result = method(pair)
+            result = method(
+                pair
+            )
 
-            if inspect.isawaitable(result):
+            if inspect.isawaitable(
+                result
+            ):
+
                 result = await result
 
             return result
 
         except Exception as exc:
-            text = str(exc)
+
+            text = str(
+                exc
+            )
 
             print(
                 f"[MARKET] {pair}: "
-                f"get_candles error: {exc}"
+                f"get_candles error: "
+                f"{exc}"
             )
 
             if (
                 "429" in text
-                or "rate limit" in text.lower()
-                or "credits" in text.lower()
+                or "rate limit"
+                in text.lower()
+                or "credits"
+                in text.lower()
             ):
+
                 self._activate_rate_limit()
 
             return None
@@ -375,42 +691,41 @@ class SignalScheduler:
     async def analyze_pair(
         self,
         pair: str,
+        expiry_minutes: Any = None,
     ) -> Optional[Signal]:
 
         if self._rate_limit_active():
+
             print(
                 f"[ANALYSIS] {pair}: "
                 "SKIP | rate limit cooldown"
             )
+
             return None
 
-        pair = str(pair).strip()
+        pair = str(
+            pair
+        ).strip()
 
         if not pair:
+
             return None
 
         # -----------------------------------------------------
-        # Small delay between API requests
+        # Normalize expiry
         # -----------------------------------------------------
 
-        if (
-            self._last_scan_at is not None
-        ):
-            elapsed = (
-                self._now()
-                - self._last_scan_at
-            ).total_seconds()
+        normalized_expiry = (
+            self.normalize_expiry(
+                expiry_minutes
+            )
+        )
 
-            if (
-                elapsed
-                < self.REQUEST_DELAY_SECONDS
-            ):
-                await asyncio.sleep(
-                    self.REQUEST_DELAY_SECONDS
-                    - elapsed
-                )
-
-        self._last_scan_at = self._now()
+        print(
+            f"[ANALYSIS] {pair} | "
+            f"requested_expiry="
+            f"{'ANY' if normalized_expiry is None else str(normalized_expiry) + 'm'}"
+        )
 
         # -----------------------------------------------------
         # Get candles
@@ -421,55 +736,93 @@ class SignalScheduler:
         )
 
         if candles is None:
+
             print(
                 f"[ANALYSIS] {pair}: "
                 "REJECT | candles unavailable"
             )
+
             return None
 
         try:
-            candles_count = len(candles)
+
+            candles_count = len(
+                candles
+            )
+
         except Exception:
+
             candles_count = 0
 
         if candles_count < 80:
+
             print(
                 f"[ANALYSIS] {pair}: "
                 f"REJECT | only "
                 f"{candles_count} candles"
             )
+
             return None
 
         # -----------------------------------------------------
-        # Engine
+        # ANY EXPIRY
         # -----------------------------------------------------
 
-        try:
-            signal = self.engine.analyze(
-                pair,
-                candles,
-            )
+        if normalized_expiry is None:
 
-        except TypeError as exc:
-            print(
-                f"[ANALYSIS] {pair}: "
-                f"ENGINE TYPE ERROR: {exc}"
-            )
-            return None
+            try:
 
-        except Exception as exc:
-            print(
-                f"[ANALYSIS] {pair}: "
-                f"ENGINE ERROR: "
-                f"{type(exc).__name__}: {exc}"
-            )
-            return None
+                signal = (
+                    self.engine.choose_best_expiry(
+                        pair=pair,
+                        candles=candles,
+                    )
+                )
+
+            except TypeError:
+
+                # Совместимость, если движок
+                # не поддерживает choose_best_expiry.
+
+                signal = (
+                    self.engine.analyze(
+                        pair,
+                        candles,
+                    )
+                )
+
+        else:
+
+            try:
+
+                signal = (
+                    self.engine.analyze(
+                        pair,
+                        candles,
+                        expiry_minutes=(
+                            normalized_expiry
+                        ),
+                    )
+                )
+
+            except TypeError:
+
+                # Старый API.
+
+                signal = (
+                    self.engine.analyze(
+                        pair,
+                        candles,
+                    )
+                )
 
         if signal is None:
+
             print(
                 f"[ANALYSIS] {pair}: "
-                "REJECT | engine returned None"
+                "REJECT | no strong signal"
             )
+
             return None
 
         print(
@@ -477,7 +830,8 @@ class SignalScheduler:
             f"SUCCESS | "
             f"{signal.direction} | "
             f"Q={signal.quality:.1f} | "
-            f"P={signal.probability:.1f}%"
+            f"P={signal.probability:.1f}% | "
+            f"EXPIRY={signal.expiry_minutes}m"
         )
 
         self._last_signals[
@@ -487,70 +841,101 @@ class SignalScheduler:
         return signal
 
     # =========================================================
-    # FIND BEST SIGNAL
+    # SIGNAL SCORE
     # =========================================================
 
     @staticmethod
     def _signal_score(
         signal: Signal,
-    ) -> tuple[float, float, float]:
-        """
-        Сортировка лучших сигналов.
-
-        Сначала вероятность,
-        затем качество,
-        затем количество подтверждений.
-        """
+    ) -> tuple[
+        float,
+        float,
+        float,
+        float,
+    ]:
 
         return (
-            float(signal.probability),
-            float(signal.quality),
             float(
-                len(signal.confirmations)
+                signal.probability
+            ),
+            float(
+                signal.quality
+            ),
+            float(
+                len(
+                    signal.confirmations
+                )
+            ),
+            -float(
+                signal.expiry_minutes
             ),
         )
+
+    # =========================================================
+    # FIND BEST SIGNAL
+    # =========================================================
 
     async def _find_best_signal(
         self,
         requested_pair: Optional[str] = None,
+        expiry_minutes: Any = None,
     ) -> tuple[
         Optional[Signal],
         list[str],
     ]:
 
-        pairs = self._select_pairs_for_scan(
-            requested_pair
+        pairs = (
+            self._select_pairs_for_scan(
+                requested_pair
+            )
+        )
+
+        print("=" * 70)
+        print("[SCAN] START")
+
+        expiry_text = (
+            "ANY 1-20m"
+            if self.normalize_expiry(
+                expiry_minutes
+            ) is None
+            else f"{self.normalize_expiry(expiry_minutes)}m"
         )
 
         print(
-            "=" * 70
+            f"[SCAN] Expiry: "
+            f"{expiry_text}"
         )
 
         print(
-            "[SCAN] START"
-        )
-
-        print(
-            f"[SCAN] Проверяем {len(pairs)} пар:"
+            f"[SCAN] Проверяем "
+            f"{len(pairs)} пар:"
         )
 
         if pairs:
+
             print(
-                ", ".join(pairs)
+                ", ".join(
+                    pairs
+                )
             )
 
-        print(
-            "=" * 70
-        )
+        print("=" * 70)
 
         if not pairs:
+
             print(
                 "[SCAN] Нет доступных пар"
             )
+
             return None, []
 
-        signals: list[Signal] = []
-        diagnostics: list[str] = []
+        signals: list[
+            Signal
+        ] = []
+
+        diagnostics: list[
+            str
+        ] = []
 
         for index, pair in enumerate(
             pairs,
@@ -558,56 +943,60 @@ class SignalScheduler:
         ):
 
             if self._rate_limit_active():
+
                 diagnostics.append(
                     f"{pair}: RATE_LIMIT"
                 )
+
                 break
 
             print(
-                f"[SCAN] {index}/{len(pairs)} "
+                f"[SCAN] "
+                f"{index}/{len(pairs)} "
                 f"→ {pair}"
             )
 
             signal = await self.analyze_pair(
-                pair
+                pair=pair,
+                expiry_minutes=(
+                    expiry_minutes
+                ),
             )
 
             if signal is None:
+
                 diagnostics.append(
                     f"{pair}: NO_SIGNAL"
                 )
-            else:
-                signals.append(signal)
 
-            # -------------------------------------------------
-            # Если это не последняя пара —
-            # выдерживаем паузу.
-            # -------------------------------------------------
+            else:
+
+                signals.append(
+                    signal
+                )
 
             if index < len(pairs):
+
                 await asyncio.sleep(
                     self.REQUEST_DELAY_SECONDS
                 )
 
         # -----------------------------------------------------
-        # No signals
+        # No signal
         # -----------------------------------------------------
 
         if not signals:
-            print(
-                "=" * 70
-            )
+
+            print("=" * 70)
             print(
                 "[SCAN] NO STRONG SIGNAL"
             )
-            print(
-                "=" * 70
-            )
+            print("=" * 70)
 
             return None, diagnostics
 
         # -----------------------------------------------------
-        # Best signal
+        # Best
         # -----------------------------------------------------
 
         signals.sort(
@@ -617,24 +1006,24 @@ class SignalScheduler:
 
         best = signals[0]
 
-        print(
-            "=" * 70
-        )
-
+        print("=" * 70)
         print(
             "[SCAN] BEST SIGNAL"
         )
 
         print(
-            f"Pair: {best.pair}"
+            f"Pair: "
+            f"{best.pair}"
         )
 
         print(
-            f"Direction: {best.direction}"
+            f"Direction: "
+            f"{best.direction}"
         )
 
         print(
-            f"Quality: {best.quality:.1f}"
+            f"Quality: "
+            f"{best.quality:.1f}"
         )
 
         print(
@@ -643,8 +1032,21 @@ class SignalScheduler:
         )
 
         print(
-            "=" * 70
+            f"Expiry: "
+            f"{best.expiry_minutes}m"
         )
+
+        print(
+            f"Entry: "
+            f"{best.entry_time.strftime('%H:%M:%S')}"
+        )
+
+        print(
+            f"Expiry time: "
+            f"{best.expiry_time.strftime('%H:%M:%S')}"
+        )
+
+        print("=" * 70)
 
         return best, diagnostics
 
@@ -655,26 +1057,35 @@ class SignalScheduler:
     async def get_manual_signal(
         self,
         pair: Optional[str] = None,
+        expiry_minutes: Any = None,
     ) -> Optional[Signal]:
 
         async with self._scan_lock:
 
-            print(
-                "=" * 70
-            )
-
+            print("=" * 70)
             print(
                 "[MANUAL SIGNAL] START"
             )
 
             print(
-                f"[MANUAL SIGNAL] "
+                "[MANUAL SIGNAL] "
                 f"{self._now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
 
-            # -------------------------------------------------
-            # Rate limit
-            # -------------------------------------------------
+            if pair:
+
+                print(
+                    "[MANUAL SIGNAL] "
+                    f"Пара: {pair}"
+                )
+
+            if expiry_minutes is not None:
+
+                print(
+                    "[MANUAL SIGNAL] "
+                    f"Время: "
+                    f"{expiry_minutes}"
+                )
 
             if self._rate_limit_active():
 
@@ -692,34 +1103,32 @@ class SignalScheduler:
 
                 return None
 
-            # -------------------------------------------------
-            # Requested pair
-            # -------------------------------------------------
-
-            if pair:
-                print(
-                    f"[MANUAL SIGNAL] "
-                    f"Запрошена пара: {pair}"
-                )
-
             signal, _ = (
                 await self._find_best_signal(
-                    requested_pair=pair
+                    requested_pair=pair,
+                    expiry_minutes=(
+                        expiry_minutes
+                    ),
                 )
             )
 
             if signal is None:
+
                 print(
                     "[MANUAL SIGNAL] "
                     "Сильного сигнала нет"
                 )
+
             else:
+
                 print(
                     "[MANUAL SIGNAL] "
-                    f"FOUND: {signal.pair} "
+                    f"FOUND: "
+                    f"{signal.pair} "
                     f"{signal.direction} "
                     f"Q={signal.quality:.1f} "
-                    f"P={signal.probability:.1f}%"
+                    f"P={signal.probability:.1f}% "
+                    f"T={signal.expiry_minutes}m"
                 )
 
             return signal
@@ -730,22 +1139,57 @@ class SignalScheduler:
 
     async def scan_once(
         self,
+        pair: Optional[str] = None,
+        expiry_minutes: Any = None,
     ) -> Optional[Signal]:
 
         async with self._scan_lock:
 
             if self._rate_limit_active():
+
                 print(
-                    "[SCHEDULER] scan_once skipped | "
+                    "[SCHEDULER] "
+                    "scan_once skipped | "
                     "rate limit cooldown"
                 )
+
                 return None
 
+            # -------------------------------------------------
+            # Если параметры не передали —
+            # используем автоматические настройки.
+            # -------------------------------------------------
+
+            if pair is None:
+
+                pair = self.auto_pair
+
+            if expiry_minutes is None:
+
+                if self.auto_any_expiry:
+
+                    expiry_minutes = (
+                        self.ANY_EXPIRY
+                    )
+
+                else:
+
+                    expiry_minutes = (
+                        self.auto_expiry_minutes
+                        or self.DEFAULT_EXPIRY_MINUTES
+                    )
+
             signal, _ = (
-                await self._find_best_signal()
+                await self._find_best_signal(
+                    requested_pair=pair,
+                    expiry_minutes=(
+                        expiry_minutes
+                    ),
+                )
             )
 
             if signal is None:
+
                 return None
 
             await self._save_signal(
@@ -768,15 +1212,13 @@ class SignalScheduler:
     ) -> None:
 
         if db is None:
+
             print(
                 "[DATABASE] db unavailable | "
                 "signal not saved"
             )
-            return
 
-        # -----------------------------------------------------
-        # Возможные API базы
-        # -----------------------------------------------------
+            return
 
         methods = [
             "save_signal",
@@ -793,6 +1235,7 @@ class SignalScheduler:
             )
 
             if method is None:
+
                 continue
 
             try:
@@ -810,10 +1253,13 @@ class SignalScheduler:
                 }
 
                 try:
+
                     result = method(
                         **payload
                     )
+
                 except TypeError:
+
                     result = method(
                         signal
                     )
@@ -821,16 +1267,20 @@ class SignalScheduler:
                 if inspect.isawaitable(
                     result
                 ):
+
                     await result
 
                 print(
                     "[DATABASE] Signal saved | "
-                    f"{signal.pair}"
+                    f"{signal.pair} | "
+                    f"{signal.direction} | "
+                    f"{signal.expiry_minutes}m"
                 )
 
                 return
 
             except Exception as exc:
+
                 print(
                     f"[DATABASE] "
                     f"{method_name} error: "
@@ -859,12 +1309,16 @@ class SignalScheduler:
             signal.direction,
         )
 
-        entry = signal.entry_time.strftime(
-            "%H:%M:%S"
+        entry = (
+            signal.entry_time.strftime(
+                "%H:%M:%S"
+            )
         )
 
-        expiry = signal.expiry_time.strftime(
-            "%H:%M:%S"
+        expiry = (
+            signal.expiry_time.strftime(
+                "%H:%M:%S"
+            )
         )
 
         confirmations = (
@@ -872,11 +1326,16 @@ class SignalScheduler:
         )
 
         if confirmations:
-            confirmations_text = "\n".join(
-                f"• {item}"
-                for item in confirmations
+
+            confirmations_text = (
+                "\n".join(
+                    f"• {item}"
+                    for item in confirmations
+                )
             )
+
         else:
+
             confirmations_text = (
                 "• Подтверждения не указаны"
             )
@@ -884,17 +1343,23 @@ class SignalScheduler:
         return (
             "🎯 <b>ТОРГОВЫЙ СИГНАЛ</b>\n"
             "\n"
-            f"💱 Пара: <b>{signal.pair}</b>\n"
+            f"💱 Пара: "
+            f"<b>{signal.pair}</b>\n"
             f"📈 Направление: "
             f"<b>{direction_text}</b>\n"
+            "\n"
+            f"⏱️ Время сделки: "
+            f"<b>{signal.expiry_minutes} мин.</b>\n"
             "\n"
             f"⭐ Качество: "
             f"<b>{signal.quality:.1f}/100</b>\n"
             f"🎯 Расчётная вероятность: "
             f"<b>{signal.probability:.1f}%</b>\n"
             "\n"
-            f"🟢 Вход: <b>{entry}</b>\n"
-            f"🔴 Закрытие: <b>{expiry}</b>\n"
+            f"🟢 Вход: "
+            f"<b>{entry}</b>\n"
+            f"🔴 Закрытие: "
+            f"<b>{expiry}</b>\n"
             "\n"
             "🔎 <b>Подтверждения:</b>\n"
             f"{confirmations_text}\n"
@@ -902,6 +1367,94 @@ class SignalScheduler:
             "⚠️ Вероятность является расчётной "
             "оценкой модели, а не гарантией результата."
         )
+
+    # =========================================================
+    # GET USER ID
+    # =========================================================
+
+    @staticmethod
+    def _extract_user_id(
+        user: Any,
+    ) -> Optional[int]:
+
+        if isinstance(
+            user,
+            int,
+        ):
+
+            return user
+
+        if isinstance(
+            user,
+            str,
+        ):
+
+            try:
+
+                return int(
+                    user
+                )
+
+            except ValueError:
+
+                return None
+
+        if isinstance(
+            user,
+            dict,
+        ):
+
+            for key in (
+                "telegram_id",
+                "user_id",
+                "id",
+            ):
+
+                if key in user:
+
+                    try:
+
+                        return int(
+                            user[key]
+                        )
+
+                    except (
+                        TypeError,
+                        ValueError,
+                    ):
+
+                        return None
+
+            return None
+
+        for key in (
+            "telegram_id",
+            "user_id",
+            "id",
+        ):
+
+            if hasattr(
+                user,
+                key,
+            ):
+
+                try:
+
+                    return int(
+                        getattr(
+                            user,
+                            key,
+                        )
+                    )
+
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+
+                    return None
+
+        return None
 
     # =========================================================
     # SEND USERS
@@ -913,24 +1466,24 @@ class SignalScheduler:
     ) -> None:
 
         if self.bot is None:
+
             print(
                 "[SCHEDULER] Bot unavailable | "
                 "signal not sent"
             )
+
             return
 
         if db is None:
+
             print(
                 "[SCHEDULER] DB unavailable | "
                 "users not loaded"
             )
+
             return
 
         users = None
-
-        # -----------------------------------------------------
-        # Получаем пользователей через возможные методы DB
-        # -----------------------------------------------------
 
         methods = [
             "get_active_users",
@@ -947,34 +1500,44 @@ class SignalScheduler:
             )
 
             if method is None:
+
                 continue
 
             try:
+
                 users = method()
 
                 if inspect.isawaitable(
                     users
                 ):
+
                     users = await users
 
                 if users is not None:
+
                     break
 
             except Exception as exc:
+
                 print(
                     f"[SCHEDULER] "
-                    f"{method_name} error: {exc}"
+                    f"{method_name} error: "
+                    f"{exc}"
                 )
 
         if not users:
+
             print(
                 "[SCHEDULER] "
                 "Нет активных пользователей"
             )
+
             return
 
-        text = self.format_signal(
-            signal
+        text = (
+            self.format_signal(
+                signal
+            )
         )
 
         sent = 0
@@ -982,63 +1545,20 @@ class SignalScheduler:
 
         for user in users:
 
-            # -------------------------------------------------
-            # Поддержка разных форматов DB
-            # -------------------------------------------------
-
-            user_id = None
-
-            if isinstance(
-                user,
-                int,
-            ):
-                user_id = user
-
-            elif isinstance(
-                user,
-                str,
-            ):
-                try:
-                    user_id = int(user)
-                except ValueError:
-                    user_id = None
-
-            elif isinstance(
-                user,
-                dict,
-            ):
-                for key in (
-                    "telegram_id",
-                    "user_id",
-                    "id",
-                ):
-                    if key in user:
-                        user_id = user[key]
-                        break
-
-            else:
-                for key in (
-                    "telegram_id",
-                    "user_id",
-                    "id",
-                ):
-                    if hasattr(
-                        user,
-                        key,
-                    ):
-                        user_id = getattr(
-                            user,
-                            key,
-                        )
-                        break
+            user_id = (
+                self._extract_user_id(
+                    user
+                )
+            )
 
             if user_id is None:
+
                 continue
 
             try:
 
                 await self.bot.send_message(
-                    chat_id=int(user_id),
+                    chat_id=user_id,
                     text=text,
                     parse_mode="HTML",
                 )
@@ -1071,10 +1591,12 @@ class SignalScheduler:
     ) -> None:
 
         if self.running:
+
             print(
                 "[SCHEDULER] "
                 "Already running"
             )
+
             return
 
         self.running = True
@@ -1082,6 +1604,18 @@ class SignalScheduler:
         print(
             "[SCHEDULER] "
             "Automatic scheduler started"
+        )
+
+        print(
+            "[SCHEDULER] "
+            f"Auto pair: "
+            f"{self.auto_pair or 'ANY'}"
+        )
+
+        print(
+            "[SCHEDULER] "
+            f"Auto expiry: "
+            f"{'ANY 1-20m' if self.auto_any_expiry else str(self.auto_expiry_minutes) + 'm'}"
         )
 
         try:
@@ -1103,26 +1637,23 @@ class SignalScheduler:
                 print(
                     "[SCHEDULER] "
                     f"Следующий анализ: "
-                    f"{next_run.strftime('%H:%M:%S')} МСК "
-                    f"| через {seconds:.1f}s"
+                    f"{next_run.strftime('%H:%M:%S')} "
+                    f"| через "
+                    f"{seconds:.1f}s"
                 )
 
                 if seconds > 0:
+
                     await asyncio.sleep(
                         seconds
                     )
 
-                # -------------------------------------------------
-                # После сна проверяем, что scheduler всё ещё
-                # работает.
-                # -------------------------------------------------
-
                 if not self.running:
+
                     break
 
                 # -------------------------------------------------
-                # Если Twelve Data временно заблокирован,
-                # ждём cooldown.
+                # RATE LIMIT
                 # -------------------------------------------------
 
                 if self._rate_limit_active():
@@ -1152,7 +1683,7 @@ class SignalScheduler:
                     continue
 
                 # -------------------------------------------------
-                # Запуск анализа
+                # SCAN
                 # -------------------------------------------------
 
                 try:
@@ -1160,6 +1691,7 @@ class SignalScheduler:
                     await self.scan_once()
 
                 except asyncio.CancelledError:
+
                     raise
 
                 except Exception as exc:
@@ -1170,11 +1702,6 @@ class SignalScheduler:
                         f"{type(exc).__name__}: "
                         f"{exc}"
                     )
-
-                # -------------------------------------------------
-                # Небольшая защита от повторного запуска
-                # в ту же минуту.
-                # -------------------------------------------------
 
                 await asyncio.sleep(
                     2
@@ -1202,7 +1729,9 @@ class SignalScheduler:
     # STOP
     # =========================================================
 
-    def stop(self) -> None:
+    def stop(
+        self,
+    ) -> None:
 
         self.running = False
 
@@ -1210,3 +1739,12 @@ class SignalScheduler:
             "[SCHEDULER] "
             "Stop requested"
         )
+
+
+# =========================================================
+# EXPORT
+# =========================================================
+
+__all__ = [
+    "SignalScheduler",
+]
