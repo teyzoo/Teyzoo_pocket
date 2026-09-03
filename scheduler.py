@@ -1,64 +1,104 @@
 from __future__ import annotations
 
-import asyncio
-import inspect
+import math
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Optional
 
-from aiogram import Bot
+import pandas as pd
 
-from config import (
-    MIN_PROBABILITY,
-    MIN_QUALITY,
-    PAIRS,
-    TIMEZONE,
-)
-
-from database import db
-from market import market_client
-from signal_engine import Signal, SignalEngine
+from config import MIN_PROBABILITY, MIN_QUALITY, TIMEZONE
+from indicators import calculate_indicators
 
 
-class SignalScheduler:
+# =========================================================
+# SIGNAL
+# =========================================================
+
+@dataclass
+class Signal:
+    pair: str
+    direction: str
+    quality: float
+    probability: float
+    entry_time: datetime
+    expiry_time: datetime
+    analysis_time: datetime
+    confirmations: list[str]
+    reasons: list[str]
+
+    @property
+    def expiry_minutes(self) -> int:
+        """Длительность сделки в минутах."""
+        seconds = (
+            self.expiry_time - self.entry_time
+        ).total_seconds()
+
+        return max(
+            1,
+            int(round(seconds / 60)),
+        )
+
+
+# =========================================================
+# SIGNAL ENGINE
+# =========================================================
+
+class SignalEngine:
     """
-    Планировщик и менеджер сигналов.
+    Основной движок анализа торговых сигналов.
 
-    Основные задачи:
+    Вход:
+        OHLCV свечи.
 
-    1. Автоматический анализ.
-    2. Ручное получение сигнала.
-    3. Выбор лучшей пары.
-    4. Защита от превышения лимита Twelve Data.
-    5. Сохранение найденных сигналов.
-    6. Отправка сигналов пользователям.
+    Выход:
+        Signal либо None.
+
+    Поддерживает:
+        expiry_minutes = 1..20
+
+    Старый вызов:
+
+        engine.analyze(pair, candles)
+
+    продолжает работать и использует:
+        expiry_minutes=5
 
     ВАЖНО:
-
-    Бесплатный Twelve Data имеет ограничение по API credits.
-    Поэтому нельзя бездумно запрашивать все 26 пар одновременно.
-
-    По умолчанию один полный проход использует максимум
-    MAX_PAIRS_PER_SCAN пар.
+        Расчётная probability — внутренняя оценка модели,
+        а НЕ гарантированная вероятность выигрыша.
     """
 
-    # =========================================================
-    # API LIMIT
-    # =========================================================
+    # ---------------------------------------------------------
+    # REQUIRED INDICATORS
+    # ---------------------------------------------------------
 
-    # Для бесплатного лимита 8 кредитов/минуту оставляем запас.
-    #
-    # 6 запросов за проход позволяют оставить место
-    # для других запросов API и ручного запуска.
-    MAX_PAIRS_PER_SCAN = 6
+    REQUIRED_INDICATORS = [
+        "close",
+        "ema_fast",
+        "ema_slow",
+        "ema_50",
+        "rsi",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "bb_upper",
+        "bb_lower",
+        "stoch_k",
+        "stoch_d",
+        "atr",
+        "body_ratio",
+        "support",
+        "resistance",
+        "ema_fast_slope",
+        "volatility",
+    ]
 
-    # Минимальная пауза между API-запросами.
-    #
-    # Это не отменяет кредитный лимит, но предотвращает
-    # мгновенный шквал запросов.
-    REQUEST_DELAY_SECONDS = 2.0
+    MIN_CANDLES = 80
 
-    # После получения 429 не продолжаем долбить API.
-    RATE_LIMIT_COOLDOWN_SECONDS = 65
+    MIN_EXPIRY_MINUTES = 1
+    MAX_EXPIRY_MINUTES = 20
+    DEFAULT_EXPIRY_MINUTES = 5
 
     # =========================================================
     # CONSTRUCTOR
@@ -66,47 +106,38 @@ class SignalScheduler:
 
     def __init__(
         self,
-        bot: Optional[Bot] = None,
+        min_quality: Optional[float] = None,
+        min_probability: Optional[float] = None,
     ) -> None:
 
-        self.bot = bot
-
-        self.engine = SignalEngine(
-            min_quality=MIN_QUALITY,
-            min_probability=MIN_PROBABILITY,
+        self.min_quality = (
+            float(MIN_QUALITY)
+            if min_quality is None
+            else float(min_quality)
         )
 
-        self.running = False
-
-        self._scan_lock = asyncio.Lock()
-
-        self._rate_limited_until: Optional[
-            datetime
-        ] = None
-
-        self._last_scan_at: Optional[
-            datetime
-        ] = None
-
-        self._last_signals: dict[
-            str,
-            Signal
-        ] = {}
+        self.min_probability = (
+            float(MIN_PROBABILITY)
+            if min_probability is None
+            else float(min_probability)
+        )
 
         print(
-            "[SCHEDULER] Initialized | "
-            f"pairs={len(PAIRS)} | "
-            f"max_pairs_per_scan={self.MAX_PAIRS_PER_SCAN} | "
-            f"min_quality={float(MIN_QUALITY):.1f} | "
-            f"min_probability={float(MIN_PROBABILITY):.1f}% | "
-            "interval=5m"
+            "[ENGINE] Initialized | "
+            f"min_quality={self.min_quality:.1f} | "
+            f"min_probability="
+            f"{self.min_probability:.1f}% | "
+            f"expiry="
+            f"{self.MIN_EXPIRY_MINUTES}-"
+            f"{self.MAX_EXPIRY_MINUTES}m"
         )
 
     # =========================================================
-    # TIME
+    # TIMEZONE
     # =========================================================
 
-    def _tz(self):
+    @staticmethod
+    def _timezone():
         try:
             if hasattr(TIMEZONE, "utcoffset"):
                 return TIMEZONE
@@ -126,31 +157,92 @@ class SignalScheduler:
 
     def _now(self) -> datetime:
         return datetime.now(
-            self._tz()
+            self._timezone()
         )
+
+    # =========================================================
+    # EXPIRY NORMALIZATION
+    # =========================================================
+
+    def normalize_expiry_minutes(
+        self,
+        expiry_minutes: Optional[int] = None,
+    ) -> int:
+        """
+        Нормализует длительность сделки.
+
+        Допустимый диапазон:
+            1..20 минут
+
+        None:
+            5 минут.
+        """
+
+        if expiry_minutes is None:
+            return self.DEFAULT_EXPIRY_MINUTES
+
+        try:
+            value = int(
+                expiry_minutes
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            print(
+                "[ENGINE] Invalid expiry_minutes="
+                f"{expiry_minutes!r}; "
+                f"using default "
+                f"{self.DEFAULT_EXPIRY_MINUTES}m"
+            )
+
+            return self.DEFAULT_EXPIRY_MINUTES
+
+        value = max(
+            self.MIN_EXPIRY_MINUTES,
+            min(
+                self.MAX_EXPIRY_MINUTES,
+                value,
+            ),
+        )
+
+        return value
+
+    # =========================================================
+    # ENTRY TIME
+    # =========================================================
 
     def _next_5_minute(
         self,
         dt: Optional[datetime] = None,
     ) -> datetime:
+        """
+        Возвращает ближайшую следующую
+        5-минутную отметку.
+
+        Это сохраняет совместимость с текущей
+        системой анализа 5m свечей.
+        """
 
         if dt is None:
             dt = self._now()
 
         if dt.tzinfo is None:
             dt = dt.replace(
-                tzinfo=self._tz()
+                tzinfo=self._timezone()
             )
 
         dt = dt.astimezone(
-            self._tz()
+            self._timezone()
         )
 
-        next_minute = (
-            ((dt.minute // 5) + 1) * 5
-        )
+        minute = (
+            (dt.minute // 5) + 1
+        ) * 5
 
-        if next_minute >= 60:
+        if minute >= 60:
+
             return (
                 dt.replace(
                     minute=0,
@@ -161,1053 +253,1435 @@ class SignalScheduler:
             )
 
         return dt.replace(
-            minute=next_minute,
+            minute=minute,
             second=0,
             microsecond=0,
         )
 
     # =========================================================
-    # PAIRS
+    # CUSTOM ENTRY
     # =========================================================
 
-    def get_available_pairs(self) -> list[str]:
+    def _get_entry_time(
+        self,
+        analysis_time: datetime,
+    ) -> datetime:
         """
-        Возвращает список доступных пар.
+        Вход остаётся привязанным к следующей
+        5-минутной свечной отметке.
 
-        Сначала используем PAIRS из config.py.
-        Если список пуст — пробуем market_client.
+        Это важно, поскольку текущий market layer
+        использует 5m данные.
         """
 
-        result: list[str] = []
+        return self._next_5_minute(
+            analysis_time
+        )
+
+    # =========================================================
+    # EXPIRY TIME
+    # =========================================================
+
+    def _get_expiry_time(
+        self,
+        entry_time: datetime,
+        expiry_minutes: int,
+    ) -> datetime:
+
+        expiry_minutes = (
+            self.normalize_expiry_minutes(
+                expiry_minutes
+            )
+        )
+
+        return (
+            entry_time
+            + timedelta(
+                minutes=expiry_minutes
+            )
+        )
+
+    # =========================================================
+    # HELPERS
+    # =========================================================
+
+    @staticmethod
+    def _safe_float(
+        value,
+    ) -> Optional[float]:
 
         try:
-            for pair in PAIRS:
-                pair = str(pair).strip()
+            result = float(value)
 
-                if pair and pair not in result:
-                    result.append(pair)
+            if not math.isfinite(
+                result
+            ):
+                return None
 
-        except Exception as exc:
-            print(
-                "[SCHEDULER] Ошибка чтения PAIRS: "
-                f"{exc}"
-            )
-
-        if result:
             return result
 
-        # -----------------------------------------------------
-        # Fallback
-        # -----------------------------------------------------
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
 
-        try:
-            method = getattr(
-                market_client,
-                "get_available_pairs",
-                None,
-            )
+    @staticmethod
+    def _ensure_numeric(
+        df: pd.DataFrame,
+        columns: list[str],
+    ) -> pd.DataFrame:
 
-            if method is not None:
-                pairs = method()
+        result = df.copy()
 
-                if inspect.isawaitable(pairs):
-                    # Этот метод синхронно здесь вызвать нельзя.
-                    # Поэтому просто не используем результат.
-                    return []
+        for column in columns:
 
-                if pairs:
-                    for pair in pairs:
-                        pair = str(pair).strip()
+            if column in result.columns:
 
-                        if (
-                            pair
-                            and pair not in result
-                        ):
-                            result.append(pair)
-
-        except Exception as exc:
-            print(
-                "[SCHEDULER] "
-                f"Ошибка fallback pair list: {exc}"
-            )
+                result[column] = pd.to_numeric(
+                    result[column],
+                    errors="coerce",
+                )
 
         return result
 
     # =========================================================
-    # PAIR SELECTION
+    # INDICATOR NORMALIZATION
     # =========================================================
 
-    def _select_pairs_for_scan(
+    def _normalize_indicators(
         self,
-        requested_pair: Optional[str] = None,
-    ) -> list[str]:
+        df: pd.DataFrame,
+    ) -> pd.DataFrame:
         """
-        Выбирает пары для конкретного анализа.
+        Нормализует старые и новые названия индикаторов.
 
-        Если пользователь запросил конкретную пару —
-        анализируем только её.
+        Поддерживаются:
 
-        Если пользователь запросил "любую пару" —
-        берём максимум MAX_PAIRS_PER_SCAN.
+            ema_9
+                -> ema_fast
+
+            ema_21
+                -> ema_slow
+
+            macd_histogram
+                -> macd_hist
+
+            ema9_slope
+                -> ema_fast_slope
         """
 
-        pairs = self.get_available_pairs()
-
-        if requested_pair:
-            requested_pair = (
-                str(requested_pair)
-                .strip()
-            )
-
-            if (
-                requested_pair.lower()
-                in {
-                    "any",
-                    "all",
-                    "любая",
-                    "любая пара",
-                }
-            ):
-                requested_pair = None
-
-        if requested_pair:
-            # Не блокируем ручной запрос конкретной пары,
-            # даже если она не находится в PAIRS.
-            return [requested_pair]
-
-        if not pairs:
-            return []
+        df = df.copy()
 
         # -----------------------------------------------------
-        # Важно:
-        #
-        # Здесь не отправляем запросы для всех 26 пар.
-        # Это защищает Twelve Data от 429.
-        # -----------------------------------------------------
-
-        return pairs[
-            :self.MAX_PAIRS_PER_SCAN
-        ]
-
-    # =========================================================
-    # RATE LIMIT
-    # =========================================================
-
-    def _rate_limit_active(self) -> bool:
-        if self._rate_limited_until is None:
-            return False
-
-        now = self._now()
-
-        if now >= self._rate_limited_until:
-            self._rate_limited_until = None
-            return False
-
-        return True
-
-    def _activate_rate_limit(self) -> None:
-        self._rate_limited_until = (
-            self._now()
-            + timedelta(
-                seconds=self.RATE_LIMIT_COOLDOWN_SECONDS
-            )
-        )
-
-        print(
-            "[SCHEDULER] Twelve Data rate limit "
-            "detected. Анализ временно остановлен "
-            f"на {self.RATE_LIMIT_COOLDOWN_SECONDS}s."
-        )
-
-    # =========================================================
-    # MARKET DATA
-    # =========================================================
-
-    async def get_candles(
-        self,
-        pair: str,
-    ):
-        """
-        Получение свечей через market_client.
-        """
-
-        try:
-            method = getattr(
-                market_client,
-                "get_candles",
-                None,
-            )
-
-            if method is None:
-                print(
-                    f"[MARKET] {pair}: "
-                    "get_candles отсутствует"
-                )
-                return None
-
-            result = method(pair)
-
-            if inspect.isawaitable(result):
-                result = await result
-
-            return result
-
-        except Exception as exc:
-            text = str(exc)
-
-            print(
-                f"[MARKET] {pair}: "
-                f"get_candles error: {exc}"
-            )
-
-            if (
-                "429" in text
-                or "rate limit" in text.lower()
-                or "credits" in text.lower()
-            ):
-                self._activate_rate_limit()
-
-            return None
-
-    # =========================================================
-    # ANALYZE ONE PAIR
-    # =========================================================
-
-    async def analyze_pair(
-        self,
-        pair: str,
-    ) -> Optional[Signal]:
-
-        if self._rate_limit_active():
-            print(
-                f"[ANALYSIS] {pair}: "
-                "SKIP | rate limit cooldown"
-            )
-            return None
-
-        pair = str(pair).strip()
-
-        if not pair:
-            return None
-
-        # -----------------------------------------------------
-        # Small delay between API requests
+        # EMA
         # -----------------------------------------------------
 
         if (
-            self._last_scan_at is not None
+            "ema_fast" not in df.columns
+            and "ema_9" in df.columns
         ):
-            elapsed = (
-                self._now()
-                - self._last_scan_at
-            ).total_seconds()
+            df["ema_fast"] = df[
+                "ema_9"
+            ]
+
+        if (
+            "ema_slow" not in df.columns
+            and "ema_21" in df.columns
+        ):
+            df["ema_slow"] = df[
+                "ema_21"
+            ]
+
+        # -----------------------------------------------------
+        # MACD HISTOGRAM
+        # -----------------------------------------------------
+
+        if (
+            "macd_hist" not in df.columns
+            and "macd_histogram" in df.columns
+        ):
+            df["macd_hist"] = df[
+                "macd_histogram"
+            ]
+
+        # -----------------------------------------------------
+        # EMA SLOPE
+        # -----------------------------------------------------
+
+        if (
+            "ema_fast_slope" not in df.columns
+            and "ema9_slope" in df.columns
+        ):
+            df["ema_fast_slope"] = df[
+                "ema9_slope"
+            ]
+
+        # -----------------------------------------------------
+        # EMA FALLBACK
+        # -----------------------------------------------------
+
+        if "close" in df.columns:
+
+            close = pd.to_numeric(
+                df["close"],
+                errors="coerce",
+            )
 
             if (
-                elapsed
-                < self.REQUEST_DELAY_SECONDS
+                "ema_fast"
+                not in df.columns
             ):
-                await asyncio.sleep(
-                    self.REQUEST_DELAY_SECONDS
-                    - elapsed
+                df["ema_fast"] = (
+                    close.ewm(
+                        span=9,
+                        adjust=False,
+                    ).mean()
                 )
 
-        self._last_scan_at = self._now()
+            if (
+                "ema_slow"
+                not in df.columns
+            ):
+                df["ema_slow"] = (
+                    close.ewm(
+                        span=21,
+                        adjust=False,
+                    ).mean()
+                )
+
+            if (
+                "ema_50"
+                not in df.columns
+            ):
+                df["ema_50"] = (
+                    close.ewm(
+                        span=50,
+                        adjust=False,
+                    ).mean()
+                )
 
         # -----------------------------------------------------
-        # Get candles
+        # MACD FALLBACK
         # -----------------------------------------------------
 
-        candles = await self.get_candles(
-            pair
+        if "close" in df.columns:
+
+            close = pd.to_numeric(
+                df["close"],
+                errors="coerce",
+            )
+
+            if "macd" not in df.columns:
+
+                ema_12 = (
+                    close.ewm(
+                        span=12,
+                        adjust=False,
+                    ).mean()
+                )
+
+                ema_26 = (
+                    close.ewm(
+                        span=26,
+                        adjust=False,
+                    ).mean()
+                )
+
+                df["macd"] = (
+                    ema_12 - ema_26
+                )
+
+            if (
+                "macd_signal"
+                not in df.columns
+            ):
+                df["macd_signal"] = (
+                    df["macd"].ewm(
+                        span=9,
+                        adjust=False,
+                    ).mean()
+                )
+
+            if (
+                "macd_hist"
+                not in df.columns
+            ):
+                df["macd_hist"] = (
+                    df["macd"]
+                    - df["macd_signal"]
+                )
+
+        # -----------------------------------------------------
+        # EMA SLOPE FALLBACK
+        # -----------------------------------------------------
+
+        if (
+            "ema_fast" in df.columns
+            and "ema_fast_slope"
+            not in df.columns
+        ):
+            df["ema_fast_slope"] = (
+                df["ema_fast"]
+                - df["ema_fast"].shift(3)
+            )
+
+        return df
+
+    # =========================================================
+    # PROBABILITY
+    # =========================================================
+
+    def _calculate_probability(
+        self,
+        quality: float,
+        score_difference: float,
+        confirmations: int,
+    ) -> float:
+        """
+        Внутренняя оценка вероятности.
+
+        НЕ является гарантией результата.
+        """
+
+        probability = (
+            50.0
+            + quality * 0.35
         )
 
+        if score_difference >= 35:
+            probability += 5.0
+
+        elif score_difference >= 30:
+            probability += 4.0
+
+        elif score_difference >= 25:
+            probability += 3.0
+
+        elif score_difference >= 20:
+            probability += 2.0
+
+        elif score_difference >= 15:
+            probability += 1.0
+
+        if confirmations >= 7:
+            probability += 3.0
+
+        elif confirmations >= 6:
+            probability += 2.0
+
+        elif confirmations >= 5:
+            probability += 1.0
+
+        return float(
+            max(
+                50.0,
+                min(
+                    95.0,
+                    probability,
+                ),
+            )
+        )
+
+    # =========================================================
+    # ANALYZE
+    # =========================================================
+
+    def analyze(
+        self,
+        pair: str,
+        candles: pd.DataFrame,
+        expiry_minutes: Optional[int] = None,
+    ) -> Optional[Signal]:
+
+        print("=" * 70)
+        print(
+            f"🔎 ANALYSIS: {pair}"
+        )
+        print("=" * 70)
+
+        # -----------------------------------------------------
+        # EXPIRY
+        # -----------------------------------------------------
+
+        expiry_minutes = (
+            self.normalize_expiry_minutes(
+                expiry_minutes
+            )
+        )
+
+        print(
+            f"⏱️ Expiry requested: "
+            f"{expiry_minutes}m"
+        )
+
+        # -----------------------------------------------------
+        # DATAFRAME
+        # -----------------------------------------------------
+
         if candles is None:
+
             print(
-                f"[ANALYSIS] {pair}: "
-                "REJECT | candles unavailable"
+                f"❌ REJECTED: {pair} | "
+                "candles=None"
             )
+
             return None
 
-        try:
-            candles_count = len(candles)
-        except Exception:
-            candles_count = 0
+        if not isinstance(
+            candles,
+            pd.DataFrame,
+        ):
 
-        if candles_count < 80:
             print(
-                f"[ANALYSIS] {pair}: "
-                f"REJECT | only "
-                f"{candles_count} candles"
-            )
-            return None
-
-        # -----------------------------------------------------
-        # Engine
-        # -----------------------------------------------------
-
-        try:
-            signal = self.engine.analyze(
-                pair,
-                candles,
+                f"❌ REJECTED: {pair} | "
+                "invalid candles type: "
+                f"{type(candles).__name__}"
             )
 
-        except TypeError as exc:
-            print(
-                f"[ANALYSIS] {pair}: "
-                f"ENGINE TYPE ERROR: {exc}"
-            )
-            return None
-
-        except Exception as exc:
-            print(
-                f"[ANALYSIS] {pair}: "
-                f"ENGINE ERROR: "
-                f"{type(exc).__name__}: {exc}"
-            )
-            return None
-
-        if signal is None:
-            print(
-                f"[ANALYSIS] {pair}: "
-                "REJECT | engine returned None"
-            )
             return None
 
         print(
-            f"[ANALYSIS] {pair}: "
-            f"SUCCESS | "
-            f"{signal.direction} | "
-            f"Q={signal.quality:.1f} | "
-            f"P={signal.probability:.1f}%"
+            f"📥 Candles received: "
+            f"{len(candles)}"
         )
 
-        self._last_signals[
-            pair
-        ] = signal
+        if candles.empty:
 
-        return signal
+            print(
+                f"❌ REJECTED: {pair} | "
+                "candles empty"
+            )
 
-    # =========================================================
-    # FIND BEST SIGNAL
-    # =========================================================
+            return None
 
-    @staticmethod
-    def _signal_score(
-        signal: Signal,
-    ) -> tuple[float, float, float]:
-        """
-        Сортировка лучших сигналов.
+        if len(candles) < self.MIN_CANDLES:
 
-        Сначала вероятность,
-        затем качество,
-        затем количество подтверждений.
-        """
+            print(
+                f"❌ REJECTED: {pair} | "
+                f"недостаточно свечей: "
+                f"{len(candles)} < "
+                f"{self.MIN_CANDLES}"
+            )
 
-        return (
-            float(signal.probability),
-            float(signal.quality),
-            float(
-                len(signal.confirmations)
+            return None
+
+        # -----------------------------------------------------
+        # OHLC
+        # -----------------------------------------------------
+
+        required_ohlc = [
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+
+        missing_ohlc = [
+            column
+            for column in required_ohlc
+            if column not in candles.columns
+        ]
+
+        if missing_ohlc:
+
+            print(
+                f"❌ REJECTED: {pair} | "
+                "Отсутствуют OHLC: "
+                f"{', '.join(missing_ohlc)}"
+            )
+
+            return None
+
+        # -----------------------------------------------------
+        # INDICATORS
+        # -----------------------------------------------------
+
+        try:
+
+            df = calculate_indicators(
+                candles.copy()
+            )
+
+        except Exception as exc:
+
+            print(
+                f"❌ INDICATOR ERROR: "
+                f"{pair} | "
+                f"{type(exc).__name__}: "
+                f"{exc}"
+            )
+
+            return None
+
+        if df is None:
+
+            print(
+                f"❌ REJECTED: {pair} | "
+                "calculate_indicators "
+                "returned None"
+            )
+
+            return None
+
+        if not isinstance(
+            df,
+            pd.DataFrame,
+        ):
+
+            print(
+                f"❌ REJECTED: {pair} | "
+                "calculate_indicators "
+                "returned "
+                f"{type(df).__name__}"
+            )
+
+            return None
+
+        print(
+            f"📊 Indicators result: "
+            f"{len(df)} rows"
+        )
+
+        print(
+            "📋 Indicator columns: "
+            f"{', '.join(map(str, df.columns))}"
+        )
+
+        # -----------------------------------------------------
+        # NORMALIZE
+        # -----------------------------------------------------
+
+        df = self._normalize_indicators(
+            df
+        )
+
+        print(
+            "📋 Normalized columns: "
+            f"{', '.join(map(str, df.columns))}"
+        )
+
+        # -----------------------------------------------------
+        # REQUIRED INDICATORS
+        # -----------------------------------------------------
+
+        missing = [
+            column
+            for column in self.REQUIRED_INDICATORS
+            if column not in df.columns
+        ]
+
+        if missing:
+
+            print(
+                f"❌ REJECTED: {pair} | "
+                "Отсутствуют индикаторы: "
+                f"{', '.join(missing)}"
+            )
+
+            return None
+
+        # -----------------------------------------------------
+        # NUMERIC
+        # -----------------------------------------------------
+
+        df = self._ensure_numeric(
+            df,
+            self.REQUIRED_INDICATORS,
+        )
+
+        # -----------------------------------------------------
+        # REMOVE FORMING CANDLE
+        # -----------------------------------------------------
+
+        if len(df) > 1:
+
+            df = df.iloc[:-1].copy()
+
+        if len(df) < 70:
+
+            print(
+                f"❌ REJECTED: {pair} | "
+                "после подготовки осталось "
+                f"{len(df)} свечей"
+            )
+
+            return None
+
+        # -----------------------------------------------------
+        # LAST CLOSED CANDLE
+        # -----------------------------------------------------
+
+        row = df.iloc[-1]
+
+        # -----------------------------------------------------
+        # VALID VALUES
+        # -----------------------------------------------------
+
+        invalid_values: list[str] = []
+
+        for column in self.REQUIRED_INDICATORS:
+
+            value = self._safe_float(
+                row.get(column)
+            )
+
+            if value is None:
+
+                invalid_values.append(
+                    column
+                )
+
+        if invalid_values:
+
+            print(
+                f"❌ REJECTED: {pair} | "
+                "Некорректные/NaN значения: "
+                f"{', '.join(invalid_values)}"
+            )
+
+            return None
+
+        # =====================================================
+        # VALUES
+        # =====================================================
+
+        close = self._safe_float(
+            row["close"]
+        )
+
+        ema_fast = self._safe_float(
+            row["ema_fast"]
+        )
+
+        ema_slow = self._safe_float(
+            row["ema_slow"]
+        )
+
+        ema_50 = self._safe_float(
+            row["ema_50"]
+        )
+
+        rsi = self._safe_float(
+            row["rsi"]
+        )
+
+        macd = self._safe_float(
+            row["macd"]
+        )
+
+        macd_signal = self._safe_float(
+            row["macd_signal"]
+        )
+
+        macd_hist = self._safe_float(
+            row["macd_hist"]
+        )
+
+        bb_upper = self._safe_float(
+            row["bb_upper"]
+        )
+
+        bb_lower = self._safe_float(
+            row["bb_lower"]
+        )
+
+        stoch_k = self._safe_float(
+            row["stoch_k"]
+        )
+
+        stoch_d = self._safe_float(
+            row["stoch_d"]
+        )
+
+        atr = self._safe_float(
+            row["atr"]
+        )
+
+        body_ratio = self._safe_float(
+            row["body_ratio"]
+        )
+
+        support = self._safe_float(
+            row["support"]
+        )
+
+        resistance = self._safe_float(
+            row["resistance"]
+        )
+
+        ema_fast_slope = self._safe_float(
+            row["ema_fast_slope"]
+        )
+
+        volatility = self._safe_float(
+            row["volatility"]
+        )
+
+        # =====================================================
+        # SCORE
+        # =====================================================
+
+        call_score = 0.0
+        put_score = 0.0
+
+        call_reasons: list[str] = []
+        put_reasons: list[str] = []
+
+        # =====================================================
+        # 1. EMA TREND — 20
+        # =====================================================
+
+        if (
+            close > ema_fast
+            and ema_fast > ema_slow
+            and ema_slow > ema_50
+        ):
+
+            call_score += 20
+
+            call_reasons.append(
+                "EMA bullish trend"
+            )
+
+        elif (
+            close < ema_fast
+            and ema_fast < ema_slow
+            and ema_slow < ema_50
+        ):
+
+            put_score += 20
+
+            put_reasons.append(
+                "EMA bearish trend"
+            )
+
+        elif close > ema_fast:
+
+            call_score += 10
+
+            call_reasons.append(
+                "Цена выше EMA fast"
+            )
+
+        elif close < ema_fast:
+
+            put_score += 10
+
+            put_reasons.append(
+                "Цена ниже EMA fast"
+            )
+
+        # =====================================================
+        # 2. EMA SLOPE — 10
+        # =====================================================
+
+        if ema_fast_slope > 0:
+
+            call_score += 10
+
+            call_reasons.append(
+                "EMA fast растёт"
+            )
+
+        elif ema_fast_slope < 0:
+
+            put_score += 10
+
+            put_reasons.append(
+                "EMA fast снижается"
+            )
+
+        # =====================================================
+        # 3. MACD — 15
+        # =====================================================
+
+        if (
+            macd > macd_signal
+            and macd_hist > 0
+        ):
+
+            call_score += 15
+
+            call_reasons.append(
+                "MACD bullish"
+            )
+
+        elif (
+            macd < macd_signal
+            and macd_hist < 0
+        ):
+
+            put_score += 15
+
+            put_reasons.append(
+                "MACD bearish"
+            )
+
+        elif macd_hist > 0:
+
+            call_score += 7
+
+            call_reasons.append(
+                "MACD histogram positive"
+            )
+
+        elif macd_hist < 0:
+
+            put_score += 7
+
+            put_reasons.append(
+                "MACD histogram negative"
+            )
+
+        # =====================================================
+        # 4. RSI — 10
+        # =====================================================
+
+        if 50 <= rsi <= 68:
+
+            call_score += 10
+
+            call_reasons.append(
+                "RSI подтверждает CALL"
+            )
+
+        elif 32 <= rsi < 50:
+
+            put_score += 10
+
+            put_reasons.append(
+                "RSI подтверждает PUT"
+            )
+
+        elif rsi < 30:
+
+            call_score += 6
+
+            call_reasons.append(
+                "RSI oversold"
+            )
+
+        elif rsi > 70:
+
+            put_score += 6
+
+            put_reasons.append(
+                "RSI overbought"
+            )
+
+        # =====================================================
+        # 5. BOLLINGER BANDS — 10
+        # =====================================================
+
+        bb_range = (
+            bb_upper
+            - bb_lower
+        )
+
+        if bb_range > 0:
+
+            bb_position = (
+                close
+                - bb_lower
+            ) / bb_range
+
+            if bb_position <= 0.30:
+
+                call_score += 10
+
+                call_reasons.append(
+                    "Цена у нижней "
+                    "Bollinger Band"
+                )
+
+            elif bb_position >= 0.70:
+
+                put_score += 10
+
+                put_reasons.append(
+                    "Цена у верхней "
+                    "Bollinger Band"
+                )
+
+            elif bb_position < 0.50:
+
+                call_score += 4
+
+                call_reasons.append(
+                    "Цена ниже середины "
+                    "Bollinger"
+                )
+
+            else:
+
+                put_score += 4
+
+                put_reasons.append(
+                    "Цена выше середины "
+                    "Bollinger"
+                )
+
+        # =====================================================
+        # 6. STOCHASTIC — 10
+        # =====================================================
+
+        if (
+            stoch_k > stoch_d
+            and stoch_k < 80
+        ):
+
+            call_score += 10
+
+            call_reasons.append(
+                "Stochastic bullish"
+            )
+
+        elif (
+            stoch_k < stoch_d
+            and stoch_k > 20
+        ):
+
+            put_score += 10
+
+            put_reasons.append(
+                "Stochastic bearish"
+            )
+
+        elif stoch_k < 20:
+
+            call_score += 6
+
+            call_reasons.append(
+                "Stochastic oversold"
+            )
+
+        elif stoch_k > 80:
+
+            put_score += 6
+
+            put_reasons.append(
+                "Stochastic overbought"
+            )
+
+        # =====================================================
+        # 7. CANDLE — 10
+        # =====================================================
+
+        candle_open = self._safe_float(
+            row.get("open")
+        )
+
+        candle_high = self._safe_float(
+            row.get("high")
+        )
+
+        candle_low = self._safe_float(
+            row.get("low")
+        )
+
+        if (
+            candle_open is not None
+            and close is not None
+            and candle_high is not None
+            and candle_low is not None
+        ):
+
+            candle_range = (
+                candle_high
+                - candle_low
+            )
+
+            if candle_range > 0:
+
+                upper_wick = (
+                    candle_high
+                    - max(
+                        candle_open,
+                        close,
+                    )
+                )
+
+                lower_wick = (
+                    min(
+                        candle_open,
+                        close,
+                    )
+                    - candle_low
+                )
+
+                if (
+                    close > candle_open
+                    and body_ratio >= 0.55
+                ):
+
+                    call_score += 10
+
+                    call_reasons.append(
+                        "Сильная бычья свеча"
+                    )
+
+                elif (
+                    close < candle_open
+                    and body_ratio >= 0.55
+                ):
+
+                    put_score += 10
+
+                    put_reasons.append(
+                        "Сильная медвежья свеча"
+                    )
+
+                elif (
+                    lower_wick
+                    > candle_range * 0.45
+                    and close > candle_open
+                ):
+
+                    call_score += 6
+
+                    call_reasons.append(
+                        "Бычий rejection"
+                    )
+
+                elif (
+                    upper_wick
+                    > candle_range * 0.45
+                    and close < candle_open
+                ):
+
+                    put_score += 6
+
+                    put_reasons.append(
+                        "Медвежий rejection"
+                    )
+
+        # =====================================================
+        # 8. SUPPORT / RESISTANCE — 10
+        # =====================================================
+
+        sr_range = (
+            resistance
+            - support
+        )
+
+        if sr_range > 0:
+
+            support_distance = (
+                close
+                - support
+            ) / sr_range
+
+            resistance_distance = (
+                resistance
+                - close
+            ) / sr_range
+
+            if support_distance <= 0.20:
+
+                call_score += 10
+
+                call_reasons.append(
+                    "Цена рядом с поддержкой"
+                )
+
+            elif resistance_distance <= 0.20:
+
+                put_score += 10
+
+                put_reasons.append(
+                    "Цена рядом с сопротивлением"
+                )
+
+        # =====================================================
+        # 9. VOLATILITY — 5
+        # =====================================================
+
+        if volatility is not None:
+
+            if volatility > 0:
+
+                call_score += 2.5
+                put_score += 2.5
+
+                call_reasons.append(
+                    "Есть рыночная волатильность"
+                )
+
+                put_reasons.append(
+                    "Есть рыночная волатильность"
+                )
+
+        # =====================================================
+        # FINAL SCORE
+        # =====================================================
+
+        call_score = float(
+            min(
+                100.0,
+                max(
+                    0.0,
+                    call_score,
+                ),
+            )
+        )
+
+        put_score = float(
+            min(
+                100.0,
+                max(
+                    0.0,
+                    put_score,
+                ),
+            )
+        )
+
+        if call_score >= put_score:
+
+            direction = "CALL"
+            quality = call_score
+            losing_score = put_score
+            reasons = call_reasons
+
+        else:
+
+            direction = "PUT"
+            quality = put_score
+            losing_score = call_score
+            reasons = put_reasons
+
+        score_difference = (
+            quality
+            - losing_score
+        )
+
+        confirmations = len(
+            reasons
+        )
+
+        print(
+            f"📈 {pair} | "
+            f"CALL={call_score:.1f} | "
+            f"PUT={put_score:.1f} | "
+            f"BEST={direction} | "
+            f"QUALITY={quality:.1f} | "
+            f"DIFF={score_difference:.1f}"
+        )
+
+        # =====================================================
+        # SCORE DIFFERENCE FILTER
+        # =====================================================
+
+        if score_difference < 12:
+
+            print(
+                f"❌ REJECTED: {pair} | "
+                "Разница сигналов слишком мала: "
+                f"{score_difference:.1f} < 12"
+            )
+
+            return None
+
+        # =====================================================
+        # QUALITY FILTER
+        # =====================================================
+
+        if quality < self.min_quality:
+
+            print(
+                f"❌ REJECTED: {pair} | "
+                f"Quality {quality:.1f} < "
+                f"{self.min_quality:.1f}"
+            )
+
+            return None
+
+        # =====================================================
+        # PROBABILITY
+        # =====================================================
+
+        probability = (
+            self._calculate_probability(
+                quality=quality,
+                score_difference=score_difference,
+                confirmations=confirmations,
+            )
+        )
+
+        print(
+            f"🎯 {pair} | "
+            f"probability="
+            f"{probability:.1f}%"
+        )
+
+        # =====================================================
+        # PROBABILITY FILTER
+        # =====================================================
+
+        if probability < self.min_probability:
+
+            print(
+                f"❌ REJECTED: {pair} | "
+                f"Probability "
+                f"{probability:.1f}% < "
+                f"{self.min_probability:.1f}%"
+            )
+
+            return None
+
+        # =====================================================
+        # TIME
+        # =====================================================
+
+        analysis_time = self._now()
+
+        entry_time = (
+            self._get_entry_time(
+                analysis_time
+            )
+        )
+
+        expiry_time = (
+            self._get_expiry_time(
+                entry_time,
+                expiry_minutes,
+            )
+        )
+
+        # =====================================================
+        # FINAL SIGNAL
+        # =====================================================
+
+        print("=" * 70)
+
+        print(
+            f"✅ SIGNAL FOUND: {pair}"
+        )
+
+        print(
+            f"📊 Direction: "
+            f"{direction}"
+        )
+
+        print(
+            f"⭐ Quality: "
+            f"{quality:.1f}"
+        )
+
+        print(
+            f"🎯 Probability: "
+            f"{probability:.1f}%"
+        )
+
+        print(
+            f"⏱️ Duration: "
+            f"{expiry_minutes}m"
+        )
+
+        print(
+            f"⏰ Entry: "
+            f"{entry_time.strftime('%H:%M:%S')}"
+        )
+
+        print(
+            f"⏰ Expiry: "
+            f"{expiry_time.strftime('%H:%M:%S')}"
+        )
+
+        print(
+            f"🔍 Confirmations: "
+            f"{confirmations}"
+        )
+
+        print("=" * 70)
+
+        return Signal(
+            pair=pair,
+            direction=direction,
+            quality=quality,
+            probability=probability,
+            entry_time=entry_time,
+            expiry_time=expiry_time,
+            analysis_time=analysis_time,
+            confirmations=list(
+                reasons
+            ),
+            reasons=list(
+                reasons
             ),
         )
 
-    async def _find_best_signal(
+    # =========================================================
+    # ANALYZE WITH ANY EXPIRY
+    # =========================================================
+
+    def analyze_with_expiry(
         self,
-        requested_pair: Optional[str] = None,
-    ) -> tuple[
-        Optional[Signal],
-        list[str],
-    ]:
+        pair: str,
+        candles: pd.DataFrame,
+        expiry_minutes: int,
+    ) -> Optional[Signal]:
+        """
+        Явный метод для нового интерфейса.
 
-        pairs = self._select_pairs_for_scan(
-            requested_pair
-        )
+        Пример:
 
-        print(
-            "=" * 70
-        )
-
-        print(
-            "[SCAN] START"
-        )
-
-        print(
-            f"[SCAN] Проверяем {len(pairs)} пар:"
-        )
-
-        if pairs:
-            print(
-                ", ".join(pairs)
+            engine.analyze_with_expiry(
+                "EUR/USD",
+                candles,
+                10,
             )
 
-        print(
-            "=" * 70
+        Аналогичен:
+
+            engine.analyze(
+                "EUR/USD",
+                candles,
+                expiry_minutes=10,
+            )
+        """
+
+        return self.analyze(
+            pair=pair,
+            candles=candles,
+            expiry_minutes=expiry_minutes,
         )
 
-        if not pairs:
-            print(
-                "[SCAN] Нет доступных пар"
-            )
-            return None, []
+    # =========================================================
+    # ANALYZE ALL EXPIRIES
+    # =========================================================
 
-        signals: list[Signal] = []
-        diagnostics: list[str] = []
+    def analyze_all_expiries(
+        self,
+        pair: str,
+        candles: pd.DataFrame,
+    ) -> dict[int, Optional[Signal]]:
+        """
+        Анализирует текущий рынок для всех длительностей
+        от 1 до 20 минут.
 
-        for index, pair in enumerate(
-            pairs,
-            start=1,
+        ВАЖНО:
+
+        Индикаторы рассчитываются один раз.
+        Для каждой длительности создаётся независимый
+        Signal с соответствующим expiry_time.
+
+        Если направление рынка одинаковое, это не означает,
+        что все 20 сигналов гарантированно одинаково успешны.
+        """
+
+        result: dict[
+            int,
+            Optional[Signal],
+        ] = {}
+
+        for minutes in range(
+            self.MIN_EXPIRY_MINUTES,
+            self.MAX_EXPIRY_MINUTES + 1,
         ):
 
-            if self._rate_limit_active():
-                diagnostics.append(
-                    f"{pair}: RATE_LIMIT"
-                )
-                break
-
-            print(
-                f"[SCAN] {index}/{len(pairs)} "
-                f"→ {pair}"
+            signal = self.analyze(
+                pair=pair,
+                candles=candles,
+                expiry_minutes=minutes,
             )
 
-            signal = await self.analyze_pair(
-                pair
-            )
+            result[minutes] = signal
 
-            if signal is None:
-                diagnostics.append(
-                    f"{pair}: NO_SIGNAL"
-                )
-            else:
-                signals.append(signal)
-
-            # -------------------------------------------------
-            # Если это не последняя пара —
-            # выдерживаем паузу.
-            # -------------------------------------------------
-
-            if index < len(pairs):
-                await asyncio.sleep(
-                    self.REQUEST_DELAY_SECONDS
-                )
-
-        # -----------------------------------------------------
-        # No signals
-        # -----------------------------------------------------
-
-        if not signals:
-            print(
-                "=" * 70
-            )
-            print(
-                "[SCAN] NO STRONG SIGNAL"
-            )
-            print(
-                "=" * 70
-            )
-
-            return None, diagnostics
-
-        # -----------------------------------------------------
-        # Best signal
-        # -----------------------------------------------------
-
-        signals.sort(
-            key=self._signal_score,
-            reverse=True,
-        )
-
-        best = signals[0]
-
-        print(
-            "=" * 70
-        )
-
-        print(
-            "[SCAN] BEST SIGNAL"
-        )
-
-        print(
-            f"Pair: {best.pair}"
-        )
-
-        print(
-            f"Direction: {best.direction}"
-        )
-
-        print(
-            f"Quality: {best.quality:.1f}"
-        )
-
-        print(
-            f"Probability: "
-            f"{best.probability:.1f}%"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        return best, diagnostics
+        return result
 
     # =========================================================
-    # MANUAL SIGNAL
-    # =========================================================
-
-    async def get_manual_signal(
-        self,
-        pair: Optional[str] = None,
-    ) -> Optional[Signal]:
-
-        async with self._scan_lock:
-
-            print(
-                "=" * 70
-            )
-
-            print(
-                "[MANUAL SIGNAL] START"
-            )
-
-            print(
-                f"[MANUAL SIGNAL] "
-                f"{self._now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-
-            # -------------------------------------------------
-            # Rate limit
-            # -------------------------------------------------
-
-            if self._rate_limit_active():
-
-                remaining = (
-                    self._rate_limited_until
-                    - self._now()
-                ).total_seconds()
-
-                print(
-                    "[MANUAL SIGNAL] "
-                    "RATE LIMIT ACTIVE | "
-                    f"осталось примерно "
-                    f"{max(0, remaining):.0f}s"
-                )
-
-                return None
-
-            # -------------------------------------------------
-            # Requested pair
-            # -------------------------------------------------
-
-            if pair:
-                print(
-                    f"[MANUAL SIGNAL] "
-                    f"Запрошена пара: {pair}"
-                )
-
-            signal, _ = (
-                await self._find_best_signal(
-                    requested_pair=pair
-                )
-            )
-
-            if signal is None:
-                print(
-                    "[MANUAL SIGNAL] "
-                    "Сильного сигнала нет"
-                )
-            else:
-                print(
-                    "[MANUAL SIGNAL] "
-                    f"FOUND: {signal.pair} "
-                    f"{signal.direction} "
-                    f"Q={signal.quality:.1f} "
-                    f"P={signal.probability:.1f}%"
-                )
-
-            return signal
-
-    # =========================================================
-    # SCAN ONCE
-    # =========================================================
-
-    async def scan_once(
-        self,
-    ) -> Optional[Signal]:
-
-        async with self._scan_lock:
-
-            if self._rate_limit_active():
-                print(
-                    "[SCHEDULER] scan_once skipped | "
-                    "rate limit cooldown"
-                )
-                return None
-
-            signal, _ = (
-                await self._find_best_signal()
-            )
-
-            if signal is None:
-                return None
-
-            await self._save_signal(
-                signal
-            )
-
-            await self._send_to_users(
-                signal
-            )
-
-            return signal
-
-    # =========================================================
-    # DATABASE
-    # =========================================================
-
-    async def _save_signal(
-        self,
-        signal: Signal,
-    ) -> None:
-
-        if db is None:
-            print(
-                "[DATABASE] db unavailable | "
-                "signal not saved"
-            )
-            return
-
-        # -----------------------------------------------------
-        # Возможные API базы
-        # -----------------------------------------------------
-
-        methods = [
-            "save_signal",
-            "add_signal",
-            "create_signal",
-        ]
-
-        for method_name in methods:
-
-            method = getattr(
-                db,
-                method_name,
-                None,
-            )
-
-            if method is None:
-                continue
-
-            try:
-
-                payload = {
-                    "pair": signal.pair,
-                    "direction": signal.direction,
-                    "quality": signal.quality,
-                    "probability": signal.probability,
-                    "entry_time": signal.entry_time,
-                    "expiry_time": signal.expiry_time,
-                    "analysis_time": signal.analysis_time,
-                    "confirmations": signal.confirmations,
-                    "reasons": signal.reasons,
-                }
-
-                try:
-                    result = method(
-                        **payload
-                    )
-                except TypeError:
-                    result = method(
-                        signal
-                    )
-
-                if inspect.isawaitable(
-                    result
-                ):
-                    await result
-
-                print(
-                    "[DATABASE] Signal saved | "
-                    f"{signal.pair}"
-                )
-
-                return
-
-            except Exception as exc:
-                print(
-                    f"[DATABASE] "
-                    f"{method_name} error: "
-                    f"{exc}"
-                )
-
-        print(
-            "[DATABASE] "
-            "Метод сохранения сигнала не найден"
-        )
-
-    # =========================================================
-    # FORMAT SIGNAL
+    # BEST EXPIRY
     # =========================================================
 
     @staticmethod
-    def format_signal(
-        signal: Signal,
-    ) -> str:
+    def _expiry_score(
+        signal: Optional[Signal],
+    ) -> float:
 
-        direction_text = {
-            "CALL": "🟢 ВВЕРХ",
-            "PUT": "🔴 ВНИЗ",
-        }.get(
-            signal.direction,
-            signal.direction,
-        )
-
-        entry = signal.entry_time.strftime(
-            "%H:%M:%S"
-        )
-
-        expiry = signal.expiry_time.strftime(
-            "%H:%M:%S"
-        )
-
-        confirmations = (
-            signal.confirmations[:8]
-        )
-
-        if confirmations:
-            confirmations_text = "\n".join(
-                f"• {item}"
-                for item in confirmations
-            )
-        else:
-            confirmations_text = (
-                "• Подтверждения не указаны"
-            )
+        if signal is None:
+            return -1.0
 
         return (
-            "🎯 <b>ТОРГОВЫЙ СИГНАЛ</b>\n"
-            "\n"
-            f"💱 Пара: <b>{signal.pair}</b>\n"
-            f"📈 Направление: "
-            f"<b>{direction_text}</b>\n"
-            "\n"
-            f"⭐ Качество: "
-            f"<b>{signal.quality:.1f}/100</b>\n"
-            f"🎯 Расчётная вероятность: "
-            f"<b>{signal.probability:.1f}%</b>\n"
-            "\n"
-            f"🟢 Вход: <b>{entry}</b>\n"
-            f"🔴 Закрытие: <b>{expiry}</b>\n"
-            "\n"
-            "🔎 <b>Подтверждения:</b>\n"
-            f"{confirmations_text}\n"
-            "\n"
-            "⚠️ Вероятность является расчётной "
-            "оценкой модели, а не гарантией результата."
+            float(signal.probability)
+            * 0.65
+            +
+            float(signal.quality)
+            * 0.35
         )
 
-    # =========================================================
-    # SEND USERS
-    # =========================================================
-
-    async def _send_to_users(
+    def choose_best_expiry(
         self,
-        signal: Signal,
-    ) -> None:
+        pair: str,
+        candles: pd.DataFrame,
+        preferred_minutes: Optional[int] = None,
+    ) -> Optional[Signal]:
+        """
+        Выбирает лучший вариант длительности.
 
-        if self.bot is None:
-            print(
-                "[SCHEDULER] Bot unavailable | "
-                "signal not sent"
-            )
-            return
+        Если preferred_minutes указан —
+        сначала проверяется именно он.
 
-        if db is None:
-            print(
-                "[SCHEDULER] DB unavailable | "
-                "users not loaded"
-            )
-            return
+        Если preferred_minutes=None —
+        проверяются 1..20 минут.
 
-        users = None
+        Если ни один вариант не проходит фильтры —
+        возвращается None.
+        """
 
-        # -----------------------------------------------------
-        # Получаем пользователей через возможные методы DB
-        # -----------------------------------------------------
+        if preferred_minutes is not None:
 
-        methods = [
-            "get_active_users",
-            "get_users",
-            "get_all_users",
-        ]
-
-        for method_name in methods:
-
-            method = getattr(
-                db,
-                method_name,
-                None,
-            )
-
-            if method is None:
-                continue
-
-            try:
-                users = method()
-
-                if inspect.isawaitable(
-                    users
-                ):
-                    users = await users
-
-                if users is not None:
-                    break
-
-            except Exception as exc:
-                print(
-                    f"[SCHEDULER] "
-                    f"{method_name} error: {exc}"
+            preferred_minutes = (
+                self.normalize_expiry_minutes(
+                    preferred_minutes
                 )
-
-        if not users:
-            print(
-                "[SCHEDULER] "
-                "Нет активных пользователей"
             )
-            return
 
-        text = self.format_signal(
-            signal
-        )
+            return self.analyze(
+                pair=pair,
+                candles=candles,
+                expiry_minutes=preferred_minutes,
+            )
 
-        sent = 0
-        failed = 0
+        best_signal: Optional[
+            Signal
+        ] = None
 
-        for user in users:
+        best_score = -1.0
 
-            # -------------------------------------------------
-            # Поддержка разных форматов DB
-            # -------------------------------------------------
+        for minutes in range(
+            self.MIN_EXPIRY_MINUTES,
+            self.MAX_EXPIRY_MINUTES + 1,
+        ):
 
-            user_id = None
+            signal = self.analyze(
+                pair=pair,
+                candles=candles,
+                expiry_minutes=minutes,
+            )
 
-            if isinstance(
-                user,
-                int,
+            score = (
+                self._expiry_score(
+                    signal
+                )
+            )
+
+            if (
+                signal is not None
+                and score > best_score
             ):
-                user_id = user
 
-            elif isinstance(
-                user,
-                str,
-            ):
-                try:
-                    user_id = int(user)
-                except ValueError:
-                    user_id = None
+                best_signal = signal
+                best_score = score
 
-            elif isinstance(
-                user,
-                dict,
-            ):
-                for key in (
-                    "telegram_id",
-                    "user_id",
-                    "id",
-                ):
-                    if key in user:
-                        user_id = user[key]
-                        break
+        return best_signal
 
-            else:
-                for key in (
-                    "telegram_id",
-                    "user_id",
-                    "id",
-                ):
-                    if hasattr(
-                        user,
-                        key,
-                    ):
-                        user_id = getattr(
-                            user,
-                            key,
-                        )
-                        break
 
-            if user_id is None:
-                continue
+# =========================================================
+# BACKWARD COMPATIBILITY
+# =========================================================
 
-            try:
-
-                await self.bot.send_message(
-                    chat_id=int(user_id),
-                    text=text,
-                    parse_mode="HTML",
-                )
-
-                sent += 1
-
-            except Exception as exc:
-
-                failed += 1
-
-                print(
-                    f"[SCHEDULER] "
-                    f"Не удалось отправить "
-                    f"{user_id}: {exc}"
-                )
-
-        print(
-            "[SCHEDULER] "
-            f"Signal sent | "
-            f"success={sent} | "
-            f"failed={failed}"
-        )
-
-    # =========================================================
-    # AUTOMATIC LOOP
-    # =========================================================
-
-    async def run(
-        self,
-    ) -> None:
-
-        if self.running:
-            print(
-                "[SCHEDULER] "
-                "Already running"
-            )
-            return
-
-        self.running = True
-
-        print(
-            "[SCHEDULER] "
-            "Automatic scheduler started"
-        )
-
-        try:
-
-            while self.running:
-
-                now = self._now()
-
-                next_run = (
-                    self._next_5_minute(
-                        now
-                    )
-                )
-
-                seconds = (
-                    next_run - now
-                ).total_seconds()
-
-                print(
-                    "[SCHEDULER] "
-                    f"Следующий анализ: "
-                    f"{next_run.strftime('%H:%M:%S')} МСК "
-                    f"| через {seconds:.1f}s"
-                )
-
-                if seconds > 0:
-                    await asyncio.sleep(
-                        seconds
-                    )
-
-                # -------------------------------------------------
-                # После сна проверяем, что scheduler всё ещё
-                # работает.
-                # -------------------------------------------------
-
-                if not self.running:
-                    break
-
-                # -------------------------------------------------
-                # Если Twelve Data временно заблокирован,
-                # ждём cooldown.
-                # -------------------------------------------------
-
-                if self._rate_limit_active():
-
-                    remaining = (
-                        self._rate_limited_until
-                        - self._now()
-                    ).total_seconds()
-
-                    print(
-                        "[SCHEDULER] "
-                        "Пропуск цикла из-за "
-                        f"rate limit "
-                        f"({max(0, remaining):.0f}s)"
-                    )
-
-                    await asyncio.sleep(
-                        min(
-                            max(
-                                remaining,
-                                1,
-                            ),
-                            70,
-                        )
-                    )
-
-                    continue
-
-                # -------------------------------------------------
-                # Запуск анализа
-                # -------------------------------------------------
-
-                try:
-
-                    await self.scan_once()
-
-                except asyncio.CancelledError:
-                    raise
-
-                except Exception as exc:
-
-                    print(
-                        "[SCHEDULER] "
-                        f"Ошибка цикла: "
-                        f"{type(exc).__name__}: "
-                        f"{exc}"
-                    )
-
-                # -------------------------------------------------
-                # Небольшая защита от повторного запуска
-                # в ту же минуту.
-                # -------------------------------------------------
-
-                await asyncio.sleep(
-                    2
-                )
-
-        except asyncio.CancelledError:
-
-            print(
-                "[SCHEDULER] "
-                "Automatic scheduler cancelled"
-            )
-
-            raise
-
-        finally:
-
-            self.running = False
-
-            print(
-                "[SCHEDULER] "
-                "Automatic scheduler stopped"
-            )
-
-    # =========================================================
-    # STOP
-    # =========================================================
-
-    def stop(self) -> None:
-
-        self.running = False
-
-        print(
-            "[SCHEDULER] "
-            "Stop requested"
-        )
+__all__ = [
+    "Signal",
+    "SignalEngine",
+]
