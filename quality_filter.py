@@ -3,9 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from config import (
-    SIGNAL_MINIMUM_QUALITY,
-)
+from config import SIGNAL_MINIMUM_QUALITY
 from market import Candle
 from models import Direction
 from signal_engine import signal_engine
@@ -275,6 +273,7 @@ class QualityFilter:
 
         if confirmations >= 3:
             confirmation_bonus = 8.0
+
         elif confirmations >= 2:
             confirmation_bonus = 3.0
 
@@ -359,6 +358,7 @@ class QualityFilter:
         if up_count > down_count:
             direction = Direction.UP
             confirmations = up_count
+
         else:
             direction = Direction.DOWN
             confirmations = down_count
@@ -447,25 +447,6 @@ class QualityFilter:
             timeframe_results=analyses,
         )
 
-
-# =========================================================
-# GLOBAL FILTER
-# =========================================================
-
-# ВАЖНО:
-#
-# Раньше здесь было жёстко:
-#
-#     minimum_quality=85.0
-#
-# Теперь используется конфигурация.
-#
-# По умолчанию:
-#
-#     75%
-#
-# При этом Render Environment Variable
-# SIGNAL_MINIMUM_QUALITY имеет приоритет.
 
 quality_filter = QualityFilter(
     minimum_quality=SIGNAL_MINIMUM_QUALITY,
