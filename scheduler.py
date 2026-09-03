@@ -2,2135 +2,1362 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta
-from typing import Optional, Any
+from typing import Any
 
-from config import (
-    MIN_PROBABILITY,
-    MIN_QUALITY,
-    PAIRS,
-    TIMEZONE,
+from aiogram import Bot
+
+from market import MarketClient
+from signal_scanner import (
+    SignalScanner,
+    TradingSignal,
 )
 
-from market import market_client
-from signal_engine import Signal, SignalEngine
+logger = logging.getLogger("scheduler")
 
-from database import db as default_database
 
-from backtest import (
-    DEFAULT_TEST_POINTS,
-    ExpiryBacktester,
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+SIGNAL_GENERATION_INTERVAL = max(
+    10,
+    int(
+        os.getenv(
+            "SCHEDULER_SIGNAL_GENERATION_INTERVAL",
+            "300",
+        )
+    ),
 )
 
+SIGNAL_WARNING_SECONDS = max(
+    10,
+    int(
+        os.getenv(
+            "SIGNAL_WARNING_SECONDS",
+            "120",
+        )
+    ),
+)
 
-logger = logging.getLogger(__name__)
+SIGNAL_RESULT_CHECK_INTERVAL = max(
+    5,
+    int(
+        os.getenv(
+            "SIGNAL_RESULT_CHECK_INTERVAL",
+            "15",
+        )
+    ),
+)
 
+# Разрешённый диапазон:
+# от 1 до 20 минут.
+SIGNAL_EXPIRY_MINUTES = max(
+    1,
+    min(
+        20,
+        int(
+            os.getenv(
+                "SIGNAL_EXPIRY_MINUTES",
+                "5",
+            )
+        ),
+    ),
+)
 
-# ================================================================
-# SETTINGS
-# ================================================================
-
-MAX_PAIRS_PER_SCAN = 6
-
-REQUEST_DELAY_SECONDS = 2.0
-RATE_LIMIT_COOLDOWN_SECONDS = 65
-
-MIN_EXPIRY_MINUTES = 1
-MAX_EXPIRY_MINUTES = 20
-
-DEFAULT_EXPIRY_MINUTES = 5
-
-ANY_EXPIRY = "any"
-
-# Кэш исторического backtest.
-BACKTEST_CACHE_SECONDS = 300
-
-# Минимум реальных исторических сделок,
-# прежде чем использовать экспирацию для ANY.
-MIN_BACKTEST_TRADES = 10
-
-# Как часто проверяем завершившиеся сигналы.
-RESULT_CHECK_INTERVAL_SECONDS = 30
-
-# Максимум сигналов за один проход проверки.
-MAX_RESULT_CHECK_BATCH = 100
-
-# Сколько минут истории запрашиваем для определения
-# цены входа/закрытия.
-RESULT_CANDLE_LIMIT = 300
-
-# ================================================================
-# GLOBAL RESULT LOCK
-# ================================================================
-
-_RESULT_LOCK = asyncio.Lock()
+SIGNAL_CHAT_ID_RAW = os.getenv(
+    "SIGNAL_CHAT_ID",
+    "",
+).strip()
 
 
-class SignalScheduler:
+# =========================================================
+# OPTIONAL MODULES
+# =========================================================
+
+try:
+    from signal_warning import signal_warning
+
+    SIGNAL_WARNING_AVAILABLE = True
+
+except ImportError:
+    signal_warning = None
+    SIGNAL_WARNING_AVAILABLE = False
+
+    logger.warning(
+        "signal_warning module is not available."
+    )
+
+
+try:
+    from signal_result_checker import (
+        signal_result_checker,
+    )
+
+    SIGNAL_RESULT_CHECKER_AVAILABLE = True
+
+except ImportError:
+    signal_result_checker = None
+    SIGNAL_RESULT_CHECKER_AVAILABLE = False
+
+    logger.warning(
+        "signal_result_checker module is not available."
+    )
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def _parse_chat_id(
+    value: str,
+) -> int | str | None:
     """
-    Планировщик автоматических и ручных сигналов.
+    Преобразует SIGNAL_CHAT_ID.
 
-    Возможности:
+    Поддерживает:
+        123456789
+        -1001234567890
+        @channel
+    """
 
-        1..20 минут
-        Любое время
-        автоматический backtest
-        автоматическая рассылка
-        автоматическое определение WIN/LOSS
-        статистика по паре
-        статистика по экспирации
-        адаптивный выбор экспирации
+    value = value.strip()
 
-    ВАЖНО:
+    if not value:
+        return None
 
-        Расчётная probability модели НЕ является
-        гарантированной вероятностью выигрыша.
+    try:
+        return int(value)
 
-        Реальный WINRATE считается только по
-        завершённым сигналам.
+    except ValueError:
+        return value
+
+
+def _safe_task_name(
+    task: asyncio.Task[Any] | None,
+) -> str:
+
+    if task is None:
+        return "unknown"
+
+    try:
+        return task.get_name()
+
+    except Exception:
+        return "unknown"
+
+
+def _clamp_expiry_minutes(
+    value: int | float | str | None,
+) -> int:
+    """
+    Всегда возвращает срок сигнала 1–20 минут.
+    """
+
+    try:
+        minutes = int(value)
+
+    except (TypeError, ValueError):
+        minutes = 5
+
+    return max(
+        1,
+        min(
+            20,
+            minutes,
+        ),
+    )
+
+
+def _ensure_datetime(
+    value: Any,
+) -> datetime | None:
+    """
+    Приводит значение к datetime.
+
+    Поддерживает:
+        datetime
+        ISO string
+    """
+
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    if isinstance(value, str):
+        text = value.strip()
+
+        if not text:
+            return None
+
+        try:
+            return datetime.fromisoformat(
+                text.replace(
+                    "Z",
+                    "+00:00",
+                )
+            )
+
+        except ValueError:
+            return None
+
+    return None
+
+
+def _signal_created_at(
+    signal: TradingSignal,
+) -> datetime:
+    """
+    Получает время создания сигнала.
+    """
+
+    value = _ensure_datetime(
+        getattr(
+            signal,
+            "created_at",
+            None,
+        )
+    )
+
+    if value is not None:
+        return value
+
+    return datetime.now().astimezone()
+
+
+def _signal_expiry(
+    signal: TradingSignal,
+) -> datetime:
+    """
+    Вычисляет фактическое время окончания сигнала.
+
+    Приоритет:
+        1. expiry_time
+        2. expiration_time
+        3. expires_at
+        4. close_time, если это полноценный timestamp
+        5. created_at + SIGNAL_EXPIRY_MINUTES
+    """
+
+    for attribute in (
+        "expiry_time",
+        "expiration_time",
+        "expires_at",
+        "close_time",
+    ):
+        value = _ensure_datetime(
+            getattr(
+                signal,
+                attribute,
+                None,
+            )
+        )
+
+        if value is not None:
+            return value
+
+    created_at = _signal_created_at(
+        signal
+    )
+
+    expiry_minutes = _clamp_expiry_minutes(
+        getattr(
+            signal,
+            "expiry_minutes",
+            SIGNAL_EXPIRY_MINUTES,
+        )
+    )
+
+    return (
+        created_at
+        + timedelta(
+            minutes=expiry_minutes
+        )
+    )
+
+
+def _format_expiry(
+    signal: TradingSignal,
+) -> str:
+    """
+    Форматирует окончание сигнала для Telegram.
+    """
+
+    expiry = _signal_expiry(
+        signal
+    )
+
+    try:
+        return expiry.astimezone().strftime(
+            "%H:%M"
+        )
+
+    except Exception:
+        return expiry.strftime(
+            "%H:%M"
+        )
+
+
+# =========================================================
+# SCHEDULER
+# =========================================================
+
+class Scheduler:
+    """
+    Главный scheduler.
+
+    Управляет:
+
+        1. SignalScanner
+        2. предупреждениями
+        3. проверкой результатов
+        4. автоматической отправкой сигналов
+
+    SignalScanner продолжает самостоятельно
+    выполнять непрерывное сканирование рынка.
     """
 
     def __init__(
         self,
-        bot=None,
-        database=None,
+        bot: Bot,
+        market: MarketClient,
     ) -> None:
+
+        # -------------------------------------------------
+        # DEPENDENCIES
+        # -------------------------------------------------
 
         self.bot = bot
+        self.market = market
 
-        # Если main.py не передаст database,
-        # используем глобальную БД проекта.
-        self.database = (
-            database
-            if database is not None
-            else default_database
-        )
+        # -------------------------------------------------
+        # STATE
+        # -------------------------------------------------
 
-        self.engine = SignalEngine(
-            min_quality=MIN_QUALITY,
-            min_probability=MIN_PROBABILITY,
-        )
+        self._running = False
+        self._started = False
 
-        self.backtester = ExpiryBacktester(
-            engine=self.engine,
-            min_trades=MIN_BACKTEST_TRADES,
-        )
+        self._stop_event = asyncio.Event()
 
-        self.running = False
+        # -------------------------------------------------
+        # TASKS
+        # -------------------------------------------------
 
-        self.task: asyncio.Task | None = None
-        self.result_task: asyncio.Task | None = None
+        self._signal_generation_task: (
+            asyncio.Task[None] | None
+        ) = None
 
-        self.auto_expiry_minutes = (
-            DEFAULT_EXPIRY_MINUTES
-        )
+        self._signal_warning_task: (
+            asyncio.Task[None] | None
+        ) = None
 
-        self.auto_pair: Optional[str] = None
+        self._signal_result_checker_task: (
+            asyncio.Task[None] | None
+        ) = None
 
-        self._last_request_time = 0.0
+        # -------------------------------------------------
+        # SCANNER
+        # -------------------------------------------------
 
-        self._signal_lock = asyncio.Lock()
+        self.scanner: SignalScanner | None = None
 
-        # --------------------------------------------------------
-        # Backtest cache
-        # --------------------------------------------------------
+        # -------------------------------------------------
+        # ACTIVE SIGNALS
+        # -------------------------------------------------
 
-        self._backtest_cache: dict[
+        self._active_signals: dict[
             str,
-            tuple[
-                float,
-                Optional[int],
-                list,
-            ],
+            TradingSignal,
         ] = {}
 
-    # ============================================================
-    # EXPIRY
-    # ============================================================
+        # -------------------------------------------------
+        # STATISTICS
+        # -------------------------------------------------
 
-    @staticmethod
-    def normalize_expiry(
-        expiry_minutes,
-    ) -> Optional[int]:
+        self.generation_cycles = 0
+        self.generated_signals = 0
+        self.warning_cycles = 0
+        self.result_checker_cycles = 0
+        self.errors = 0
 
-        if expiry_minutes is None:
-            return DEFAULT_EXPIRY_MINUTES
-
-        if isinstance(
-            expiry_minutes,
-            str,
-        ):
-
-            value = (
-                expiry_minutes
-                .strip()
-                .lower()
-            )
-
-            if value in {
-                "any",
-                "all",
-                "auto",
-                "any_time",
-                "любое",
-                "любое время",
-            }:
-
-                return None
-
-            try:
-
-                expiry_minutes = int(
-                    value
-                )
-
-            except ValueError:
-
-                return DEFAULT_EXPIRY_MINUTES
-
-        try:
-
-            value = int(
-                expiry_minutes
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
-            return DEFAULT_EXPIRY_MINUTES
-
-        return max(
-            MIN_EXPIRY_MINUTES,
-            min(
-                MAX_EXPIRY_MINUTES,
-                value,
-            ),
+        logger.info(
+            "Scheduler object created."
         )
 
-    def set_auto_expiry(
-        self,
-        expiry_minutes,
-    ) -> None:
+    # =====================================================
+    # START
+    # =====================================================
 
-        self.auto_expiry_minutes = (
-            self.normalize_expiry(
-                expiry_minutes
+    async def start(
+        self,
+    ) -> None:
+        """
+        Запускает scheduler.
+
+        Повторный вызов безопасен.
+        """
+
+        if self._started:
+            logger.warning(
+                "Scheduler is already started."
             )
+            return
+
+        logger.info(
+            "================================================"
         )
 
-    def set_auto_pair(
-        self,
-        pair: Optional[str],
-    ) -> None:
+        logger.info(
+            "STARTING TEYZUS SCHEDULER"
+        )
 
-        self.auto_pair = pair
+        logger.info(
+            "================================================"
+        )
 
-    # ============================================================
-    # TIME
-    # ============================================================
+        self._started = True
+        self._running = True
+        self._stop_event.clear()
 
-    def _now(self) -> datetime:
+        # -------------------------------------------------
+        # CREATE SCANNER
+        # -------------------------------------------------
 
         try:
+            self.scanner = SignalScanner(
+                market_client=self.market,
+                send_signal=self._handle_signal,
+            )
 
-            return datetime.now(
-                TIMEZONE
+            logger.info(
+                "SignalScanner initialized."
             )
 
         except Exception:
+            self._running = False
+            self._started = False
 
-            from zoneinfo import ZoneInfo
-
-            return datetime.now(
-                ZoneInfo(
-                    "Europe/Moscow"
-                )
+            logger.exception(
+                "Failed to initialize SignalScanner."
             )
 
-    def _next_minute(
-        self,
-        dt: Optional[datetime] = None,
-    ) -> datetime:
+            raise
 
-        if dt is None:
-            dt = self._now()
+        # -------------------------------------------------
+        # START TASKS
+        # -------------------------------------------------
 
-        if dt.tzinfo is None:
-
-            dt = dt.replace(
-                tzinfo=TIMEZONE
+        self._signal_generation_task = (
+            asyncio.create_task(
+                self._signal_generation_loop(),
+                name="signal_generation",
             )
-
-        dt = dt.astimezone(
-            TIMEZONE
         )
 
-        return (
-            dt.replace(
-                second=0,
-                microsecond=0,
+        self._signal_warning_task = (
+            asyncio.create_task(
+                self._signal_warning_loop(),
+                name="signal_warning",
             )
-            + timedelta(minutes=1)
         )
 
-    # ============================================================
-    # DATETIME HELPERS
-    # ============================================================
-
-    @staticmethod
-    def _parse_datetime(
-        value: Any,
-    ) -> Optional[datetime]:
-
-        if value is None:
-            return None
-
-        if isinstance(
-            value,
-            datetime,
-        ):
-
-            dt = value
-
-        else:
-
-            text = str(value).strip()
-
-            if not text:
-                return None
-
-            try:
-
-                dt = datetime.fromisoformat(
-                    text.replace(
-                        "Z",
-                        "+00:00",
-                    )
-                )
-
-            except Exception:
-
-                return None
-
-        if dt.tzinfo is None:
-
-            dt = dt.replace(
-                tzinfo=TIMEZONE
+        self._signal_result_checker_task = (
+            asyncio.create_task(
+                self._signal_result_checker_loop(),
+                name="signal_result_checker",
             )
-
-        return dt.astimezone(
-            TIMEZONE
         )
 
-    # ============================================================
-    # PAIRS
-    # ============================================================
-
-    def _select_pairs_for_scan(
-        self,
-        requested_pair: Optional[str] = None,
-    ) -> list[str]:
-
-        if requested_pair:
-
-            normalized = str(
-                requested_pair
-            ).strip().lower()
-
-            if normalized not in {
-                "any",
-                "any_regular",
-                "any_otc",
-                "all",
-            }:
-
-                return [
-                    requested_pair
-                ]
-
-        return list(
-            PAIRS[
-                :MAX_PAIRS_PER_SCAN
-            ]
+        logger.info(
+            "Scheduler started: 3 tasks."
         )
 
-    # ============================================================
-    # RATE LIMIT
-    # ============================================================
+        logger.info(
+            "Scheduler tasks:"
+        )
 
-    async def _respect_rate_limit(
+        logger.info(
+            " - signal_generation"
+        )
+
+        logger.info(
+            " - signal_warning"
+        )
+
+        logger.info(
+            " - signal_result_checker"
+        )
+
+        logger.info(
+            "Signal expiry: %s minutes.",
+            SIGNAL_EXPIRY_MINUTES,
+        )
+
+    # =====================================================
+    # STOP
+    # =====================================================
+
+    async def stop(
         self,
     ) -> None:
 
-        loop = (
-            asyncio.get_running_loop()
-        )
-
-        now = loop.time()
-
-        elapsed = (
-            now
-            - self._last_request_time
-        )
-
-        if (
-            elapsed
-            < REQUEST_DELAY_SECONDS
-        ):
-
-            await asyncio.sleep(
-                REQUEST_DELAY_SECONDS
-                - elapsed
-            )
-
-        self._last_request_time = (
-            loop.time()
-        )
-
-    # ============================================================
-    # CANDLES
-    # ============================================================
-
-    async def get_candles(
-        self,
-        pair: str,
-        limit: int = 220,
-        interval: str = "1min",
-    ):
-
-        """
-        Получает свечи нужного таймфрейма.
-
-        Сначала используем совместимый get_history(),
-        потому что текущий market.py уже предоставляет
-        этот метод.
-
-        Если его нет — пробуем get_candles().
-        """
-
-        await self._respect_rate_limit()
-
-        # --------------------------------------------------------
-        # Основной вариант:
-        # market.py -> get_history(pair, interval, limit)
-        # --------------------------------------------------------
-
-        try:
-
-            if hasattr(
-                market_client,
-                "get_history",
-            ):
-
-                candles = (
-                    await market_client.get_history(
-                        pair=pair,
-                        interval=interval,
-                        limit=limit,
-                    )
-                )
-
-                if candles is not None:
-                    return candles
-
-        except TypeError:
-
-            # Совместимость со старой сигнатурой.
-            try:
-
-                candles = (
-                    await market_client.get_history(
-                        pair,
-                        interval,
-                        limit,
-                    )
-                )
-
-                if candles is not None:
-                    return candles
-
-            except Exception as exc:
-
-                logger.debug(
-                    "[MARKET] "
-                    "get_history positional error "
-                    "%s: %s",
-                    pair,
-                    exc,
-                )
-
-        except Exception as exc:
-
-            logger.warning(
-                "[MARKET] "
-                "get_history error %s: %s",
-                pair,
-                exc,
-            )
-
-        # --------------------------------------------------------
-        # Fallback
-        # --------------------------------------------------------
-
-        try:
-
-            return await market_client.get_candles(
-                pair=pair,
-                limit=limit,
-            )
-
-        except TypeError:
-
-            try:
-
-                return await market_client.get_candles(
-                    pair,
-                    limit,
-                )
-
-            except Exception as exc:
-
-                logger.warning(
-                    "[MARKET] "
-                    "get_candles fallback error "
-                    "%s: %s",
-                    pair,
-                    exc,
-                )
-
-                return None
-
-        except Exception as exc:
-
-            logger.warning(
-                "[MARKET] "
-                "get_candles error %s: %s",
-                pair,
-                exc,
-            )
-
-            return None
-
-    # ============================================================
-    # BACKTEST
-    # ============================================================
-
-    async def _get_best_expiry_from_backtest(
-        self,
-        pair: str,
-        candles,
-    ) -> tuple[
-        Optional[int],
-        list,
-    ]:
-
-        now = time.time()
-
-        cached = (
-            self._backtest_cache.get(
-                pair
-            )
-        )
-
-        if cached is not None:
-
-            (
-                cached_at,
-                best_expiry,
-                results,
-            ) = cached
-
-            if (
-                now - cached_at
-                < BACKTEST_CACHE_SECONDS
-            ):
-
-                return (
-                    best_expiry,
-                    results,
-                )
+        if not self._started:
+            return
 
         logger.info(
-            "[BACKTEST] "
-            "%s: историческая проверка "
-            "экспираций 1-20m",
-            pair,
+            "Stopping TEYZUS scheduler..."
         )
 
-        try:
+        self._running = False
+        self._stop_event.set()
 
-            best_expiry, results = (
-                await asyncio.to_thread(
-                    self.backtester.choose_best_expiry,
-                    pair,
-                    candles,
-                    DEFAULT_TEST_POINTS,
-                )
-            )
+        # -------------------------------------------------
+        # STOP SCANNER
+        # -------------------------------------------------
 
-        except Exception as exc:
+        if self.scanner is not None:
+            try:
+                await self.scanner.stop()
 
-            logger.exception(
-                "[BACKTEST] "
-                "%s error: %s",
-                pair,
-                exc,
-            )
-
-            return (
-                None,
-                [],
-            )
-
-        self._backtest_cache[
-            pair
-        ] = (
-            now,
-            best_expiry,
-            results,
-        )
-
-        if best_expiry is None:
-
-            logger.info(
-                "[BACKTEST] "
-                "%s: подходящей экспирации "
-                "не найдено",
-                pair,
-            )
-
-        else:
-
-            selected = next(
-                (
-                    item
-                    for item in results
-                    if (
-                        item.expiry_minutes
-                        == best_expiry
-                    )
-                ),
-                None,
-            )
-
-            if selected is not None:
-
-                logger.info(
-                    "[BACKTEST] "
-                    "%s: BEST=%sm | "
-                    "WINRATE=%.1f%% | "
-                    "W=%s | L=%s | N=%s",
-                    pair,
-                    best_expiry,
-                    selected.winrate,
-                    selected.wins,
-                    selected.losses,
-                    selected.total,
+            except Exception:
+                logger.exception(
+                    "Error while stopping SignalScanner."
                 )
 
-        return (
-            best_expiry,
-            results,
-        )
+        # -------------------------------------------------
+        # COLLECT TASKS
+        # -------------------------------------------------
 
-    # ============================================================
-    # ANALYZE PAIR
-    # ============================================================
-
-    async def analyze_pair(
-        self,
-        pair: str,
-        expiry_minutes=None,
-    ) -> Optional[Signal]:
-
-        normalized_expiry = (
-            self.normalize_expiry(
-                expiry_minutes
-            )
-        )
-
-        candles = await self.get_candles(
-            pair=pair,
-            limit=220,
-            interval="1min",
-        )
-
-        if candles is None:
-
-            logger.info(
-                "[SCHEDULER] "
-                "%s: свечи недоступны",
-                pair,
-            )
-
-            return None
-
-        # ========================================================
-        # КОНКРЕТНАЯ ЭКСПИРАЦИЯ
-        # ========================================================
-
-        if normalized_expiry is not None:
-
-            signal = self.engine.analyze(
-                pair=pair,
-                candles=candles,
-                expiry_minutes=normalized_expiry,
-            )
-
-            if signal is not None:
-
-                logger.info(
-                    "[SCHEDULER] "
-                    "%s | %sm | %s | "
-                    "quality=%.1f | "
-                    "probability=%.1f",
-                    pair,
-                    normalized_expiry,
-                    signal.direction,
-                    signal.quality,
-                    signal.probability,
-                )
-
-            return signal
-
-        # ========================================================
-        # ЛЮБОЕ ВРЕМЯ
-        # ========================================================
-
-        best_expiry, results = (
-            await self._get_best_expiry_from_backtest(
-                pair=pair,
-                candles=candles,
-            )
-        )
-
-        if best_expiry is None:
-
-            return None
-
-        logger.info(
-            "[SCHEDULER] "
-            "%s | ANY → %sm",
-            pair,
-            best_expiry,
-        )
-
-        signal = self.engine.analyze(
-            pair=pair,
-            candles=candles,
-            expiry_minutes=best_expiry,
-        )
-
-        return signal
-
-    # ============================================================
-    # BEST SIGNAL
-    # ============================================================
-
-    async def _find_best_signal(
-        self,
-        requested_pair: Optional[str] = None,
-        expiry_minutes=None,
-    ) -> Optional[Signal]:
-
-        pairs = (
-            self._select_pairs_for_scan(
-                requested_pair
-            )
-        )
-
-        if not pairs:
-            return None
-
-        signals: list[
-            Signal
+        tasks: list[
+            asyncio.Task[Any]
         ] = []
 
-        for pair in pairs:
-
-            try:
-
-                signal = await self.analyze_pair(
-                    pair=pair,
-                    expiry_minutes=expiry_minutes,
-                )
-
-                if signal is not None:
-
-                    signals.append(
-                        signal
-                    )
-
-            except Exception as exc:
-
-                logger.exception(
-                    "[SCHEDULER] "
-                    "%s analysis error: %s",
-                    pair,
-                    exc,
-                )
-
-        if not signals:
-            return None
-
-        # --------------------------------------------------------
-        # Выбираем самый сильный сигнал.
-        #
-        # 1. Probability
-        # 2. Quality
-        # 3. Подтверждения
-        # --------------------------------------------------------
-
-        signals.sort(
-            key=lambda signal: (
-                float(
-                    signal.probability
-                ),
-                float(
-                    signal.quality
-                ),
-                len(
-                    signal.confirmations
-                ),
-            ),
-            reverse=True,
-        )
-
-        return signals[0]
-
-    # ============================================================
-    # MANUAL
-    # ============================================================
-
-    async def get_manual_signal(
-        self,
-        pair: Optional[str] = None,
-        expiry_minutes=None,
-    ) -> Optional[Signal]:
-
-        normalized_expiry = (
-            self.normalize_expiry(
-                expiry_minutes
-            )
-        )
-
-        async with self._signal_lock:
-
-            return await self._find_best_signal(
-                requested_pair=pair,
-                expiry_minutes=normalized_expiry,
-            )
-
-    # ============================================================
-    # SIGNAL PRICE
-    # ============================================================
-
-    @staticmethod
-    def _extract_candle_datetime(
-        row: Any,
-    ) -> Optional[datetime]:
-
-        # --------------------------------------------------------
-        # dict / sqlite Row / mapping
-        # --------------------------------------------------------
-
-        if hasattr(
-            row,
-            "keys",
+        for task in (
+            self._signal_generation_task,
+            self._signal_warning_task,
+            self._signal_result_checker_task,
         ):
+            if task is not None:
+                tasks.append(task)
 
-            try:
+        # -------------------------------------------------
+        # CANCEL
+        # -------------------------------------------------
 
-                keys = set(
-                    row.keys()
-                )
+        for task in tasks:
+            if not task.done():
+                task.cancel()
 
-                for key in (
-                    "datetime",
-                    "timestamp",
-                    "time",
-                    "date",
-                ):
+        # -------------------------------------------------
+        # WAIT
+        # -------------------------------------------------
 
-                    if key in keys:
+        if tasks:
+            results = await asyncio.gather(
+                *tasks,
+                return_exceptions=True,
+            )
 
-                        value = row[key]
-
-                        dt = (
-                            SignalScheduler
-                            ._parse_datetime(
-                                value
-                            )
-                        )
-
-                        if dt is not None:
-                            return dt
-
-            except Exception:
-                pass
-
-        # --------------------------------------------------------
-        # pandas Series
-        # --------------------------------------------------------
-
-        try:
-
-            if hasattr(
-                row,
-                "name",
+            for task, result in zip(
+                tasks,
+                results,
             ):
-
-                dt = (
-                    SignalScheduler
-                    ._parse_datetime(
-                        row.name
-                    )
-                )
-
-                if dt is not None:
-                    return dt
-
-        except Exception:
-            pass
-
-        return None
-
-    @staticmethod
-    def _extract_candle_close(
-        row: Any,
-    ) -> Optional[float]:
-
-        # --------------------------------------------------------
-        # dict / mapping
-        # --------------------------------------------------------
-
-        if hasattr(
-            row,
-            "keys",
-        ):
-
-            try:
-
-                keys = set(
-                    row.keys()
-                )
-
-                for key in (
-                    "close",
-                    "Close",
-                    "CLOSE",
-                ):
-
-                    if key in keys:
-
-                        value = row[key]
-
-                        if value is None:
-                            continue
-
-                        return float(
-                            value
-                        )
-
-            except Exception:
-                pass
-
-        # --------------------------------------------------------
-        # pandas Series
-        # --------------------------------------------------------
-
-        try:
-
-            for key in (
-                "close",
-                "Close",
-                "CLOSE",
-            ):
-
-                if key in row:
-
-                    value = row[key]
-
-                    if value is None:
-                        continue
-
-                    return float(
-                        value
-                    )
-
-        except Exception:
-            pass
-
-        # --------------------------------------------------------
-        # Object attribute
-        # --------------------------------------------------------
-
-        for key in (
-            "close",
-            "Close",
-        ):
-
-            try:
-
-                value = getattr(
-                    row,
-                    key,
-                )
-
-                if value is not None:
-
-                    return float(
-                        value
-                    )
-
-            except Exception:
-                continue
-
-        return None
-
-    def _normalize_candles_for_result(
-        self,
-        candles,
-    ) -> list[tuple[
-        Optional[datetime],
-        float,
-    ]]:
-
-        if candles is None:
-            return []
-
-        result = []
-
-        # --------------------------------------------------------
-        # pandas DataFrame
-        # --------------------------------------------------------
-
-        try:
-
-            columns = {
-                str(column).lower()
-                for column in candles.columns
-            }
-
-            if "close" in columns:
-
-                for index, row in candles.iterrows():
-
-                    dt = (
-                        self._extract_candle_datetime(
-                            row
-                        )
-                    )
-
-                    if dt is None:
-
-                        dt = (
-                            self._parse_datetime(
-                                index
-                            )
-                        )
-
-                    price = (
-                        self._extract_candle_close(
-                            row
-                        )
-                    )
-
-                    if price is not None:
-
-                        result.append(
-                            (
-                                dt,
-                                price,
-                            )
-                        )
-
-                return result
-
-        except Exception:
-            pass
-
-        # --------------------------------------------------------
-        # list / tuple
-        # --------------------------------------------------------
-
-        try:
-
-            for row in candles:
-
-                dt = (
-                    self._extract_candle_datetime(
-                        row
-                    )
-                )
-
-                price = (
-                    self._extract_candle_close(
-                        row
-                    )
-                )
-
-                if price is not None:
-
-                    result.append(
-                        (
-                            dt,
-                            price,
-                        )
-                    )
-
-        except Exception:
-            return []
-
-        return result
-
-    def _find_price_at_or_after(
-        self,
-        candles,
-        target_time: datetime,
-    ) -> Optional[float]:
-
-        rows = (
-            self._normalize_candles_for_result(
-                candles
-            )
-        )
-
-        if not rows:
-            return None
-
-        target_time = (
-            self._parse_datetime(
-                target_time
-            )
-        )
-
-        if target_time is None:
-            return None
-
-        # --------------------------------------------------------
-        # Если есть timestamp — ищем первую свечу,
-        # которая соответствует или идёт после нужного времени.
-        # --------------------------------------------------------
-
-        timestamp_rows = [
-            item
-            for item in rows
-            if item[0] is not None
-        ]
-
-        if timestamp_rows:
-
-            timestamp_rows.sort(
-                key=lambda item: item[0]
-            )
-
-            for dt, price in timestamp_rows:
-
-                if dt >= target_time:
-
-                    return float(
-                        price
-                    )
-
-            # Если нужная свеча ещё не пришла,
-            # берём последнюю доступную только если
-            # она не слишком старая.
-            last_dt, last_price = (
-                timestamp_rows[-1]
-            )
-
-            delta = (
-                target_time - last_dt
-            ).total_seconds()
-
-            if 0 <= delta <= 120:
-
-                return float(
-                    last_price
-                )
-
-            return None
-
-        # --------------------------------------------------------
-        # Если timestamp отсутствует,
-        # берём последнюю цену.
-        #
-        # Такой fallback нужен для старых источников.
-        # --------------------------------------------------------
-
-        try:
-
-            return float(
-                rows[-1][1]
-            )
-
-        except Exception:
-
-            return None
-
-    # ============================================================
-    # SAVE SIGNAL
-    # ============================================================
-
-    async def _save_signal(
-        self,
-        signal: Signal,
-    ) -> Optional[int]:
-
-        if self.database is None:
-            return None
-
-        try:
-
-            # ----------------------------------------------------
-            # Проверяем дубликат ДО отправки.
-            # ----------------------------------------------------
-
-            if hasattr(
-                self.database,
-                "signal_exists",
-            ):
-
-                exists = (
-                    self.database.signal_exists(
-                        pair=signal.pair,
-                        direction=signal.direction,
-                        entry_time=signal.entry_time.isoformat(),
-                    )
-                )
-
-                if asyncio.iscoroutine(
-                    exists
-                ):
-
-                    exists = await exists
-
-                if exists:
-
-                    logger.info(
-                        "[SCHEDULER] "
-                        "Signal already exists: "
-                        "%s %s %s",
-                        signal.pair,
-                        signal.direction,
-                        signal.entry_time,
-                    )
-
-                    return None
-
-            # ----------------------------------------------------
-            # Получаем 1m candles для определения
-            # максимально близкой цены входа.
-            # ----------------------------------------------------
-
-            entry_price = None
-
-            try:
-
-                candles = await self.get_candles(
-                    pair=signal.pair,
-                    limit=120,
-                    interval="1min",
-                )
-
-                if candles is not None:
-
-                    entry_price = (
-                        self._find_price_at_or_after(
-                            candles,
-                            signal.entry_time,
-                        )
-                    )
-
-            except Exception as exc:
-
-                logger.debug(
-                    "[SCHEDULER] "
-                    "entry price unavailable "
-                    "%s: %s",
-                    signal.pair,
-                    exc,
-                )
-
-            # ----------------------------------------------------
-            # Сохраняем.
-            # ----------------------------------------------------
-
-            expiry_minutes = getattr(
-                signal,
-                "expiry_minutes",
-                None,
-            )
-
-            result = (
-                self.database.save_signal(
-                    pair=signal.pair,
-                    direction=signal.direction,
-                    quality=signal.quality,
-                    probability=signal.probability,
-                    entry_time=signal.entry_time.isoformat(),
-                    expiry_time=signal.expiry_time.isoformat(),
-                    expiry_minutes=expiry_minutes,
-                    analysis_time=signal.analysis_time.isoformat(),
-                    confirmations=signal.confirmations,
-                    reasons=signal.reasons,
-                    entry_price=entry_price,
-                )
-            )
-
-            if asyncio.iscoroutine(
-                result
-            ):
-
-                result = await result
-
-            signal_id = (
-                int(result)
-                if result is not None
-                else None
-            )
-
-            if signal_id:
-
-                logger.info(
-                    "[SCHEDULER] "
-                    "Signal saved id=%s | "
-                    "%s | %s | %sm",
-                    signal_id,
-                    signal.pair,
-                    signal.direction,
-                    expiry_minutes,
-                )
-
-            return signal_id
-
-        except Exception as exc:
-
-            logger.exception(
-                "[SCHEDULER] "
-                "DB save error: %s",
-                exc,
-            )
-
-            return None
-
-    # ============================================================
-    # RESULT CALCULATION
-    # ============================================================
-
-    @staticmethod
-    def _calculate_result(
-        direction: str,
-        entry_price: float,
-        expiry_price: float,
-    ) -> str:
-
-        direction = (
-            str(direction)
-            .upper()
-            .strip()
-        )
-
-        # Небольшая защита от float noise.
-        epsilon = 1e-12
-
-        if abs(
-            expiry_price
-            - entry_price
-        ) <= epsilon:
-
-            return "DRAW"
-
-        if direction == "CALL":
-
-            if expiry_price > entry_price:
-                return "WIN"
-
-            return "LOSS"
-
-        if direction == "PUT":
-
-            if expiry_price < entry_price:
-                return "WIN"
-
-            return "LOSS"
-
-        # Неизвестное направление.
-        return "EXPIRED"
-
-    # ============================================================
-    # CHECK ONE RESULT
-    # ============================================================
-
-    async def _check_signal_result(
-        self,
-        signal_row: dict,
-    ) -> bool:
-
-        if not signal_row:
-            return False
-
-        signal_id = signal_row.get(
-            "id"
-        )
-
-        pair = signal_row.get(
-            "pair"
-        )
-
-        direction = signal_row.get(
-            "direction"
-        )
-
-        entry_time = self._parse_datetime(
-            signal_row.get(
-                "entry_time"
-            )
-        )
-
-        expiry_time = self._parse_datetime(
-            signal_row.get(
-                "expiry_time"
-            )
-        )
-
-        if not signal_id:
-            return False
-
-        if not pair:
-            return False
-
-        if not direction:
-            return False
-
-        if entry_time is None:
-            return False
-
-        if expiry_time is None:
-            return False
-
-        # --------------------------------------------------------
-        # Если expiry ещё не наступил — ничего не делаем.
-        # --------------------------------------------------------
-
-        now = self._now()
-
-        if now < expiry_time:
-
-            return False
-
-        try:
-
-            # ----------------------------------------------------
-            # Получаем актуальные 1m candles.
-            # ----------------------------------------------------
-
-            candles = await self.get_candles(
-                pair=pair,
-                limit=RESULT_CANDLE_LIMIT,
-                interval="1min",
-            )
-
-            if candles is None:
-
-                logger.info(
-                    "[RESULT] "
-                    "%s id=%s: candles unavailable",
-                    pair,
-                    signal_id,
-                )
-
-                return False
-
-            # ----------------------------------------------------
-            # Цена входа.
-            #
-            # Если она уже сохранена — используем её.
-            # Иначе пытаемся найти историческую цену.
-            # ----------------------------------------------------
-
-            entry_price = signal_row.get(
-                "entry_price"
-            )
-
-            try:
-
-                if entry_price is not None:
-
-                    entry_price = float(
-                        entry_price
-                    )
-
-            except Exception:
-
-                entry_price = None
-
-            if entry_price is None:
-
-                entry_price = (
-                    self._find_price_at_or_after(
-                        candles,
-                        entry_time,
-                    )
-                )
-
-            # ----------------------------------------------------
-            # Цена закрытия.
-            # ----------------------------------------------------
-
-            expiry_price = (
-                self._find_price_at_or_after(
-                    candles,
-                    expiry_time,
-                )
-            )
-
-            if entry_price is None:
-
-                logger.warning(
-                    "[RESULT] "
-                    "%s id=%s: "
-                    "entry price unavailable",
-                    pair,
-                    signal_id,
-                )
-
-                return False
-
-            if expiry_price is None:
-
-                logger.info(
-                    "[RESULT] "
-                    "%s id=%s: "
-                    "expiry price not available yet",
-                    pair,
-                    signal_id,
-                )
-
-                return False
-
-            # ----------------------------------------------------
-            # Рассчитываем результат.
-            # ----------------------------------------------------
-
-            result = (
-                self._calculate_result(
-                    direction=direction,
-                    entry_price=entry_price,
-                    expiry_price=expiry_price,
-                )
-            )
-
-            # ----------------------------------------------------
-            # Записываем результат.
-            # ----------------------------------------------------
-
-            if hasattr(
-                self.database,
-                "set_signal_result",
-            ):
-
-                saved = (
-                    self.database.set_signal_result(
-                        signal_id=int(
-                            signal_id
-                        ),
-                        result=result,
-                        expiry_price=expiry_price,
-                    )
-                )
-
-                if asyncio.iscoroutine(
-                    saved
-                ):
-
-                    saved = await saved
-
-                if saved:
-
-                    logger.info(
-                        "[RESULT] "
-                        "%s id=%s | "
-                        "%s | "
-                        "entry=%.8f | "
-                        "expiry=%.8f",
-                        pair,
-                        signal_id,
+                if (
+                    isinstance(
                         result,
-                        entry_price,
-                        expiry_price,
+                        Exception,
                     )
-
-                    # ------------------------------------------------
-                    # Логируем статистику после закрытия.
-                    # ------------------------------------------------
-
-                    try:
-
-                        if hasattr(
-                            self.database,
-                            "get_signal_statistics",
-                        ):
-
-                            stats = (
-                                self.database
-                                .get_signal_statistics(
-                                    pair=pair,
-                                    expiry_minutes=(
-                                        signal_row.get(
-                                            "expiry_minutes"
-                                        )
-                                    ),
-                                )
-                            )
-
-                            logger.info(
-                                "[STATS] "
-                                "%s | %sm | "
-                                "WINRATE=%.2f%% | "
-                                "W=%s | L=%s | N=%s",
-                                pair,
-                                signal_row.get(
-                                    "expiry_minutes"
-                                ),
-                                stats.get(
-                                    "winrate",
-                                    0,
-                                ),
-                                stats.get(
-                                    "wins",
-                                    0,
-                                ),
-                                stats.get(
-                                    "losses",
-                                    0,
-                                ),
-                                stats.get(
-                                    "total",
-                                    0,
-                                ),
-                            )
-
-                    except Exception as exc:
-
-                        logger.debug(
-                            "[STATS] "
-                            "statistics error: %s",
-                            exc,
-                        )
-
-                    return True
-
-            return False
-
-        except Exception as exc:
-
-            logger.exception(
-                "[RESULT] "
-                "%s id=%s check error: %s",
-                pair,
-                signal_id,
-                exc,
-            )
-
-            return False
-
-    # ============================================================
-    # CHECK ALL RESULTS
-    # ============================================================
-
-    async def check_pending_results(
-        self,
-    ) -> int:
-
-        if self.database is None:
-            return 0
-
-        if not hasattr(
-            self.database,
-            "get_pending_signals",
-        ):
-
-            return 0
-
-        async with _RESULT_LOCK:
-
-            try:
-
-                before_time = (
-                    self._now().isoformat()
-                )
-
-                rows = (
-                    self.database.get_pending_signals(
-                        before_time=before_time,
-                        limit=MAX_RESULT_CHECK_BATCH,
+                    and not isinstance(
+                        result,
+                        asyncio.CancelledError,
                     )
-                )
-
-                if asyncio.iscoroutine(
-                    rows
                 ):
-
-                    rows = await rows
-
-                if not rows:
-                    return 0
-
-                completed = 0
-
-                for row in rows:
-
-                    try:
-
-                        success = (
-                            await self._check_signal_result(
-                                row
-                            )
-                        )
-
-                        if success:
-
-                            completed += 1
-
-                    except Exception as exc:
-
-                        logger.exception(
-                            "[RESULT] "
-                            "signal check error: %s",
-                            exc,
-                        )
-
-                if completed:
-
-                    # ------------------------------------------------
-                    # Старый backtest cache может уже устареть
-                    # относительно накопленной статистики.
-                    # ------------------------------------------------
-
-                    self._backtest_cache.clear()
-
-                    logger.info(
-                        "[RESULT] "
-                        "Закрыто сигналов: %s",
-                        completed,
+                    logger.error(
+                        (
+                            "Scheduler task %s "
+                            "stopped with error: %s"
+                        ),
+                        _safe_task_name(task),
+                        result,
                     )
 
-                return completed
+        # -------------------------------------------------
+        # RESET
+        # -------------------------------------------------
 
-            except Exception as exc:
+        self._signal_generation_task = None
+        self._signal_warning_task = None
+        self._signal_result_checker_task = None
 
-                logger.exception(
-                    "[RESULT] "
-                    "pending results error: %s",
-                    exc,
-                )
+        self.scanner = None
 
-                return 0
+        self._started = False
 
-    # ============================================================
-    # FORMAT
-    # ============================================================
-
-    @staticmethod
-    def format_signal(
-        signal: Signal,
-    ) -> str:
-
-        direction_text = {
-            "CALL": "🟢 CALL / ВВЕРХ",
-            "PUT": "🔴 PUT / ВНИЗ",
-        }.get(
-            signal.direction,
-            signal.direction,
+        logger.info(
+            "TEYZUS scheduler stopped."
         )
 
-        confirmations = (
-            signal.confirmations[:8]
-        )
+    # =====================================================
+    # SIGNAL GENERATION
+    # =====================================================
 
-        confirmation_text = "\n".join(
-            f"• {item}"
-            for item in confirmations
-        )
-
-        return (
-            "🎯 <b>СИЛЬНЫЙ СИГНАЛ</b>\n\n"
-            f"💱 <b>Пара:</b> "
-            f"{signal.pair}\n"
-            f"📈 <b>Направление:</b> "
-            f"{direction_text}\n"
-            f"⏱️ <b>Время сделки:</b> "
-            f"{signal.expiry_minutes} мин.\n\n"
-            f"⭐ <b>Quality:</b> "
-            f"{signal.quality:.1f}/100\n"
-            f"🎯 <b>Расчётная вероятность:</b> "
-            f"{signal.probability:.1f}%\n\n"
-            f"🟢 <b>Вход:</b> "
-            f"{signal.entry_time.strftime('%H:%M:%S')}\n"
-            f"🔴 <b>Закрытие:</b> "
-            f"{signal.expiry_time.strftime('%H:%M:%S')}\n\n"
-            "🔍 <b>Подтверждения:</b>\n"
-            f"{confirmation_text or '• —'}\n\n"
-            "⚠️ Расчётная вероятность "
-            "является оценкой модели. "
-            "Фактический WINRATE считается "
-            "по завершённым сигналам."
-        )
-
-    # ============================================================
-    # SEND
-    # ============================================================
-
-    async def _send_to_users(
+    async def _signal_generation_loop(
         self,
-        signal: Signal,
     ) -> None:
+        """
+        Запускает SignalScanner один раз.
 
-        if self.bot is None:
-            return
+        Сам scanner имеет собственный continuous loop.
+        """
 
-        if self.database is None:
+        logger.info(
+            "================================================"
+        )
+
+        logger.info(
+            "SIGNAL GENERATION LOOP STARTED"
+        )
+
+        logger.info(
+            "================================================"
+        )
+
+        scanner = self.scanner
+
+        if scanner is None:
+            logger.error(
+                "SignalScanner is not initialized."
+            )
             return
 
         try:
 
-            users = []
-
-            if hasattr(
-                self.database,
-                "get_active_users",
-            ):
-
-                result = (
-                    self.database.get_active_users()
-                )
-
-                if asyncio.iscoroutine(
-                    result
-                ):
-
-                    result = await result
-
-                users = result or []
-
-            text = self.format_signal(
-                signal
-            )
-
-            for user in users:
-
-                user_id = None
-
-                try:
-
-                    if isinstance(
-                        user,
-                        int,
-                    ):
-
-                        user_id = user
-
-                    elif isinstance(
-                        user,
-                        dict,
-                    ):
-
-                        user_id = user.get(
-                            "user_id"
-                        )
-
-                    else:
-
-                        user_id = getattr(
-                            user,
-                            "user_id",
-                            None,
-                        )
-
-                    if not user_id:
-                        continue
-
-                    await self.bot.send_message(
-                        user_id,
-                        text,
-                        parse_mode="HTML",
-                    )
-
-                except Exception as exc:
-
-                    logger.warning(
-                        "[SCHEDULER] "
-                        "send error user=%s: %s",
-                        user_id,
-                        exc,
-                    )
-
-        except Exception as exc:
-
-            logger.exception(
-                "[SCHEDULER] "
-                "send users error: %s",
-                exc,
-            )
-
-    # ============================================================
-    # SCAN ONCE
-    # ============================================================
-
-    async def scan_once(
-        self,
-        pair: Optional[str] = None,
-        expiry_minutes=None,
-    ) -> Optional[Signal]:
-
-        if pair is None:
-            pair = self.auto_pair
-
-        if expiry_minutes is None:
-
-            expiry_minutes = (
-                self.auto_expiry_minutes
-            )
-
-        signal = await self._find_best_signal(
-            requested_pair=pair,
-            expiry_minutes=expiry_minutes,
-        )
-
-        if signal is None:
+            await scanner.start()
 
             logger.info(
-                "[SCHEDULER] "
-                "Сильный сигнал не найден."
+                "SignalScanner started."
             )
 
-            return None
+            while self._running:
 
-        signal_id = (
-            await self._save_signal(
-                signal
-            )
-        )
-
-        # --------------------------------------------------------
-        # Если сигнал уже существует, повторно его не отправляем.
-        # --------------------------------------------------------
-
-        if signal_id is None:
-
-            return None
-
-        await self._send_to_users(
-            signal
-        )
-
-        return signal
-
-    # ============================================================
-    # RESULT LOOP
-    # ============================================================
-
-    async def _result_loop(
-        self,
-    ) -> None:
-
-        logger.info(
-            "[RESULT] "
-            "Automatic result checker started"
-        )
-
-        while self.running:
-
-            try:
-
-                await self.check_pending_results()
-
-                await asyncio.sleep(
-                    RESULT_CHECK_INTERVAL_SECONDS
-                )
-
-            except asyncio.CancelledError:
-
-                break
-
-            except Exception as exc:
-
-                logger.exception(
-                    "[RESULT] "
-                    "result loop error: %s",
-                    exc,
-                )
-
-                await asyncio.sleep(
-                    RESULT_CHECK_INTERVAL_SECONDS
-                )
-
-        logger.info(
-            "[RESULT] "
-            "Automatic result checker stopped"
-        )
-
-    # ============================================================
-    # RUN
-    # ============================================================
-
-    async def run(self) -> None:
-
-        if self.running:
-            return
-
-        self.running = True
-
-        logger.info(
-            "[SCHEDULER] "
-            "Automatic scheduler started"
-        )
-
-        # --------------------------------------------------------
-        # Отдельный цикл проверки результатов.
-        # --------------------------------------------------------
-
-        self.result_task = asyncio.create_task(
-            self._result_loop()
-        )
-
-        try:
-
-            while self.running:
+                self.generation_cycles += 1
 
                 try:
-
-                    now = self._now()
-
-                    next_run = (
-                        self._next_minute(now)
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=SIGNAL_GENERATION_INTERVAL,
                     )
-
-                    delay = (
-                        next_run - now
-                    ).total_seconds()
-
-                    if delay > 0:
-
-                        await asyncio.sleep(
-                            delay
-                        )
-
-                    if not self.running:
-                        break
-
-                    # ------------------------------------------------
-                    # Сначала закрываем старые сделки.
-                    # ------------------------------------------------
-
-                    await self.check_pending_results()
-
-                    # ------------------------------------------------
-                    # Затем ищем новые.
-                    # ------------------------------------------------
-
-                    await self.scan_once()
-
-                except asyncio.CancelledError:
 
                     break
 
-                except Exception as exc:
-
-                    logger.exception(
-                        "[SCHEDULER] "
-                        "scan loop error: %s",
-                        exc,
-                    )
-
-                    await asyncio.sleep(
-                        RATE_LIMIT_COOLDOWN_SECONDS
-                    )
-
-        finally:
-
-            self.running = False
-
-            if self.result_task is not None:
-
-                self.result_task.cancel()
-
-                try:
-
-                    await self.result_task
-
-                except asyncio.CancelledError:
+                except asyncio.TimeoutError:
                     pass
 
-                self.result_task = None
+        except asyncio.CancelledError:
+            raise
 
-        logger.info(
-            "[SCHEDULER] "
-            "Automatic scheduler stopped"
-        )
+        except Exception:
+            self.errors += 1
 
-    # ============================================================
-    # START
-    # ============================================================
+            logger.exception(
+                "Signal generation loop crashed."
+            )
 
-    def start(self) -> None:
+        finally:
+            logger.info(
+                "Signal generation loop stopped."
+            )
 
-        if self.task is not None:
+    # =====================================================
+    # HANDLE SIGNAL
+    # =====================================================
+
+    async def _handle_signal(
+        self,
+        signal: TradingSignal,
+    ) -> None:
+        """
+        Получает сигнал от SignalScanner.
+        """
+
+        if not self._running:
             return
 
-        self.task = asyncio.create_task(
-            self.run()
+        self.generated_signals += 1
+
+        # -------------------------------------------------
+        # UNIQUE KEY
+        # -------------------------------------------------
+
+        key = self._signal_key(
+            signal
         )
 
-    # ============================================================
-    # STOP
-    # ============================================================
+        self._active_signals[
+            key
+        ] = signal
 
-    async def stop(self) -> None:
+        expiry = _signal_expiry(
+            signal
+        )
 
-        self.running = False
+        logger.info(
+            "================================================"
+        )
 
-        if self.task is not None:
+        logger.info(
+            (
+                "SIGNAL RECEIVED BY SCHEDULER | "
+                "symbol=%s | "
+                "direction=%s | "
+                "quality=%.2f | "
+                "expires=%s"
+            ),
+            signal.symbol,
+            signal.direction,
+            signal.quality_score,
+            expiry.isoformat(),
+        )
 
-            self.task.cancel()
+        logger.info(
+            "Signal active key=%s",
+            key,
+        )
 
-            try:
+        # -------------------------------------------------
+        # TELEGRAM
+        # -------------------------------------------------
 
-                await self.task
+        await self._send_signal_to_telegram(
+            signal
+        )
 
-            except asyncio.CancelledError:
-                pass
+    # =====================================================
+    # SIGNAL KEY
+    # =====================================================
 
-            self.task = None
+    @staticmethod
+    def _signal_key(
+        signal: TradingSignal,
+    ) -> str:
 
-        if self.result_task is not None:
+        created = _signal_created_at(
+            signal
+        )
 
-            self.result_task.cancel()
+        return (
+            f"{signal.symbol}:"
+            f"{signal.direction}:"
+            f"{created.timestamp():.0f}"
+        )
 
-            try:
+    # =====================================================
+    # TELEGRAM
+    # =====================================================
 
-                await self.result_task
+    async def _send_signal_to_telegram(
+        self,
+        signal: TradingSignal,
+    ) -> None:
+        """
+        Отправляет найденный сигнал.
 
-            except asyncio.CancelledError:
-                pass
+        Если SIGNAL_CHAT_ID не задан,
+        scanner продолжает работать.
+        """
 
-            self.result_task = None
+        chat_id = _parse_chat_id(
+            SIGNAL_CHAT_ID_RAW
+        )
+
+        if chat_id is None:
+
+            logger.warning(
+                (
+                    "SIGNAL_CHAT_ID is not configured. "
+                    "Signal will not be sent to Telegram: %s"
+                ),
+                signal.symbol,
+            )
+
+            return
 
         try:
 
-            await market_client.close()
+            text = SignalScanner.format_signal(
+                signal
+            )
+
+            # -------------------------------------------------
+            # Добавляем срок действия, если formatter
+            # его ещё не показывает.
+            # -------------------------------------------------
+
+            expiry_text = _format_expiry(
+                signal
+            )
+
+            if "Закрытие" not in text:
+                text += (
+                    "\n"
+                    f"⏱ Закрытие: {expiry_text} МСК"
+                )
+
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+            )
+
+            logger.info(
+                (
+                    "Signal sent to Telegram | "
+                    "symbol=%s | "
+                    "direction=%s | "
+                    "quality=%.2f | "
+                    "expiry=%s"
+                ),
+                signal.symbol,
+                signal.direction,
+                signal.quality_score,
+                expiry_text,
+            )
 
         except Exception:
+            self.errors += 1
+
+            logger.exception(
+                (
+                    "Failed to send signal "
+                    "to Telegram | symbol=%s"
+                ),
+                signal.symbol,
+            )
+
+    # =====================================================
+    # WARNING LOOP
+    # =====================================================
+
+    async def _signal_warning_loop(
+        self,
+    ) -> None:
+
+        logger.info(
+            "Signal warning scheduler started."
+        )
+
+        if not SIGNAL_WARNING_AVAILABLE:
+
+            logger.info(
+                (
+                    "signal_warning.py is not available. "
+                    "Warning scheduler is idle."
+                )
+            )
+
+        try:
+
+            while self._running:
+
+                self.warning_cycles += 1
+
+                if (
+                    SIGNAL_WARNING_AVAILABLE
+                    and signal_warning is not None
+                ):
+
+                    try:
+                        await self._call_warning_function()
+
+                    except asyncio.CancelledError:
+                        raise
+
+                    except Exception:
+
+                        self.errors += 1
+
+                        logger.exception(
+                            "Signal warning cycle failed."
+                        )
+
+                try:
+
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=15,
+                    )
+
+                    break
+
+                except asyncio.TimeoutError:
+                    pass
+
+        except asyncio.CancelledError:
+            raise
+
+        finally:
+
+            logger.info(
+                "Signal warning scheduler stopped."
+            )
+
+    # =====================================================
+    # CALL WARNING FUNCTION
+    # =====================================================
+
+    async def _call_warning_function(
+        self,
+    ) -> None:
+
+        if signal_warning is None:
+            return
+
+        function = signal_warning
+
+        # -------------------------------------------------
+        # FIRST
+        # -------------------------------------------------
+
+        try:
+
+            result = function(
+                bot=self.bot,
+                market=self.market,
+            )
+
+            if asyncio.iscoroutine(result):
+                await result
+
+            return
+
+        except TypeError:
             pass
 
+        # -------------------------------------------------
+        # SECOND
+        # -------------------------------------------------
 
-# ================================================================
-# GLOBAL SCHEDULER
-# ================================================================
+        try:
 
-scheduler = SignalScheduler()
+            result = function(
+                bot=self.bot,
+            )
+
+            if asyncio.iscoroutine(result):
+                await result
+
+            return
+
+        except TypeError:
+            pass
+
+        # -------------------------------------------------
+        # THIRD
+        # -------------------------------------------------
+
+        try:
+
+            result = function(
+                market=self.market,
+            )
+
+            if asyncio.iscoroutine(result):
+                await result
+
+            return
+
+        except TypeError:
+            pass
+
+        # -------------------------------------------------
+        # FOURTH
+        # -------------------------------------------------
+
+        try:
+
+            result = function()
+
+            if asyncio.iscoroutine(result):
+                await result
+
+        except TypeError as exc:
+
+            logger.warning(
+                (
+                    "signal_warning() has unsupported "
+                    "signature: %s"
+                ),
+                exc,
+            )
+
+    # =====================================================
+    # RESULT CHECKER LOOP
+    # =====================================================
+
+    async def _signal_result_checker_loop(
+        self,
+    ) -> None:
+
+        logger.info(
+            "Result checker started."
+        )
+
+        if not SIGNAL_RESULT_CHECKER_AVAILABLE:
+
+            logger.info(
+                (
+                    "signal_result_checker.py "
+                    "is not available. "
+                    "Result checker is idle."
+                )
+            )
+
+        try:
+
+            while self._running:
+
+                self.result_checker_cycles += 1
+
+                if (
+                    SIGNAL_RESULT_CHECKER_AVAILABLE
+                    and signal_result_checker is not None
+                ):
+
+                    try:
+
+                        await self._call_result_checker()
+
+                    except asyncio.CancelledError:
+                        raise
+
+                    except Exception:
+
+                        self.errors += 1
+
+                        logger.exception(
+                            "Result checker cycle failed."
+                        )
+
+                # -------------------------------------------------
+                # CLEAN LOCAL ACTIVE SIGNALS
+                # -------------------------------------------------
+
+                self._cleanup_old_signals()
+
+                # -------------------------------------------------
+                # WAIT
+                # -------------------------------------------------
+
+                try:
+
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=SIGNAL_RESULT_CHECK_INTERVAL,
+                    )
+
+                    break
+
+                except asyncio.TimeoutError:
+                    pass
+
+        except asyncio.CancelledError:
+            raise
+
+        finally:
+
+            logger.info(
+                "Result checker stopped."
+            )
+
+    # =====================================================
+    # CALL RESULT CHECKER
+    # =====================================================
+
+    async def _call_result_checker(
+        self,
+    ) -> None:
+
+        if signal_result_checker is None:
+            return
+
+        function = signal_result_checker
+
+        # -------------------------------------------------
+        # FIRST
+        # -------------------------------------------------
+
+        try:
+
+            result = function(
+                bot=self.bot,
+                market=self.market,
+            )
+
+            if asyncio.iscoroutine(result):
+                await result
+
+            return
+
+        except TypeError:
+            pass
+
+        # -------------------------------------------------
+        # SECOND
+        # -------------------------------------------------
+
+        try:
+
+            result = function(
+                market=self.market,
+            )
+
+            if asyncio.iscoroutine(result):
+                await result
+
+            return
+
+        except TypeError:
+            pass
+
+        # -------------------------------------------------
+        # THIRD
+        # -------------------------------------------------
+
+        try:
+
+            result = function(
+                bot=self.bot,
+            )
+
+            if asyncio.iscoroutine(result):
+                await result
+
+            return
+
+        except TypeError:
+            pass
+
+        # -------------------------------------------------
+        # FOURTH
+        # -------------------------------------------------
+
+        try:
+
+            result = function()
+
+            if asyncio.iscoroutine(result):
+                await result
+
+        except TypeError as exc:
+
+            logger.warning(
+                (
+                    "signal_result_checker() has "
+                    "unsupported signature: %s"
+                ),
+                exc,
+            )
+
+    # =====================================================
+    # CLEAN OLD SIGNALS
+    # =====================================================
+
+    def _cleanup_old_signals(
+        self,
+    ) -> None:
+
+        if not self._active_signals:
+            return
+
+        max_age = (
+            SIGNAL_EXPIRY_MINUTES * 60
+            + SIGNAL_WARNING_SECONDS
+            + 60
+        )
+
+        expired: list[str] = []
+
+        current_timestamp = time.time()
+
+        for key, signal in (
+            self._active_signals.items()
+        ):
+
+            try:
+
+                created_timestamp = (
+                    _signal_created_at(
+                        signal
+                    ).timestamp()
+                )
+
+                age = (
+                    current_timestamp
+                    - created_timestamp
+                )
+
+                if age > max_age:
+                    expired.append(key)
+
+            except Exception:
+
+                expired.append(key)
+
+        for key in expired:
+
+            self._active_signals.pop(
+                key,
+                None,
+            )
+
+        if expired:
+
+            logger.debug(
+                (
+                    "Cleaned %s expired "
+                    "signals from scheduler cache."
+                ),
+                len(expired),
+            )
+
+    # =====================================================
+    # MANUAL SCAN
+    # =====================================================
+
+    async def scan_now(
+        self,
+    ) -> list[TradingSignal]:
+
+        if not self._running:
+            raise RuntimeError(
+                "Scheduler is not running."
+            )
+
+        if self.scanner is None:
+            raise RuntimeError(
+                "SignalScanner is not initialized."
+            )
+
+        logger.info(
+            "Manual signal scan requested."
+        )
+
+        return await self.scanner.scan_once()
+
+    # =====================================================
+    # STATUS
+    # =====================================================
+
+    @property
+    def running(
+        self,
+    ) -> bool:
+
+        return self._running
+
+    @property
+    def started(
+        self,
+    ) -> bool:
+
+        return self._started
+
+    # =====================================================
+    # GET SCANNER
+    # =====================================================
+
+    def get_scanner(
+        self,
+    ) -> SignalScanner | None:
+
+        return self.scanner
+
+    # =====================================================
+    # GET ACTIVE SIGNALS
+    # =====================================================
+
+    def get_active_signals(
+        self,
+    ) -> list[TradingSignal]:
+
+        return list(
+            self._active_signals.values()
+        )
+
+    # =====================================================
+    # GET STATISTICS
+    # =====================================================
+
+    def get_stats(
+        self,
+    ) -> dict[str, Any]:
+
+        scanner_stats = None
+
+        if self.scanner is not None:
+
+            try:
+
+                scanner_stats = (
+                    self.scanner.get_stats()
+                )
+
+            except Exception:
+
+                scanner_stats = None
+
+        return {
+            "running": self._running,
+            "started": self._started,
+            "generation_cycles": (
+                self.generation_cycles
+            ),
+            "generated_signals": (
+                self.generated_signals
+            ),
+            "warning_cycles": (
+                self.warning_cycles
+            ),
+            "result_checker_cycles": (
+                self.result_checker_cycles
+            ),
+            "errors": self.errors,
+            "active_signals": (
+                len(
+                    self._active_signals
+                )
+            ),
+            "signal_expiry_minutes": (
+                SIGNAL_EXPIRY_MINUTES
+            ),
+            "scanner": scanner_stats,
+        }
+
+
+# =========================================================
+# FACTORY
+# =========================================================
+
+def create_scheduler(
+    bot: Bot,
+    market: MarketClient,
+) -> Scheduler:
+
+    return Scheduler(
+        bot=bot,
+        market=market,
+    )
+
+
+# =========================================================
+# EXPORTS
+# =========================================================
+
+__all__ = [
+    "Scheduler",
+    "create_scheduler",
+]
