@@ -12,21 +12,35 @@ from config import (
     TIMEZONE,
 )
 from market import market_client
-from signal_engine import Signal, SignalEngine
+from signal_engine import Signal
+
+from backtest import (
+    DEFAULT_TEST_POINTS,
+    ExpiryBacktester,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
 MAX_PAIRS_PER_SCAN = 6
+
 REQUEST_DELAY_SECONDS = 2.0
 RATE_LIMIT_COOLDOWN_SECONDS = 65
 
 MIN_EXPIRY_MINUTES = 1
 MAX_EXPIRY_MINUTES = 20
+
 DEFAULT_EXPIRY_MINUTES = 5
 
 ANY_EXPIRY = "any"
+
+# Сколько минут держим кэш backtest.
+BACKTEST_CACHE_SECONDS = 300
+
+# Минимальное количество исторических сделок
+# для выбора экспирации.
+MIN_BACKTEST_TRADES = 10
 
 
 class SignalScheduler:
@@ -38,15 +52,22 @@ class SignalScheduler:
         1..20 минут
         Любое время
 
-    Автоматические сигналы:
-        работают без запроса пользователя.
+    При выборе конкретной экспирации:
 
-    Ручные сигналы:
-        get_manual_signal(...)
+        анализируется именно выбранный срок.
 
-    Важно:
-        probability является расчётной оценкой модели,
-        а не гарантированной вероятностью выигрыша.
+    При выборе "Любое время":
+
+        выполняется исторический backtest
+        для 1..20 минут,
+
+        после чего выбирается экспирация
+        с лучшим фактическим историческим WINRATE.
+
+    ВАЖНО:
+
+        Исторический WINRATE не является гарантией
+        будущего результата.
     """
 
     def __init__(
@@ -58,9 +79,16 @@ class SignalScheduler:
         self.bot = bot
         self.database = database
 
+        from signal_engine import SignalEngine
+
         self.engine = SignalEngine(
             min_quality=MIN_QUALITY,
             min_probability=MIN_PROBABILITY,
+        )
+
+        self.backtester = ExpiryBacktester(
+            engine=self.engine,
+            min_trades=MIN_BACKTEST_TRADES,
         )
 
         self.running = False
@@ -74,17 +102,20 @@ class SignalScheduler:
 
         self._last_request_time = 0.0
 
-        self._cache: dict[
-            tuple[str, int],
-            Signal | None,
-        ] = {}
-
-        self._cache_time: dict[
-            tuple[str, int],
-            datetime,
-        ] = {}
-
         self._signal_lock = asyncio.Lock()
+
+        # --------------------------------------------------------
+        # Backtest cache
+        # --------------------------------------------------------
+
+        self._backtest_cache: dict[
+            str,
+            tuple[
+                float,
+                Optional[int],
+                list,
+            ],
+        ] = {}
 
     # ============================================================
     # EXPIRY
@@ -103,7 +134,11 @@ class SignalScheduler:
             str,
         ):
 
-            value = expiry_minutes.strip().lower()
+            value = (
+                expiry_minutes
+                .strip()
+                .lower()
+            )
 
             if value in {
                 "any",
@@ -117,7 +152,10 @@ class SignalScheduler:
                 return None
 
             try:
-                expiry_minutes = int(value)
+
+                expiry_minutes = int(
+                    value
+                )
 
             except ValueError:
 
@@ -149,11 +187,11 @@ class SignalScheduler:
         expiry_minutes,
     ) -> None:
 
-        normalized = self.normalize_expiry(
-            expiry_minutes
+        self.auto_expiry_minutes = (
+            self.normalize_expiry(
+                expiry_minutes
+            )
         )
-
-        self.auto_expiry_minutes = normalized
 
     def set_auto_pair(
         self,
@@ -192,19 +230,23 @@ class SignalScheduler:
         if dt is None:
             dt = self._now()
 
+        if dt.tzinfo is None:
+
+            dt = dt.replace(
+                tzinfo=TIMEZONE
+            )
+
         dt = dt.astimezone(
             TIMEZONE
         )
 
-        result = (
+        return (
             dt.replace(
                 second=0,
                 microsecond=0,
             )
             + timedelta(minutes=1)
         )
-
-        return result
 
     # ============================================================
     # PAIRS
@@ -217,28 +259,26 @@ class SignalScheduler:
 
         if requested_pair:
 
-            if requested_pair in {
+            normalized = str(
+                requested_pair
+            ).strip().lower()
+
+            if normalized not in {
                 "any",
                 "any_regular",
                 "any_otc",
                 "all",
             }:
 
-                requested_pair = None
-
-            else:
-
                 return [
                     requested_pair
                 ]
 
-        pairs = list(
-            PAIRS
+        return list(
+            PAIRS[
+                :MAX_PAIRS_PER_SCAN
+            ]
         )
-
-        return pairs[
-            :MAX_PAIRS_PER_SCAN
-        ]
 
     # ============================================================
     # RATE LIMIT
@@ -248,14 +288,21 @@ class SignalScheduler:
         self,
     ) -> None:
 
-        now = asyncio.get_running_loop().time()
+        loop = (
+            asyncio.get_running_loop()
+        )
+
+        now = loop.time()
 
         elapsed = (
             now
             - self._last_request_time
         )
 
-        if elapsed < REQUEST_DELAY_SECONDS:
+        if (
+            elapsed
+            < REQUEST_DELAY_SECONDS
+        ):
 
             await asyncio.sleep(
                 REQUEST_DELAY_SECONDS
@@ -263,7 +310,7 @@ class SignalScheduler:
             )
 
         self._last_request_time = (
-            asyncio.get_running_loop().time()
+            loop.time()
         )
 
     # ============================================================
@@ -278,9 +325,119 @@ class SignalScheduler:
         await self._respect_rate_limit()
 
         return await market_client.get_candles(
-            pair,
+            pair=pair,
             limit=220,
             interval="1min",
+        )
+
+    # ============================================================
+    # BACKTEST
+    # ============================================================
+
+    async def _get_best_expiry_from_backtest(
+        self,
+        pair: str,
+        candles,
+    ) -> tuple[
+        Optional[int],
+        list,
+    ]:
+
+        import time
+
+        now = time.time()
+
+        cached = (
+            self._backtest_cache.get(
+                pair
+            )
+        )
+
+        if cached is not None:
+
+            (
+                cached_at,
+                best_expiry,
+                results,
+            ) = cached
+
+            if (
+                now - cached_at
+                < BACKTEST_CACHE_SECONDS
+            ):
+
+                return (
+                    best_expiry,
+                    results,
+                )
+
+        logger.info(
+            "[BACKTEST] "
+            "%s: запускаю "
+            "историческую проверку 1-20m",
+            pair,
+        )
+
+        # Backtest тяжёлый, поэтому отдаём
+        # выполнение CPU-коду в отдельный поток.
+        best_expiry, results = (
+            await asyncio.to_thread(
+                self.backtester.choose_best_expiry,
+                pair,
+                candles,
+                DEFAULT_TEST_POINTS,
+            )
+        )
+
+        self._backtest_cache[
+            pair
+        ] = (
+            now,
+            best_expiry,
+            results,
+        )
+
+        if best_expiry is None:
+
+            logger.info(
+                "[BACKTEST] "
+                "%s: подходящей экспирации "
+                "не найдено",
+                pair,
+            )
+
+        else:
+
+            selected = next(
+                (
+                    item
+                    for item in results
+                    if (
+                        item.expiry_minutes
+                        == best_expiry
+                    )
+                ),
+                None,
+            )
+
+            if selected is not None:
+
+                logger.info(
+                    "[BACKTEST] "
+                    "%s: BEST=%sm | "
+                    "WINRATE=%.1f%% | "
+                    "W=%s | L=%s | N=%s",
+                    pair,
+                    best_expiry,
+                    selected.winrate,
+                    selected.wins,
+                    selected.losses,
+                    selected.total,
+                )
+
+        return (
+            best_expiry,
+            results,
         )
 
     # ============================================================
@@ -306,28 +463,26 @@ class SignalScheduler:
         if candles is None:
 
             logger.info(
-                "[SCHEDULER] %s: "
-                "candles unavailable",
+                "[SCHEDULER] "
+                "%s: свечи недоступны",
                 pair,
             )
 
             return None
 
-        # --------------------------------------------------------
-        # конкретное время
-        # --------------------------------------------------------
+        # ========================================================
+        # КОНКРЕТНАЯ ЭКСПИРАЦИЯ
+        # ========================================================
 
         if normalized_expiry is not None:
 
-            signal = (
-                self.engine.analyze(
-                    pair=pair,
-                    candles=candles,
-                    expiry_minutes=normalized_expiry,
-                )
+            signal = self.engine.analyze(
+                pair=pair,
+                candles=candles,
+                expiry_minutes=normalized_expiry,
             )
 
-            if signal:
+            if signal is not None:
 
                 logger.info(
                     "[SCHEDULER] "
@@ -343,30 +498,33 @@ class SignalScheduler:
 
             return signal
 
-        # --------------------------------------------------------
+        # ========================================================
         # ЛЮБОЕ ВРЕМЯ
-        # --------------------------------------------------------
+        # ========================================================
 
-        signal = (
-            self.engine.choose_best_expiry(
+        best_expiry, results = (
+            await self._get_best_expiry_from_backtest(
                 pair=pair,
                 candles=candles,
             )
         )
 
-        if signal:
+        if best_expiry is None:
 
-            logger.info(
-                "[SCHEDULER] "
-                "%s | ANY | selected=%sm | "
-                "%s | quality=%.1f | "
-                "probability=%.1f",
-                pair,
-                signal.expiry_minutes,
-                signal.direction,
-                signal.quality,
-                signal.probability,
-            )
+            return None
+
+        logger.info(
+            "[SCHEDULER] "
+            "%s | ANY → %sm",
+            pair,
+            best_expiry,
+        )
+
+        signal = self.engine.analyze(
+            pair=pair,
+            candles=candles,
+            expiry_minutes=best_expiry,
+        )
 
         return signal
 
@@ -389,7 +547,9 @@ class SignalScheduler:
         if not pairs:
             return None
 
-        signals: list[Signal] = []
+        signals: list[
+            Signal
+        ] = []
 
         for pair in pairs:
 
@@ -410,7 +570,7 @@ class SignalScheduler:
 
                 logger.exception(
                     "[SCHEDULER] "
-                    "analysis error %s: %s",
+                    "%s analysis error: %s",
                     pair,
                     exc,
                 )
@@ -418,12 +578,25 @@ class SignalScheduler:
         if not signals:
             return None
 
+        # --------------------------------------------------------
+        # Основной выбор:
+        #
+        # 1. Расчётная вероятность
+        # 2. Quality
+        # 3. Количество подтверждений
+        # --------------------------------------------------------
+
         signals.sort(
             key=lambda signal: (
-                float(signal.probability),
-                float(signal.quality),
-                len(signal.confirmations),
-                -int(signal.expiry_minutes),
+                float(
+                    signal.probability
+                ),
+                float(
+                    signal.quality
+                ),
+                len(
+                    signal.confirmations
+                ),
             ),
             reverse=True,
         )
@@ -431,7 +604,7 @@ class SignalScheduler:
         return signals[0]
 
     # ============================================================
-    # MANUAL SIGNAL
+    # MANUAL
     # ============================================================
 
     async def get_manual_signal(
@@ -448,15 +621,13 @@ class SignalScheduler:
 
         async with self._signal_lock:
 
-            signal = await self._find_best_signal(
+            return await self._find_best_signal(
                 requested_pair=pair,
                 expiry_minutes=normalized_expiry,
             )
 
-        return signal
-
     # ============================================================
-    # DATABASE
+    # SAVE
     # ============================================================
 
     async def _save_signal(
@@ -474,26 +645,31 @@ class SignalScheduler:
                 "save_signal",
             ):
 
-                result = self.database.save_signal(
-                    pair=signal.pair,
-                    direction=signal.direction,
-                    quality=signal.quality,
-                    probability=signal.probability,
-                    entry_time=signal.entry_time,
-                    expiry_time=signal.expiry_time,
-                    analysis_time=signal.analysis_time,
-                    confirmations=signal.confirmations,
-                    reasons=signal.reasons,
+                result = (
+                    self.database.save_signal(
+                        pair=signal.pair,
+                        direction=signal.direction,
+                        quality=signal.quality,
+                        probability=signal.probability,
+                        entry_time=signal.entry_time,
+                        expiry_time=signal.expiry_time,
+                        analysis_time=signal.analysis_time,
+                        confirmations=signal.confirmations,
+                        reasons=signal.reasons,
+                    )
                 )
 
-                if asyncio.iscoroutine(result):
+                if asyncio.iscoroutine(
+                    result
+                ):
+
                     await result
 
         except Exception as exc:
 
             logger.exception(
                 "[SCHEDULER] "
-                "database save error: %s",
+                "DB save error: %s",
                 exc,
             )
 
@@ -514,9 +690,9 @@ class SignalScheduler:
             signal.direction,
         )
 
-        confirmations = signal.confirmations[
-            :8
-        ]
+        confirmations = (
+            signal.confirmations[:8]
+        )
 
         confirmation_text = "\n".join(
             f"• {item}"
@@ -541,9 +717,10 @@ class SignalScheduler:
             f"{signal.expiry_time.strftime('%H:%M:%S')}\n\n"
             "🔍 <b>Подтверждения:</b>\n"
             f"{confirmation_text or '• —'}\n\n"
-            "⚠️ Расчётная вероятность — "
-            "оценка модели, а не гарантия "
-            "результата."
+            "⚠️ Расчётная вероятность "
+            "является оценкой модели. "
+            "Исторический WINRATE не "
+            "гарантирует будущий результат."
         )
 
     # ============================================================
@@ -574,7 +751,10 @@ class SignalScheduler:
                     self.database.get_active_users()
                 )
 
-                if asyncio.iscoroutine(result):
+                if asyncio.iscoroutine(
+                    result
+                ):
+
                     result = await result
 
                 users = result or []
@@ -585,20 +765,24 @@ class SignalScheduler:
 
             for user in users:
 
+                user_id = None
+
                 try:
 
-                    user_id = (
-                        user
-                        if isinstance(
-                            user,
-                            int,
-                        )
-                        else getattr(
+                    if isinstance(
+                        user,
+                        int,
+                    ):
+
+                        user_id = user
+
+                    else:
+
+                        user_id = getattr(
                             user,
                             "user_id",
                             None,
                         )
-                    )
 
                     if not user_id:
                         continue
@@ -640,6 +824,7 @@ class SignalScheduler:
             pair = self.auto_pair
 
         if expiry_minutes is None:
+
             expiry_minutes = (
                 self.auto_expiry_minutes
             )
@@ -690,9 +875,6 @@ class SignalScheduler:
 
                 now = self._now()
 
-                # Работаем на каждой новой минуте.
-                # Это необходимо для поддержки
-                # экспираций 1..20 минут.
                 next_run = (
                     self._next_minute(now)
                 )
@@ -759,6 +941,7 @@ class SignalScheduler:
             self.task.cancel()
 
             try:
+
                 await self.task
 
             except asyncio.CancelledError:
@@ -767,6 +950,7 @@ class SignalScheduler:
             self.task = None
 
         try:
+
             await market_client.close()
 
         except Exception:
